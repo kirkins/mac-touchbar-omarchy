@@ -1,0 +1,56 @@
+# Optional named-bar configuration. After review, install as /etc/tiny-dfr/config.toml.
+# Global appearance/brightness options continue to inherit from config.toml.
+DefaultLayer = "home"
+# Optional: holding Fn temporarily shows this bar; releasing Fn returns to the
+# previous bar. Tapping a navigation button during Fn keeps the chosen bar open.
+FnLayer = "function"
+
+[[Layers]]
+Name = "home"
+Keys = [
+    { Icon = "volume_down", Action = "VolumeDown" },
+    { Icon = "volume_off", Action = "Mute" },
+    { Icon = "volume_up", Action = "VolumeUp" },
+    { Icon = "brightness_low", Action = "BrightnessDown" },
+    { Icon = "brightness_high", Action = "BrightnessUp" },
+    { Icon = "play_pause", Action = "PlayPause" },
+    { Text = "F1-F12", Action = { Layer = "function" } },
+    { Text = "Media", Action = { Layer = "media" } },
+    { Battery = "both", Stretch = 2 },
+    { Time = "%H:%M", Stretch = 2 },
+]
+
+[[Layers]]
+Name = "function"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "F1", Action = "F1" },
+    { Text = "F2", Action = "F2" },
+    { Text = "F3", Action = "F3" },
+    { Text = "F4", Action = "F4" },
+    { Text = "F5", Action = "F5" },
+    { Text = "F6", Action = "F6" },
+    { Text = "F7", Action = "F7" },
+    { Text = "F8", Action = "F8" },
+    { Text = "F9", Action = "F9" },
+    { Text = "F10", Action = "F10" },
+    { Text = "F11", Action = "F11" },
+    { Text = "F12", Action = "F12" },
+]
+
+[[Layers]]
+Name = "media"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Icon = "fast_rewind", Action = "PreviousSong" },
+    { Icon = "play_pause", Action = "PlayPause" },
+    { Icon = "fast_forward", Action = "NextSong" },
+    { Icon = "volume_off", Action = "Mute" },
+    { Icon = "volume_down", Action = "VolumeDown" },
+    { Icon = "volume_up", Action = "VolumeUp" },
+]
+
+# To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,
+# then add a button with Action = { Layer = "that-name" } to a reachable bar.
+# A Home button is inserted automatically on sub-bars that lack a visible
+# button targeting DefaultLayer. No command execution or external service is used.

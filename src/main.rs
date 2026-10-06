@@ -49,7 +49,7 @@ mod pixel_shift;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
-use config::{ButtonConfig, Config};
+use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 
@@ -101,7 +101,7 @@ struct Button {
     image: ButtonImage,
     changed: bool,
     active: bool,
-    action: Vec<Key>,
+    action: ButtonAction,
     icon_width: f64,
     icon_height: f64,
 }
@@ -277,7 +277,7 @@ impl Button {
     }
     fn new_spacer() -> Button {
         Button {
-            action: vec![],
+            action: ButtonAction::default(),
             active: false,
             changed: false,
             image: ButtonImage::Spacer,
@@ -285,7 +285,7 @@ impl Button {
             icon_height: 0.0,
         }
     }
-    fn new_text(text: String, action: Vec<Key>) -> Button {
+    fn new_text(text: String, action: ButtonAction) -> Button {
         Button {
             action,
             active: false,
@@ -298,7 +298,7 @@ impl Button {
     fn new_icon(
         path: impl AsRef<str>,
         theme: Option<impl AsRef<str>>,
-        action: Vec<Key>,
+        action: ButtonAction,
         icon_width: i32,
         icon_height: i32,
     ) -> Button {
@@ -322,7 +322,7 @@ impl Button {
         panic!("failed to load icon");
     }
     fn new_battery(
-        action: Vec<Key>,
+        action: ButtonAction,
         battery: String,
         battery_mode: String,
         theme: Option<impl AsRef<str>>,
@@ -331,15 +331,25 @@ impl Button {
         let mut plain = Vec::new();
         let mut charging = Vec::new();
         for icon in [
-            "battery_0_bar", "battery_1_bar", "battery_2_bar", "battery_3_bar",
-            "battery_4_bar", "battery_5_bar", "battery_6_bar", "battery_full",
+            "battery_0_bar",
+            "battery_1_bar",
+            "battery_2_bar",
+            "battery_3_bar",
+            "battery_4_bar",
+            "battery_5_bar",
+            "battery_6_bar",
+            "battery_full",
         ] {
             plain.push(Self::load_battery_image(icon, theme.as_ref()));
         }
         for icon in [
-            "battery_charging_20", "battery_charging_30", "battery_charging_50",
-            "battery_charging_60", "battery_charging_80",
-            "battery_charging_90", "battery_charging_full",
+            "battery_charging_20",
+            "battery_charging_30",
+            "battery_charging_50",
+            "battery_charging_60",
+            "battery_charging_80",
+            "battery_charging_90",
+            "battery_charging_full",
         ] {
             charging.push(Self::load_battery_image(icon, theme.as_ref()));
         }
@@ -367,7 +377,7 @@ impl Button {
         }
     }
 
-    fn new_time(action: Vec<Key>, format: &str, locale_str: Option<&str>) -> Button {
+    fn new_time(action: ButtonAction, format: &str, locale_str: Option<&str>) -> Button {
         let format_str = if format == "24hr" {
             "%H:%M    %a %-e %b"
         } else if format == "12hr" {
@@ -515,15 +525,14 @@ impl Button {
             ButtonImage::Spacer => (),
         }
     }
-    fn set_active<F>(&mut self, uinput: &mut UInputHandle<F>, active: bool)
-    where
-        F: AsRawFd,
-    {
+    fn set_active(&mut self, active: bool, emit_keys: &mut impl FnMut(&[Key], bool)) {
         if self.active != active {
             self.active = active;
             self.changed = true;
 
-            toggle_keys(uinput, &self.action, active as i32);
+            if let ButtonAction::Keys(keys) = &self.action {
+                emit_keys(keys, active);
+            }
         }
     }
     fn set_background_color(&self, c: &Context, color: f64) {
@@ -760,6 +769,166 @@ impl FunctionLayer {
     }
 }
 
+struct TouchState {
+    button: usize,
+    inside: bool,
+}
+
+// Input state belongs to the deck, so transitions always release the old layer
+// before changing the displayed layer or discarding its buttons on reload.
+pub struct LayerDeck {
+    layers: Vec<FunctionLayer>,
+    names: HashMap<String, usize>,
+    home: usize,
+    fn_layer: Option<usize>,
+    legacy: bool,
+    active: usize,
+    fn_pressed: bool,
+    fn_return: Option<usize>,
+    touches: HashMap<u32, TouchState>,
+}
+
+impl LayerDeck {
+    fn new(
+        layers: Vec<(String, FunctionLayer)>,
+        home: usize,
+        fn_layer: Option<usize>,
+        legacy: bool,
+    ) -> Self {
+        let names = layers
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (name.clone(), i))
+            .collect();
+        Self {
+            layers: layers.into_iter().map(|(_, layer)| layer).collect(),
+            names,
+            home,
+            fn_layer,
+            legacy,
+            active: home,
+            fn_pressed: false,
+            fn_return: None,
+            touches: HashMap::new(),
+        }
+    }
+
+    fn current(&self) -> &FunctionLayer {
+        &self.layers[self.active]
+    }
+
+    fn current_mut(&mut self) -> &mut FunctionLayer {
+        &mut self.layers[self.active]
+    }
+
+    fn release_all(&mut self, emit_keys: &mut impl FnMut(&[Key], bool)) {
+        for layer in &mut self.layers {
+            for (_, button) in &mut layer.buttons {
+                button.set_active(false, emit_keys);
+            }
+        }
+        self.touches.clear();
+    }
+
+    fn switch_to(&mut self, target: usize, emit_keys: &mut impl FnMut(&[Key], bool)) -> bool {
+        if target >= self.layers.len() || target == self.active {
+            return false;
+        }
+        self.release_all(emit_keys);
+        self.active = target;
+        true
+    }
+
+    fn switch_named(&mut self, name: &str, emit_keys: &mut impl FnMut(&[Key], bool)) -> bool {
+        let Some(&target) = self.names.get(name) else {
+            return false;
+        };
+        // Explicit navigation wins over a temporary Fn selection.
+        self.fn_return = None;
+        self.switch_to(target, emit_keys)
+    }
+
+    fn fn_event(
+        &mut self,
+        pressed: bool,
+        double_press: bool,
+        emit_keys: &mut impl FnMut(&[Key], bool),
+    ) -> bool {
+        if self.fn_pressed == pressed {
+            return false;
+        }
+        self.fn_pressed = pressed;
+        if pressed {
+            if self.legacy && double_press {
+                if let Some(alternate) = &mut self.fn_layer {
+                    std::mem::swap(&mut self.home, alternate);
+                }
+            }
+            self.fn_return = Some(if self.legacy { self.home } else { self.active });
+            self.fn_layer
+                .is_some_and(|target| self.switch_to(target, emit_keys))
+        } else {
+            self.fn_return
+                .take()
+                .is_some_and(|target| self.switch_to(target, emit_keys))
+        }
+    }
+
+    fn update_button(&mut self, button: usize, emit_keys: &mut impl FnMut(&[Key], bool)) {
+        let active = self
+            .touches
+            .values()
+            .any(|touch| touch.button == button && touch.inside);
+        self.current_mut().buttons[button]
+            .1
+            .set_active(active, emit_keys);
+    }
+
+    fn touch_down(
+        &mut self,
+        slot: u32,
+        button: usize,
+        emit_keys: &mut impl FnMut(&[Key], bool),
+    ) -> bool {
+        self.touch_up(slot, emit_keys);
+        if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
+            return false;
+        }
+        if let ButtonAction::SwitchLayer(name) = &self.current().buttons[button].1.action {
+            let name = name.clone();
+            return self.switch_named(&name, emit_keys);
+        }
+        self.touches.insert(
+            slot,
+            TouchState {
+                button,
+                inside: true,
+            },
+        );
+        self.update_button(button, emit_keys);
+        false
+    }
+
+    fn touch_motion(&mut self, slot: u32, inside: bool, emit_keys: &mut impl FnMut(&[Key], bool)) {
+        if let Some(touch) = self.touches.get_mut(&slot) {
+            touch.inside = inside;
+            let button = touch.button;
+            self.update_button(button, emit_keys);
+        }
+    }
+
+    fn touch_up(&mut self, slot: u32, emit_keys: &mut impl FnMut(&[Key], bool)) {
+        if let Some(touch) = self.touches.remove(&slot) {
+            self.update_button(touch.button, emit_keys);
+        }
+    }
+
+    fn replace(&mut self, new: Self, emit_keys: &mut impl FnMut(&[Key], bool)) {
+        self.release_all(emit_keys);
+        *self = new;
+    }
+}
+
 struct Interface;
 
 impl LibinputInterface for Interface {
@@ -796,7 +965,7 @@ where
         .unwrap();
 }
 
-fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &Vec<Key>, value: i32)
+fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &[Key], value: i32)
 where
     F: AsRawFd,
 {
@@ -848,7 +1017,7 @@ fn real_main(drm: &mut DrmBackend) {
     let mut cfg_mgr = ConfigManager::new();
     let (mut cfg, mut layers) = cfg_mgr.load_config(width);
     let mut pixel_shift = PixelShiftManager::new();
-    let mut last = Instant::now();
+    let mut last_fn_press: Option<Instant> = None;
 
     // drop privileges to input and video group
     let groups = ["input", "video"];
@@ -861,7 +1030,6 @@ fn real_main(drm: &mut DrmBackend) {
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
-    let mut active_layer = 0;
     let mut needs_complete_redraw = true;
 
     let mut input_tb = Libinput::new_with_udev(Interface);
@@ -911,16 +1079,18 @@ fn real_main(drm: &mut DrmBackend) {
     uinput.dev_create().unwrap();
 
     let mut digitizer: Option<InputDevice> = None;
-    let mut touches = HashMap::<u32, (usize, usize)>::new();
-    let mut last_redraw_ts = if layers[active_layer].faster_refresh {
+    let mut last_redraw_ts = if layers.current().faster_refresh {
         Local::now().second()
     } else {
         Local::now().minute()
     };
     loop {
-        if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
-            touches = HashMap::<u32, (usize, usize)>::new();
-            active_layer = 0;
+        if let Some((new_cfg, new_layers)) = cfg_mgr.update_config(width) {
+            layers.replace(new_layers, &mut |keys, active| {
+                toggle_keys(&mut uinput, keys, active as i32)
+            });
+            cfg = new_cfg;
+            last_fn_press = None;
             needs_complete_redraw = true;
         }
 
@@ -936,30 +1106,30 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
         }
 
-        let current_ts = if layers[active_layer].faster_refresh {
+        let current_ts = if layers.current().faster_refresh {
             Local::now().second()
         } else {
             Local::now().minute()
         };
-        if layers[active_layer].displays_time && (current_ts != last_redraw_ts) {
+        if layers.current().displays_time && (current_ts != last_redraw_ts) {
             needs_complete_redraw = true;
             last_redraw_ts = current_ts;
         }
-        if layers[active_layer].displays_battery {
-            for button in &mut layers[active_layer].buttons {
+        if layers.current().displays_battery {
+            for button in &mut layers.current_mut().buttons {
                 if let ButtonImage::Battery(_, _, _) = button.1.image {
                     button.1.changed = true;
                 }
             }
         }
 
-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.changed) {
+        if needs_complete_redraw || layers.current().buttons.iter().any(|b| b.1.changed) {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
                 (0.0, 0.0)
             };
-            let clips = layers[active_layer].draw(
+            let clips = layers.current_mut().draw(
                 &cfg,
                 width as i32,
                 height as i32,
@@ -994,22 +1164,30 @@ fn real_main(drm: &mut DrmBackend) {
                         digitizer = Some(dev);
                     }
                 }
+                Event::Device(DeviceEvent::Removed(evt)) => {
+                    if Some(evt.device()) == digitizer {
+                        layers.release_all(&mut |keys, active| {
+                            toggle_keys(&mut uinput, keys, active as i32)
+                        });
+                        digitizer = None;
+                    }
+                }
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
                     if key.key() == Key::Fn as u32 {
-                        if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
-                            if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
-                                layers.swap(0, 1);
-                            }
-                            last = Instant::now();
+                        let pressed = key.key_state() == KeyState::Pressed;
+                        let double_press = pressed
+                            && cfg.double_press_switch_layers > 0
+                            && last_fn_press.is_some_and(|last| {
+                                last.elapsed()
+                                    < Duration::from_millis(cfg.double_press_switch_layers.into())
+                            });
+                        if pressed {
+                            last_fn_press = Some(Instant::now());
                         }
-                        let new_layer = match key.key_state() {
-                            KeyState::Pressed => 1,
-                            KeyState::Released => 0,
-                        };
-                        if active_layer != new_layer {
-                            active_layer = new_layer;
-                            needs_complete_redraw = true;
-                        }
+                        needs_complete_redraw |=
+                            layers.fn_event(pressed, double_press, &mut |keys, active| {
+                                toggle_keys(&mut uinput, keys, active as i32)
+                            });
                     }
                 }
                 Event::Touch(te) => {
@@ -1020,33 +1198,36 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
-                                touches.insert(dn.seat_slot(), (active_layer, btn));
-                                layers[active_layer].buttons[btn]
-                                    .1
-                                    .set_active(&mut uinput, true);
+                            if let Some(btn) = layers.current().hit(width, height, x, y, None) {
+                                needs_complete_redraw |=
+                                    layers.touch_down(dn.seat_slot(), btn, &mut |keys, active| {
+                                        toggle_keys(&mut uinput, keys, active as i32)
+                                    });
                             }
                         }
                         TouchEvent::Motion(mtn) => {
-                            if !touches.contains_key(&mtn.seat_slot()) {
+                            let Some(touch) = layers.touches.get(&mtn.seat_slot()) else {
                                 continue;
-                            }
+                            };
 
                             let x = mtn.x_transformed(width as u32);
                             let y = mtn.y_transformed(height as u32);
-                            let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
-                            let hit = layers[active_layer]
-                                .hit(width, height, x, y, Some(btn))
+                            let hit = layers
+                                .current()
+                                .hit(width, height, x, y, Some(touch.button))
                                 .is_some();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+                            layers.touch_motion(mtn.seat_slot(), hit, &mut |keys, active| {
+                                toggle_keys(&mut uinput, keys, active as i32)
+                            });
                         }
                         TouchEvent::Up(up) => {
-                            if !touches.contains_key(&up.seat_slot()) {
-                                continue;
-                            }
-                            let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                            layers.touch_up(up.seat_slot(), &mut |keys, active| {
+                                toggle_keys(&mut uinput, keys, active as i32)
+                            });
                         }
+                        TouchEvent::Cancel(_) => layers.release_all(&mut |keys, active| {
+                            toggle_keys(&mut uinput, keys, active as i32)
+                        }),
                         _ => {}
                     }
                 }
@@ -1054,5 +1235,293 @@ fn real_main(drm: &mut DrmBackend) {
             }
         }
         backlight.update_backlight(&cfg);
+        if backlight.current_bl() == 0 {
+            layers.release_all(&mut |keys, active| toggle_keys(&mut uinput, keys, active as i32));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(label: &str, action: ButtonAction) -> ButtonConfig {
+        ButtonConfig {
+            text: Some(label.into()),
+            action,
+            ..ButtonConfig::default()
+        }
+    }
+    fn keys(label: &str, keys: &[Key]) -> ButtonConfig {
+        text(label, ButtonAction::Keys(keys.to_vec()))
+    }
+    fn nav(label: &str, layer: &str) -> ButtonConfig {
+        text(label, ButtonAction::SwitchLayer(layer.into()))
+    }
+    fn named_deck() -> LayerDeck {
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        nav("Functions", "function"),
+                        nav("Media", "media"),
+                    ]),
+                ),
+                (
+                    "function".into(),
+                    FunctionLayer::with_config(vec![nav("Home", "home"), keys("F1", &[Key::F1])]),
+                ),
+                (
+                    "media".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        keys("Play", &[Key::PlayPause]),
+                    ]),
+                ),
+            ],
+            0,
+            Some(1),
+            false,
+        )
+    }
+
+    #[test]
+    fn navigation_hit_testing_and_redraw_display_the_selected_bar() {
+        let mut deck = named_deck();
+        let config = Config {
+            show_button_outlines: true,
+            enable_pixel_shift: false,
+            font_face: cairo::FontFace::toy_create(
+                "sans",
+                cairo::FontSlant::Normal,
+                cairo::FontWeight::Bold,
+            )
+            .unwrap(),
+            adaptive_brightness: false,
+            active_brightness: 128,
+            double_press_switch_layers: 0,
+        };
+        let (width, height) = (2008, 60);
+        let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
+        deck.current_mut()
+            .draw(&config, width, height, &surface, (0.0, 0.0), true);
+        let home_image = surface.data().unwrap().to_vec();
+
+        // The center navigation button on home opens the function bar.
+        let button = deck
+            .current()
+            .hit(width as u16, height as u16, (width / 2) as f64, 30.0, None)
+            .unwrap();
+        assert!(deck.touch_down(0, button, &mut |_, _| {}));
+        deck.current_mut()
+            .draw(&config, width, height, &surface, (0.0, 0.0), true);
+        assert_ne!(&*surface.data().unwrap(), home_image.as_slice());
+
+        // The first button on the function bar returns to the same home image.
+        let button = deck
+            .current()
+            .hit(width as u16, height as u16, 100.0, 30.0, None)
+            .unwrap();
+        assert!(deck.touch_down(1, button, &mut |_, _| {}));
+        deck.current_mut()
+            .draw(&config, width, height, &surface, (0.0, 0.0), true);
+        assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
+    }
+
+    #[test]
+    fn on_bar_navigation_releases_keys_ignores_old_touches_and_returns_home() {
+        let mut deck = named_deck();
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        assert!(!deck.touch_down(0, 0, &mut emit));
+        assert!(deck.touch_down(1, 1, &mut emit));
+        assert_eq!(deck.active, 1);
+        assert!(deck.touches.is_empty());
+        deck.touch_motion(0, true, &mut emit);
+        deck.touch_up(0, &mut emit);
+        deck.touch_motion(1, true, &mut emit);
+        deck.touch_up(1, &mut emit);
+        assert!(deck.touch_down(2, 0, &mut emit));
+        assert_eq!(deck.active, deck.home);
+        assert!(deck.touch_down(3, 2, &mut emit));
+        assert_eq!(deck.active, 2);
+        assert!(deck.touch_down(4, 0, &mut emit));
+        assert_eq!(deck.active, deck.home);
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, button)| !button.active)));
+        assert_eq!(
+            events,
+            vec![
+                (vec![Key::LeftCtrl, Key::F1], true),
+                (vec![Key::LeftCtrl, Key::F1], false)
+            ]
+        );
+    }
+
+    #[test]
+    fn named_fn_is_temporary_and_on_bar_navigation_wins() {
+        let mut deck = named_deck();
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.switch_named("media", &mut emit);
+        deck.touch_down(0, 1, &mut emit);
+        assert!(deck.fn_event(true, false, &mut emit));
+        assert_eq!(deck.active, 1);
+        deck.touch_down(1, 1, &mut emit);
+        assert!(deck.fn_event(false, false, &mut emit));
+        assert_eq!(deck.active, 2);
+        assert!(deck.fn_event(true, false, &mut emit));
+        assert!(deck.touch_down(2, 0, &mut emit)); // Home while Fn is held
+        assert_eq!(deck.active, deck.home);
+        assert!(!deck.fn_event(false, false, &mut emit));
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(
+            events,
+            vec![
+                (vec![Key::PlayPause], true),
+                (vec![Key::PlayPause], false),
+                (vec![Key::F1], true),
+                (vec![Key::F1], false),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_fn_and_double_press_keep_both_default_orders() {
+        for home in [0, 1] {
+            let mut deck = LayerDeck::new(
+                vec![
+                    (
+                        "primary".into(),
+                        FunctionLayer::with_config(vec![keys("F1", &[Key::F1])]),
+                    ),
+                    (
+                        "media".into(),
+                        FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]),
+                    ),
+                ],
+                home,
+                Some(1 - home),
+                true,
+            );
+            let mut events = Vec::new();
+            let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+            deck.touch_down(0, 0, &mut emit);
+            assert!(deck.fn_event(true, false, &mut emit));
+            assert_eq!(deck.active, 1 - home);
+            assert!(deck.fn_event(false, false, &mut emit));
+            assert_eq!(deck.active, home);
+            // Second quick Fn press changes the default, without swapping button storage.
+            assert!(!deck.fn_event(true, true, &mut emit));
+            assert_eq!(deck.active, home);
+            assert!(deck.fn_event(false, false, &mut emit));
+            assert_eq!(deck.active, 1 - home);
+            assert_eq!(deck.home, 1 - home);
+            assert_eq!(events.len(), 2);
+            assert!(events[0].1);
+            assert!(!events[1].1);
+            assert_eq!(events[0].0, events[1].0);
+        }
+    }
+
+    #[test]
+    fn reload_to_a_smaller_deck_releases_input_and_resets_to_new_home() {
+        let mut deck = named_deck();
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.fn_event(true, false, &mut emit);
+        deck.touch_down(0, 1, &mut emit);
+        let replacement = LayerDeck::new(
+            vec![(
+                "new-home".into(),
+                FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]),
+            )],
+            0,
+            None,
+            false,
+        );
+        deck.replace(replacement, &mut emit);
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(deck.layers.len(), 1);
+        assert!(deck.touches.is_empty());
+        deck.touch_motion(0, true, &mut emit);
+        deck.touch_up(0, &mut emit);
+        assert!(!deck.fn_event(false, false, &mut emit));
+        deck.touch_down(1, 0, &mut emit);
+        deck.touch_up(1, &mut emit);
+        assert_eq!(
+            events,
+            vec![
+                (vec![Key::F1], true),
+                (vec![Key::F1], false),
+                (vec![Key::VolumeUp], true),
+                (vec![Key::VolumeUp], false),
+            ]
+        );
+    }
+
+    #[test]
+    fn motion_releases_and_represses_keys_and_up_ends_capture() {
+        let mut deck = named_deck();
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.touch_down(0, 0, &mut emit);
+        deck.touch_motion(0, false, &mut emit);
+        deck.touch_motion(0, true, &mut emit);
+        deck.touch_up(0, &mut emit);
+        deck.touch_motion(0, true, &mut emit);
+        deck.touch_up(0, &mut emit);
+        assert!(deck.touches.is_empty());
+        assert_eq!(
+            events.iter().map(|(_, active)| *active).collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn multiple_fingers_on_one_button_release_after_the_last_finger() {
+        let mut deck = named_deck();
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.touch_down(0, 0, &mut emit);
+        deck.touch_down(1, 0, &mut emit);
+        deck.touch_motion(0, false, &mut emit);
+        deck.touch_up(1, &mut emit);
+        assert!(!deck.current().buttons[0].1.active);
+        deck.touch_motion(0, true, &mut emit);
+        deck.release_all(&mut emit); // cancel, device removal, or display sleeping
+        deck.touch_motion(0, true, &mut emit);
+        assert!(deck.touches.is_empty());
+        assert_eq!(
+            events.iter().map(|(_, active)| *active).collect::<Vec<_>>(),
+            vec![true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn invalid_target_does_not_change_state_or_release_held_keys() {
+        let mut deck = named_deck();
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.touch_down(0, 0, &mut emit);
+        assert!(!deck.switch_named("missing", &mut emit));
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(deck.touches.len(), 1);
+        deck.touch_up(0, &mut emit);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn fn_without_a_target_and_named_double_press_do_not_change_the_home() {
+        let mut deck = named_deck();
+        deck.fn_layer = None;
+        assert!(!deck.fn_event(true, true, &mut |_, _| {}));
+        assert!(!deck.fn_event(false, false, &mut |_, _| {}));
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(deck.home, 0);
     }
 }
