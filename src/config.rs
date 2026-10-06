@@ -301,7 +301,7 @@ fn load_config(
         adaptive_brightness: base.adaptive_brightness.unwrap(),
         font_face: load_font(&base.font_template.unwrap()),
         active_brightness: base.active_brightness.unwrap(),
-        double_press_switch_layers: base.double_press_switch_layers.unwrap(),
+        double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
     };
     Ok((cfg, layers))
 }
@@ -696,26 +696,35 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
         deck.touch_down(0, 1, &mut emit);
+        drop(emit);
         assert_eq!(events, vec![(vec![Key::F1], true)]);
 
         fs::write(&path, NAMED.replace("F1", "F5")).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.replace(replacement, &mut emit);
+        drop(emit);
         assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
         events.clear();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
         deck.touch_down(0, 1, &mut emit);
+        drop(emit);
         assert_eq!(events, vec![(vec![Key::F5], true)]);
 
         let stage = dotfiles.join("config.new");
         fs::write(&stage, NAMED.replace("F1", "F6")).unwrap();
         fs::rename(&stage, &target).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.replace(replacement, &mut emit);
+        drop(emit);
         assert_eq!(events, vec![(vec![Key::F5], true), (vec![Key::F5], false)]);
         events.clear();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
         deck.touch_down(0, 1, &mut emit);
+        drop(emit);
         assert_eq!(events, vec![(vec![Key::F6], true)]);
     }
 
@@ -783,5 +792,27 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         assert!(deck.touches.is_empty());
         deck.touch_up(0, &mut emit);
         assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
+    }
+
+    #[test]
+    fn base_without_double_press_loads_with_the_feature_disabled() {
+        // Distro-installed base configs predate DoublePressSwitchLayers and the
+        // shipped multibar example does not set it either (README install path).
+        let mut installed: toml::Value = toml::from_str(BASE).unwrap();
+        assert!(installed
+            .as_table_mut()
+            .unwrap()
+            .remove("DoublePressSwitchLayers")
+            .is_some());
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        fs::write(&base_path, toml::to_string(&installed).unwrap()).unwrap();
+        let user_path = tmp.0.join("config.toml");
+        fs::write(&user_path, include_str!("../share/tiny-dfr/multibar.toml")).unwrap();
+        let manager = ConfigManager::with_paths(base_path, user_path);
+        let (cfg, deck) = manager.load_config(2008);
+        assert_eq!(cfg.double_press_switch_layers, 0);
+        assert!(!deck.legacy);
+        assert_eq!(deck.layers.len(), 3);
     }
 }
