@@ -330,9 +330,8 @@ fn arm_dir_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescript
 }
 
 fn arm_file_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescriptor> {
-    let flags = AddWatchFlags::IN_CLOSE_WRITE
-        | AddWatchFlags::IN_MOVE_SELF
-        | AddWatchFlags::IN_DELETE_SELF;
+    let flags =
+        AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVE_SELF | AddWatchFlags::IN_DELETE_SELF;
     match inotify_fd.add_watch(user_path, flags) {
         Ok(wd) => Some(wd),
         Err(Errno::ENOENT) => None,
@@ -406,7 +405,8 @@ impl ConfigManager {
                     ret = true;
                 }
             } else if Some(evt.wd) == self.file_watch {
-                if evt.mask
+                if evt
+                    .mask
                     .intersects(AddWatchFlags::IN_MOVE_SELF | AddWatchFlags::IN_DELETE_SELF)
                 {
                     self.rearm_file_watch();
