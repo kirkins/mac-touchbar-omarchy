@@ -308,12 +308,13 @@ fn load_config(
 
 pub struct ConfigManager {
     inotify_fd: Inotify,
-    watch_desc: Option<WatchDescriptor>,
+    dir_watch: Option<WatchDescriptor>,
+    file_watch: Option<WatchDescriptor>,
     user_path: PathBuf,
     base_path: PathBuf,
 }
 
-fn arm_inotify(inotify_fd: &Inotify, user_path: &std::path::Path) -> Option<WatchDescriptor> {
+fn arm_dir_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescriptor> {
     // Watch the parent to handle both direct writes and editors' atomic renames.
     let flags = AddWatchFlags::IN_MOVED_TO
         | AddWatchFlags::IN_MOVED_FROM
@@ -328,16 +329,29 @@ fn arm_inotify(inotify_fd: &Inotify, user_path: &std::path::Path) -> Option<Watc
     }
 }
 
+fn arm_file_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescriptor> {
+    let flags = AddWatchFlags::IN_CLOSE_WRITE
+        | AddWatchFlags::IN_MOVE_SELF
+        | AddWatchFlags::IN_DELETE_SELF;
+    match inotify_fd.add_watch(user_path, flags) {
+        Ok(wd) => Some(wd),
+        Err(Errno::ENOENT) => None,
+        e => Some(e.unwrap()),
+    }
+}
+
 impl ConfigManager {
     pub fn new() -> ConfigManager {
         Self::with_paths(PathBuf::from(BASE_CFG_PATH), PathBuf::from(USER_CFG_PATH))
     }
     fn with_paths(base_path: PathBuf, user_path: PathBuf) -> ConfigManager {
         let inotify_fd = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
-        let watch_desc = arm_inotify(&inotify_fd, &user_path);
+        let dir_watch = arm_dir_watch(&inotify_fd, &user_path);
+        let file_watch = arm_file_watch(&inotify_fd, &user_path);
         ConfigManager {
             inotify_fd,
-            watch_desc,
+            dir_watch,
+            file_watch,
             user_path,
             base_path,
         }
@@ -361,34 +375,56 @@ impl ConfigManager {
         }
     }
     fn pending_reload(&mut self) -> bool {
-        if self.watch_desc.is_none() {
-            self.watch_desc = arm_inotify(&self.inotify_fd, &self.user_path);
-            return self.watch_desc.is_some();
+        let mut pending = false;
+        if self.dir_watch.is_none() {
+            self.dir_watch = arm_dir_watch(&self.inotify_fd, &self.user_path);
+            pending = self.dir_watch.is_some();
+        }
+        if self.file_watch.is_none() {
+            self.file_watch = arm_file_watch(&self.inotify_fd, &self.user_path);
+            pending |= self.file_watch.is_some();
         }
         match self.inotify_fd.read_events() {
-            Err(Errno::EAGAIN) => false,
-            r => self.handle_events(r),
+            Err(Errno::EAGAIN) => pending,
+            r => self.handle_events(r) || pending,
         }
     }
     #[cold]
     fn handle_events(&mut self, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
         let mut ret = false;
         for evt in evts.unwrap() {
-            if Some(evt.wd) != self.watch_desc {
-                continue;
-            }
-            if evt.mask.intersects(
-                AddWatchFlags::IN_IGNORED
-                    | AddWatchFlags::IN_DELETE_SELF
-                    | AddWatchFlags::IN_MOVE_SELF,
-            ) {
-                self.watch_desc = None;
-            }
-            if evt.name.as_deref() == self.user_path.file_name() {
-                ret = true;
+            if Some(evt.wd) == self.dir_watch {
+                if evt.mask.intersects(
+                    AddWatchFlags::IN_IGNORED
+                        | AddWatchFlags::IN_DELETE_SELF
+                        | AddWatchFlags::IN_MOVE_SELF,
+                ) {
+                    self.dir_watch = None;
+                }
+                if evt.name.as_deref() == self.user_path.file_name() {
+                    self.rearm_file_watch();
+                    ret = true;
+                }
+            } else if Some(evt.wd) == self.file_watch {
+                if evt.mask
+                    .intersects(AddWatchFlags::IN_MOVE_SELF | AddWatchFlags::IN_DELETE_SELF)
+                {
+                    self.rearm_file_watch();
+                    ret = true;
+                } else if evt.mask.intersects(AddWatchFlags::IN_IGNORED) {
+                    self.file_watch = arm_file_watch(&self.inotify_fd, &self.user_path);
+                } else if evt.mask.intersects(AddWatchFlags::IN_CLOSE_WRITE) {
+                    ret = true;
+                }
             }
         }
         ret
+    }
+    fn rearm_file_watch(&mut self) {
+        if let Some(wd) = self.file_watch.take() {
+            let _ = self.inotify_fd.rm_watch(wd);
+        }
+        self.file_watch = arm_file_watch(&self.inotify_fd, &self.user_path);
     }
     pub fn fd(&self) -> &impl AsFd {
         &self.inotify_fd
@@ -399,6 +435,7 @@ impl ConfigManager {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::symlink;
 
     const BASE: &str = include_str!("../share/tiny-dfr/config.toml");
     const NAMED: &str = r#"
@@ -637,6 +674,49 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         fs::remove_file(path).unwrap();
         assert!(manager.pending_reload());
         assert!(!manager.pending_reload());
+    }
+
+    #[test]
+    fn symlinked_config_reloads_in_place_writes_and_target_replacements() {
+        let tmp = TempDir::new();
+        let base = tmp.0.join("base.toml");
+        fs::write(&base, text_only_base()).unwrap();
+        let dotfiles = tmp.0.join("dotfiles");
+        fs::create_dir(&dotfiles).unwrap();
+        let target = dotfiles.join("config.toml");
+        fs::write(&target, NAMED).unwrap();
+        let path = tmp.0.join("config.toml");
+        symlink(&target, &path).unwrap();
+
+        let mut manager = ConfigManager::with_paths(base, path.clone());
+        let (_, mut deck) = manager.load_config(2008);
+        assert!(!deck.legacy);
+        assert_eq!(deck.layers.len(), 2);
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.switch_named("function", &mut emit);
+        deck.touch_down(0, 1, &mut emit);
+        assert_eq!(events, vec![(vec![Key::F1], true)]);
+
+        fs::write(&path, NAMED.replace("F1", "F5")).unwrap();
+        let (_, replacement) = manager.update_config(2008).unwrap();
+        deck.replace(replacement, &mut emit);
+        assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
+        events.clear();
+        deck.switch_named("function", &mut emit);
+        deck.touch_down(0, 1, &mut emit);
+        assert_eq!(events, vec![(vec![Key::F5], true)]);
+
+        let stage = dotfiles.join("config.new");
+        fs::write(&stage, NAMED.replace("F1", "F6")).unwrap();
+        fs::rename(&stage, &target).unwrap();
+        let (_, replacement) = manager.update_config(2008).unwrap();
+        deck.replace(replacement, &mut emit);
+        assert_eq!(events, vec![(vec![Key::F5], true), (vec![Key::F5], false)]);
+        events.clear();
+        deck.switch_named("function", &mut emit);
+        deck.touch_down(0, 1, &mut emit);
+        assert_eq!(events, vec![(vec![Key::F6], true)]);
     }
 
     #[test]
