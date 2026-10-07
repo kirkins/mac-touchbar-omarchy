@@ -53,9 +53,10 @@ pub struct Bar {
     pub home_active: bool,
 }
 
-/// An occupied horizontal span of the bar in layout coordinates (before any
-/// pixel-shift offset is applied). `clock` marks the clock widget the pet
-/// prefers to nap next to.
+/// An occupied horizontal span of the bar in layout coordinates mirroring
+/// the drawn button geometry: the static pixel-shift inset is included, the
+/// dynamic shift is applied later at draw and tap time. `clock` marks the
+/// clock widget the pet prefers to nap next to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
     pub left: f64,
