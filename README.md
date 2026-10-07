@@ -20,9 +20,11 @@ CARGO_BUILD_JOBS=1 cargo build --locked --release
 ```
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
-cover configuration compatibility, navigation, Fn behavior, reloads, and emitted
-key presses/releases. Physical layout, touch accuracy, brightness, media-key
-delivery to the desktop, and live battery/clock refresh still need a device test.
+cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
+presses/releases, and battery widget cycling. Physical layout, touch accuracy,
+brightness, media-key delivery to the desktop, and live battery/clock refresh
+still need a device test; battery checks there must include repeated
+tap-to-cycle, device labels in each display mode, hotplug, and timed return.
 
 ## Named bars
 
@@ -79,10 +81,6 @@ return delay after the last cycling tap; it must be greater than zero. Both
 settings have these defaults when absent from older configurations. Cycling,
 automatic return, and removal of a selected source release held virtual keys and
 discard existing touches; fingers already down must lift before pressing again.
-
-Offline tests cover source discovery, cycling, timeout, removal, configuration,
-and key-release safety. Physical Touch Bar validation must still check repeated
-tap-to-cycle, device labels in each display mode, live hotplug, and timed return.
 
 Unknown targets, duplicate or empty names, and empty bars reject the candidate
 configuration. Invalid TOML or layer definitions at startup log an error and use
