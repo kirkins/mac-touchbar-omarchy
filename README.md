@@ -81,6 +81,9 @@ seconds. A disconnected or unreadable selected device returns to the system.
 action and original system-battery display. With no device battery, the widget
 also retains that behavior. `BatteryCycleTimeoutSecs = 15` sets the automatic
 return delay after the last cycling tap; it must be greater than zero. Both
+settings have these defaults when absent from older configurations. Cycling,
+automatic return, and removal of a selected source release held virtual keys and
+discard existing touches; fingers already down must lift before pressing again.
 
 ## Touch Bar pet
 
@@ -93,12 +96,13 @@ it sits and begs, and tapping the pet itself or the bar next to it drops a
 kibble it walks over and munches. A satiety value decays over about an hour and
 gates the behavior: hungry pets beg and never nap, well-fed pets nap and wander.
 A direct tap on the pet is always consumed and never fires the widget
-underneath; nearby taps are only consumed while the pet is hungry and begging.
+underneath; nearby taps are consumed only while the pet is hungry, whether it
+is idling, walking, or begging.
 The pet is drawn as tiny per-state pixel frames through the existing cairo
 surface - no images are loaded and no font glyphs are required.
 
 ```toml
-PetEnabled = true   # remove the pet entirely
+PetEnabled = true   # set false to remove the pet entirely
 PetVariant = "cat"  # or "fox"
 PetEnergy = "calm"  # or "rowdy" for a faster, hungrier pet
 ```
@@ -108,9 +112,6 @@ keys keep the defaults above, and the pet survives config reloads in place
 (nap, position, and satiety included). The pet only ever appears on the home
 bar; sub-bars and the Fn layer are pet-free. There is no scripting, network
 access, or persistence beyond the running daemon.
-settings have these defaults when absent from older configurations. Cycling,
-automatic return, and removal of a selected source release held virtual keys and
-discard existing touches; fingers already down must lift before pressing again.
 
 Unknown targets, duplicate or empty names, and empty bars reject the candidate
 configuration. Invalid TOML or layer definitions at startup log an error and use
