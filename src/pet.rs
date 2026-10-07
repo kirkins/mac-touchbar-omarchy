@@ -892,9 +892,7 @@ impl PetManager {
             });
         };
         match self.state {
-            PetState::Idle { until } | PetState::Nap { until, .. } => {
-                consider(until)
-            }
+            PetState::Idle { until } | PetState::Nap { until, .. } => consider(until),
             PetState::Beg { until } => {
                 consider(until);
                 if let Some(t) = self.next_step {
