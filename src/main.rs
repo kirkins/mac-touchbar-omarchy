@@ -48,12 +48,14 @@ mod backlight;
 mod config;
 mod display;
 mod fonts;
+mod pet;
 mod pixel_shift;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
 use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
+use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 
 const BUTTON_SPACING_PX: i32 = 16;
@@ -941,6 +943,40 @@ impl FunctionLayer {
         modified_regions
     }
 
+    /// Occupied widget spans of this layer in layout coordinates, mirroring
+    /// the drawn button geometry including the static pixel-shift inset.
+    /// Spacers are free space; `clock` marks the time widget the pet naps
+    /// next to.
+    fn layout_spans(&self, width: i32, pixel_shift_width: u64) -> Vec<PetSpan> {
+        let virtual_button_width = ((width - pixel_shift_width as i32)
+            - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
+            as f64
+            / self.virtual_button_count as f64;
+        let mut spans = Vec::new();
+        for (i, (start, button)) in self.buttons.iter().enumerate() {
+            if matches!(button.image, ButtonImage::Spacer) {
+                continue;
+            }
+            let end = if i + 1 < self.buttons.len() {
+                self.buttons[i + 1].0
+            } else {
+                self.virtual_button_count
+            };
+            let left_edge = (*start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+                .floor()
+                + (pixel_shift_width / 2) as f64;
+            let button_width = virtual_button_width
+                + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+                    .floor();
+            spans.push(PetSpan {
+                left: left_edge,
+                right: left_edge + button_width,
+                clock: matches!(button.image, ButtonImage::Time(..)),
+            });
+        }
+        spans
+    }
+
     fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
         let virtual_button_width =
             (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
@@ -1271,6 +1307,7 @@ fn real_main(drm: &mut DrmBackend) {
     let mut cfg_mgr = ConfigManager::new();
     let (mut cfg, mut layers) = cfg_mgr.load_config(width);
     let mut pixel_shift = PixelShiftManager::new();
+    let mut pet = PetManager::new(cfg.pet_enabled, cfg.pet_variant, cfg.pet_energy);
     let mut last_fn_press: Option<Instant> = None;
 
     // drop privileges to input and video group
@@ -1352,6 +1389,7 @@ fn real_main(drm: &mut DrmBackend) {
                 toggle_keys(&mut uinput, keys, active as i32)
             });
             cfg = new_cfg;
+            pet.apply_config(cfg.pet_enabled, cfg.pet_variant, cfg.pet_energy);
             last_fn_press = None;
             needs_complete_redraw = true;
         }
@@ -1382,6 +1420,32 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
         }
 
+        // The pet lives on the home bar; on other layers it waits unseen.
+        let home_active = layers.active == layers.home;
+        let pet_bar = PetBar {
+            width: width as f64,
+            height: height as f64,
+            home_active,
+        };
+        let pet_pixel_shift_width = if cfg.enable_pixel_shift {
+            PIXEL_SHIFT_WIDTH_PX
+        } else {
+            0
+        };
+        let pet_spans = if home_active {
+            layers
+                .current()
+                .layout_spans(width as i32, pet_pixel_shift_width)
+        } else {
+            Vec::new()
+        };
+        let (pet_needs_redraw, pet_next_timeout_ms) =
+            pet.update(Instant::now(), &pet_bar, &pet_spans);
+        if pet_needs_redraw {
+            needs_complete_redraw = true;
+        }
+        next_timeout_ms = min(next_timeout_ms, pet_next_timeout_ms);
+
         let current_ts = if layers.current().faster_refresh {
             Local::now().second()
         } else {
@@ -1405,6 +1469,22 @@ fn real_main(drm: &mut DrmBackend) {
                 shift,
                 needs_complete_redraw,
             );
+            if pet.is_visible() {
+                let pixel_shift_width = if cfg.enable_pixel_shift {
+                    PIXEL_SHIFT_WIDTH_PX as f64
+                } else {
+                    0.0
+                };
+                let pet_c = Context::new(&surface).unwrap();
+                pet_c.translate(height as f64, 0.0);
+                pet_c.rotate((90.0f64).to_radians());
+                pet.draw(
+                    &pet_c,
+                    height as i32,
+                    (shift.0 + pixel_shift_width / 2.0, shift.1),
+                    Instant::now(),
+                );
+            }
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
             drm.dirty(&clips).unwrap();
@@ -1468,7 +1548,18 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if let Some(btn) = layers.current().hit(width, height, x, y, None) {
+                            let pet_shift_x = if cfg.enable_pixel_shift {
+                                pixel_shift.get().0 + (PIXEL_SHIFT_WIDTH_PX / 2) as f64
+                            } else {
+                                0.0
+                            };
+                            if pet.tap(x, y, Instant::now(), pet_shift_x) {
+                                // The pet consumed the tap; the widget
+                                // underneath must not fire.
+                                needs_complete_redraw = true;
+                            } else if let Some(btn) =
+                                layers.current().hit(width, height, x, y, None)
+                            {
                                 needs_complete_redraw |=
                                     layers.touch_down(dn.seat_slot(), btn, &mut |keys, active| {
                                         toggle_keys(&mut uinput, keys, active as i32)
@@ -1981,6 +2072,9 @@ mod tests {
             double_press_switch_layers: 0,
             battery_cycle_enabled: true,
             battery_cycle_timeout_secs: 15,
+            pet_enabled: false,
+            pet_variant: Default::default(),
+            pet_energy: Default::default(),
         };
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();

@@ -1,6 +1,7 @@
 use crate::fonts::{FontConfig, Pattern};
+use crate::pet::{PetEnergy, PetVariant};
 use crate::{FunctionLayer, LayerDeck};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cairo::FontFace;
 use freetype::Library as FtLibrary;
 use input_linux::Key;
@@ -28,6 +29,9 @@ pub struct Config {
     pub double_press_switch_layers: u32,
     pub battery_cycle_enabled: bool,
     pub battery_cycle_timeout_secs: u32,
+    pub pet_enabled: bool,
+    pub pet_variant: PetVariant,
+    pub pet_energy: PetEnergy,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +46,9 @@ struct ConfigProxy {
     double_press_switch_layers: Option<u32>,
     battery_cycle_enabled: Option<bool>,
     battery_cycle_timeout_secs: Option<u32>,
+    pet_enabled: Option<bool>,
+    pet_variant: Option<String>,
+    pet_energy: Option<String>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     layers: Option<Vec<LayerConfig>>,
@@ -129,6 +136,9 @@ impl ConfigProxy {
             double_press_switch_layers,
             battery_cycle_enabled,
             battery_cycle_timeout_secs,
+            pet_enabled,
+            pet_variant,
+            pet_energy,
             primary_layer_keys,
             media_layer_keys,
             layers,
@@ -263,6 +273,16 @@ fn parse_config(base: &str, user: Option<&str>, width: u16) -> Result<(ConfigPro
     if base.battery_cycle_timeout_secs == Some(0) {
         bail!("BatteryCycleTimeoutSecs must be greater than zero");
     }
+    base.pet_variant
+        .as_deref()
+        .map(PetVariant::parse)
+        .transpose()
+        .map_err(|err| anyhow!(err))?;
+    base.pet_energy
+        .as_deref()
+        .map(PetEnergy::parse)
+        .transpose()
+        .map_err(|err| anyhow!(err))?;
     let layers = base.layer_layout(width)?;
     Ok((base, layers))
 }
@@ -313,6 +333,17 @@ fn load_config(
         double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
         battery_cycle_enabled: base.battery_cycle_enabled.unwrap_or(true),
         battery_cycle_timeout_secs: base.battery_cycle_timeout_secs.unwrap_or(15),
+        pet_enabled: base.pet_enabled.unwrap_or(true),
+        pet_variant: base
+            .pet_variant
+            .as_deref()
+            .and_then(|value| PetVariant::parse(value).ok())
+            .unwrap_or_default(),
+        pet_energy: base
+            .pet_energy
+            .as_deref()
+            .and_then(|value| PetEnergy::parse(value).ok())
+            .unwrap_or_default(),
     };
     Ok((cfg, layers))
 }
@@ -690,6 +721,50 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         ] {
             assert!(parse_config(BASE, Some(invalid), 2008).is_err());
         }
+    }
+
+    #[test]
+    fn pet_settings_merge_with_legacy_defaults_and_reject_invalid_values() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        let user_path = tmp.0.join("config.toml");
+        // A base config predating the pet keeps working with defaults.
+        let mut legacy: toml::Value = toml::from_str(&text_only_base()).unwrap();
+        legacy.as_table_mut().unwrap().remove("PetEnabled");
+        legacy.as_table_mut().unwrap().remove("PetVariant");
+        legacy.as_table_mut().unwrap().remove("PetEnergy");
+        fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
+        let (config, _) = load_config(2008, &base_path, None).unwrap();
+        assert!(config.pet_enabled);
+        assert_eq!(config.pet_variant, PetVariant::Cat);
+        assert_eq!(config.pet_energy, PetEnergy::Calm);
+        // User overrides win over the base defaults.
+        fs::write(
+            &user_path,
+            "PetEnabled = false\nPetVariant = \"fox\"\nPetEnergy = \"rowdy\"",
+        )
+        .unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        assert!(!config.pet_enabled);
+        assert_eq!(config.pet_variant, PetVariant::Fox);
+        assert_eq!(config.pet_energy, PetEnergy::Rowdy);
+        // Invalid values are rejected like the other knobs.
+        for invalid in [
+            "PetVariant = \"dog\"",
+            "PetEnergy = \"zoomy\"",
+            "PetEnabled = 'true'",
+            "PetVariant = 42",
+        ] {
+            assert!(
+                parse_config(BASE, Some(invalid), 2008).is_err(),
+                "accepted invalid pet configuration: {invalid}"
+            );
+        }
+        // The shipped base config carries valid pet defaults.
+        let (config, _) = parse_config(BASE, None, 2008).unwrap();
+        assert!(config.pet_enabled.is_some());
+        assert_eq!(config.pet_variant.as_deref(), Some("cat"));
+        assert_eq!(config.pet_energy.as_deref(), Some("calm"));
     }
 
     #[test]
