@@ -571,7 +571,7 @@ impl PetManager {
                 } else {
                     let total = until.saturating_duration_since(started).as_secs_f64();
                     let t = now.saturating_duration_since(started).as_secs_f64() / total.max(1e-9);
-                    self.lift = -(STARTLE_LIFT * (std::f64::consts::PI * t).sin());
+                    self.lift = STARTLE_LIFT * (std::f64::consts::PI * t).sin();
                     redraw = true;
                 }
             }
@@ -949,7 +949,7 @@ fn frame_pair(
 
 fn hop_lift(hop: Option<Hop>, now: Instant) -> f64 {
     hop.map_or(0.0, |hop| {
-        -HOP_HEIGHT * (std::f64::consts::PI * hop.progress(now)).sin()
+        HOP_HEIGHT * (std::f64::consts::PI * hop.progress(now)).sin()
     })
 }
 
@@ -1238,7 +1238,7 @@ mod tests {
             tick(&mut p, &mut now, &spans, 40);
             if p.hop.is_some() {
                 hopped = true;
-                if p.lift < -5.0 {
+                if p.lift > 5.0 {
                     lifted = true;
                 }
             }
