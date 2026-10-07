@@ -878,8 +878,14 @@ impl PetManager {
             });
         };
         match self.state {
-            PetState::Idle { until } | PetState::Beg { until } | PetState::Nap { until, .. } => {
+            PetState::Idle { until } | PetState::Nap { until, .. } => {
                 consider(until)
+            }
+            PetState::Beg { until } => {
+                consider(until);
+                if let Some(t) = self.next_step {
+                    consider(t);
+                }
             }
             PetState::Walk { .. } => {
                 if let Some(hop) = self.hop {
@@ -1280,6 +1286,21 @@ mod tests {
         let spot = nap_spot(&spans, 100.0, p.min_x(), p.max_x());
         assert!(span_at(&spans, spot).is_none(), "nap spot must be free");
         assert!(spot < clock.left && clock.left - spot < 24.0);
+    }
+
+    #[test]
+    fn begging_schedules_frame_flips() {
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.state = PetState::Beg {
+            until: now + Duration::from_secs(3),
+        };
+        p.next_step = Some(now + Duration::from_millis(BEG_MS));
+        let (_, timeout) = tick(&mut p, &mut now, &[], 60);
+        assert!(
+            timeout <= BEG_MS as i32,
+            "beg frame flips must be scheduled, got {timeout}ms"
+        );
     }
 
     #[test]
