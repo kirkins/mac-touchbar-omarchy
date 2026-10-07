@@ -1874,8 +1874,7 @@ mod tests {
                 button.render(&c, 60, 0.0, 200, 0.0);
                 assert_eq!(c.font_matrix().xx(), 32.0); // The next widget keeps its font size.
             }
-            let pixels = surface.data().unwrap().to_vec();
-            pixels
+            surface.data().unwrap().to_vec()
         }
         for mode in [
             BatteryIconMode::Icon,
