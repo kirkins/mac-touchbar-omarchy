@@ -26,6 +26,8 @@ pub struct Config {
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
     pub double_press_switch_layers: u32,
+    pub battery_cycle_enabled: bool,
+    pub battery_cycle_timeout_secs: u32,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +40,8 @@ struct ConfigProxy {
     adaptive_brightness: Option<bool>,
     active_brightness: Option<u32>,
     double_press_switch_layers: Option<u32>,
+    battery_cycle_enabled: Option<bool>,
+    battery_cycle_timeout_secs: Option<u32>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     layers: Option<Vec<LayerConfig>>,
@@ -123,6 +127,8 @@ impl ConfigProxy {
             adaptive_brightness,
             active_brightness,
             double_press_switch_layers,
+            battery_cycle_enabled,
+            battery_cycle_timeout_secs,
             primary_layer_keys,
             media_layer_keys,
             layers,
@@ -254,6 +260,9 @@ fn parse_config(base: &str, user: Option<&str>, width: u16) -> Result<(ConfigPro
     if let Some(user) = user {
         base.merge(toml::from_str(user).context("invalid user configuration")?);
     }
+    if base.battery_cycle_timeout_secs == Some(0) {
+        bail!("BatteryCycleTimeoutSecs must be greater than zero");
+    }
     let layers = base.layer_layout(width)?;
     Ok((base, layers))
 }
@@ -302,6 +311,8 @@ fn load_config(
         font_face: load_font(&base.font_template.unwrap()),
         active_brightness: base.active_brightness.unwrap(),
         double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
+        battery_cycle_enabled: base.battery_cycle_enabled.unwrap_or(true),
+        battery_cycle_timeout_secs: base.battery_cycle_timeout_secs.unwrap_or(15),
     };
     Ok((cfg, layers))
 }
@@ -645,6 +656,40 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             base[name] = value.clone();
         }
         toml::to_string(&base).unwrap()
+    }
+
+    #[test]
+    fn battery_cycle_settings_merge_and_legacy_configs_have_defaults() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        let user_path = tmp.0.join("config.toml");
+        let mut legacy: toml::Value = toml::from_str(&text_only_base()).unwrap();
+        legacy.as_table_mut().unwrap().remove("BatteryCycleEnabled");
+        legacy
+            .as_table_mut()
+            .unwrap()
+            .remove("BatteryCycleTimeoutSecs");
+        fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
+        let (config, deck) = load_config(2008, &base_path, None).unwrap();
+        assert!(deck.legacy);
+        assert!(config.battery_cycle_enabled);
+        assert_eq!(config.battery_cycle_timeout_secs, 15);
+        fs::write(
+            &user_path,
+            "BatteryCycleEnabled = false\nBatteryCycleTimeoutSecs = 7",
+        )
+        .unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        assert!(!config.battery_cycle_enabled);
+        assert_eq!(config.battery_cycle_timeout_secs, 7);
+        for invalid in [
+            "BatteryCycleTimeoutSecs = 0",
+            "BatteryCycleTimeoutSecs = -1",
+            "BatteryCycleTimeoutSecs = '15'",
+            "BatteryCycleEnabled = 'false'",
+        ] {
+            assert!(parse_config(BASE, Some(invalid), 2008).is_err());
+        }
     }
 
     #[test]

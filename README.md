@@ -65,6 +65,25 @@ leaves named bars entirely under on-bar navigation. `MediaLayerDefault` and
 behavior, and `Action = "F1"` or `Action = ["LeftCtrl", "F1"]` still sends keys.
 Clock, battery, icons, spacers, and `Stretch` work in named bars as before.
 
+Tap a battery widget to cycle from the system battery through connected device
+batteries (including `scope=Device` power supplies such as hidpp mice), then back
+to the system. A small `SYS` or abbreviated device name with a device number
+identifies the reading in all three battery display modes. Discovery and battery
+reads run in the background, refreshing on power-supply events and every ten
+seconds. A disconnected or unreadable selected device returns to the system.
+
+`BatteryCycleEnabled = false` disables cycling and retains the configured button
+action and original system-battery display. With no device battery, the widget
+also retains that behavior. `BatteryCycleTimeoutSecs = 15` sets the automatic
+return delay after the last cycling tap; it must be greater than zero. Both
+settings have these defaults when absent from older configurations. Cycling,
+automatic return, and removal of a selected source release held virtual keys and
+discard existing touches; fingers already down must lift before pressing again.
+
+Offline tests cover source discovery, cycling, timeout, removal, configuration,
+and key-release safety. Physical Touch Bar validation must still check repeated
+tap-to-cycle, device labels in each display mode, live hotplug, and timed return.
+
 Unknown targets, duplicate or empty names, and empty bars reject the candidate
 configuration. Invalid TOML or layer definitions at startup log an error and use
 the base configuration. Those errors on reload keep the current configuration
