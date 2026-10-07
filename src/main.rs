@@ -127,12 +127,12 @@ impl BatteryWidget {
     // held keys and discard touches just as it does for a layer switch.
     fn refresh(
         &mut self,
-        sources: Option<&[BatterySource]>,
+        sources: &[BatterySource],
         enabled: bool,
         timeout: Duration,
         now: Instant,
     ) -> bool {
-        if let Some(sources) = sources.filter(|sources| self.sources != *sources) {
+        if self.sources != sources {
             self.sources = sources.to_vec();
         }
         self.cycling = enabled;
@@ -1050,7 +1050,7 @@ impl LayerDeck {
                 if let ButtonImage::Battery(battery, _, _) = &mut button.image {
                     let old_source = battery.source().cloned();
                     let old_label = battery.label().map(str::to_owned);
-                    switched |= battery.refresh(Some(sources), enabled, timeout, now);
+                    switched |= battery.refresh(sources, enabled, timeout, now);
                     button.changed |= old_source.as_ref() != battery.source()
                         || old_label.as_deref() != battery.label();
                     if let Some(deadline) = battery.return_at {
@@ -1684,7 +1684,7 @@ mod tests {
         let now = Instant::now();
         let timeout = Duration::from_secs(15);
         let mut battery = BatteryWidget::default();
-        battery.refresh(Some(&sources), true, timeout, now);
+        battery.refresh(&sources, true, timeout, now);
         assert_eq!(battery.source().unwrap().id, "BAT0");
         assert_eq!(battery.label(), Some("SYS"));
         assert!(battery.cycle(now));
@@ -1692,8 +1692,8 @@ mod tests {
         assert_eq!(battery.label(), Some("hidpp_mouse"));
         assert!(battery.cycle(now + Duration::from_secs(10)));
         assert_eq!(battery.source().unwrap().id, "keyboard");
-        assert!(!battery.refresh(None, true, timeout, now + timeout));
-        assert!(battery.refresh(None, true, timeout, now + Duration::from_secs(25)));
+        assert!(!battery.refresh(&sources, true, timeout, now + timeout));
+        assert!(battery.refresh(&sources, true, timeout, now + Duration::from_secs(25)));
         assert_eq!(battery.source().unwrap().id, "BAT0");
         assert!(battery.return_at.is_none());
         for expected in ["hidpp_mouse", "keyboard", "BAT0", "hidpp_mouse"] {
@@ -1708,7 +1708,7 @@ mod tests {
         let timeout = Duration::from_secs(15);
         let mut sources = sample_sources();
         let mut battery = BatteryWidget::default();
-        battery.refresh(Some(&sources), true, timeout, now);
+        battery.refresh(&sources, true, timeout, now);
         battery.cycle(now);
         sources[1].capacity = 75;
         sources.insert(
@@ -1721,23 +1721,23 @@ mod tests {
                 state: BatteryState::NotCharging,
             },
         );
-        assert!(!battery.refresh(Some(&sources), true, timeout, now));
+        assert!(!battery.refresh(&sources, true, timeout, now));
         assert_eq!(battery.source().unwrap().id, "hidpp_mouse");
         assert_eq!(battery.source().unwrap().capacity, 75);
         sources.retain(|source| source.id != "hidpp_mouse");
-        assert!(battery.refresh(Some(&sources), true, timeout, now));
+        assert!(battery.refresh(&sources, true, timeout, now));
         assert_eq!(battery.source().unwrap().id, "BAT0");
         battery.cycle(now);
-        assert!(battery.refresh(None, false, timeout, now));
+        assert!(battery.refresh(&sources, false, timeout, now));
         assert!(!battery.cycle(now));
         assert!(battery.label().is_none());
-        battery.refresh(Some(&sources[..1]), true, timeout, now);
+        battery.refresh(&sources[..1], true, timeout, now);
         assert!(!battery.cycle(now));
         assert!(battery.label().is_none());
-        battery.refresh(Some(&[]), true, timeout, now);
+        battery.refresh(&[], true, timeout, now);
         assert!(battery.source().is_none());
         assert!(!battery.cycle(now));
-        battery.refresh(Some(&sources[1..]), true, timeout, now);
+        battery.refresh(&sources[1..], true, timeout, now);
         assert!(battery.source().is_none()); // A peripheral never masquerades as the computer.
         assert!(battery.cycle(now));
         assert!(battery.source().unwrap().device);
@@ -1894,7 +1894,7 @@ mod tests {
             }
             let now = Instant::now();
             let timeout = Duration::from_secs(15);
-            battery.refresh(Some(&sources), true, timeout, now);
+            battery.refresh(&sources, true, timeout, now);
             let system = render(&button);
             let ButtonImage::Battery(battery, _, _) = &mut button.image else {
                 panic!()
@@ -1912,12 +1912,12 @@ mod tests {
             let ButtonImage::Battery(battery, _, _) = &mut button.image else {
                 panic!()
             };
-            battery.refresh(None, false, timeout, now);
+            battery.refresh(&sources, false, timeout, now);
             let disabled = render(&button);
             let ButtonImage::Battery(battery, _, _) = &mut button.image else {
                 panic!()
             };
-            battery.refresh(Some(&sources[..1]), true, timeout, now);
+            battery.refresh(&sources[..1], true, timeout, now);
             assert_eq!(disabled, render(&button));
         }
     }
