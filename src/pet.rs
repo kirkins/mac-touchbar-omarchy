@@ -489,8 +489,9 @@ impl PetManager {
         }
         if let Some(food) = &mut self.food {
             if span_at(spans, food.x).is_some() {
+                let old_x = food.x;
                 food.x = clamp_outside(food.x, spans, min_x, max_x);
-                redraw = true;
+                redraw |= food.x != old_x;
             }
         }
 
@@ -1361,6 +1362,41 @@ mod tests {
         }
         assert!(p.satiety > 0.99, "meal eaten, got {}", p.satiety);
         assert!(p.food.is_none());
+    }
+
+    #[test]
+    fn kibble_reclamps_redraw_only_when_moved() {
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.state = PetState::Idle {
+            until: now + Duration::from_secs(60),
+        };
+        p.food = Some(Food { x: 640.0 });
+
+        // A widget dropped over the kibble: the re-clamp moves it and must
+        // repaint the moved sprite.
+        let reload = vec![Span {
+            left: 600.0,
+            right: 690.0,
+            clock: false,
+        }];
+        let (redraw, _) = tick(&mut p, &mut now, &reload, 60);
+        let moved = p.food.unwrap().x;
+        assert!((moved - 640.0).abs() > 0.01 && span_at(&reload, moved).is_none());
+        assert!(redraw, "a moved kibble must repaint");
+
+        // A single full-width widget leaves the kibble no standable spot:
+        // it stays put and must not force a repaint on every quiet wake.
+        let full = vec![Span {
+            left: 0.0,
+            right: WIDTH,
+            clock: false,
+        }];
+        for _ in 0..10 {
+            let (redraw, _) = tick(&mut p, &mut now, &full, 60);
+            assert!(!redraw, "an unmoved kibble must not repaint");
+        }
+        assert!(span_at(&full, p.food.unwrap().x).is_some());
     }
 
     #[test]
