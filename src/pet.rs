@@ -479,6 +479,20 @@ impl PetManager {
         if self.hop.is_none() {
             self.pos = clamp_outside(self.pos, spans, self.min_x(), self.max_x());
         }
+        // The same reload can drop widgets onto a chosen target or waiting
+        // food; keep both standable against the layout now in force.
+        let (min_x, max_x) = (self.min_x(), self.max_x());
+        if let PetState::Walk { target, .. } = &mut self.state {
+            if span_at(spans, *target).is_some() {
+                *target = clamp_outside(*target, spans, min_x, max_x);
+            }
+        }
+        if let Some(food) = &mut self.food {
+            if span_at(spans, food.x).is_some() {
+                food.x = clamp_outside(food.x, spans, min_x, max_x);
+                redraw = true;
+            }
+        }
 
         match self.state {
             PetState::Idle { until } => {
@@ -1301,6 +1315,54 @@ mod tests {
             timeout <= BEG_MS as i32,
             "beg frame flips must be scheduled, got {timeout}ms"
         );
+    }
+
+    #[test]
+    fn reload_covering_the_target_and_food_re_clamps_them() {
+        let mut p = pet();
+        let mut now = Instant::now();
+        // Mid-walk toward kibble that sits on the target spot.
+        p.pos = 596.0;
+        p.state = PetState::Walk {
+            target: 640.0,
+            after: After::Munch,
+        };
+        p.next_step = Some(now);
+        p.food = Some(Food { x: 640.0 });
+        // The reloaded home bar places a widget over both.
+        let spans = vec![Span {
+            left: 600.0,
+            right: 690.0,
+            clock: false,
+        }];
+        let mut reached_food = false;
+        for i in 0..200 {
+            tick(&mut p, &mut now, &spans, 60);
+            if let Some(food) = &p.food {
+                assert!(
+                    span_at(&spans, food.x).is_none(),
+                    "kibble must never sit on a widget (iteration {i}: {})",
+                    food.x
+                );
+            }
+            if p.hop.is_none() {
+                assert!(
+                    span_at(&spans, p.pos).is_none(),
+                    "pet stood inside a widget at iteration {i}: {}",
+                    p.pos
+                );
+            }
+            reached_food |= matches!(p.state, PetState::Munch { .. });
+            if reached_food {
+                break;
+            }
+        }
+        assert!(reached_food, "the pet must still reach and eat the food");
+        for _ in 0..100 {
+            tick(&mut p, &mut now, &spans, 60);
+        }
+        assert!(p.satiety > 0.99, "meal eaten, got {}", p.satiety);
+        assert!(p.food.is_none());
     }
 
     #[test]
