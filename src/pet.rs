@@ -604,7 +604,7 @@ impl PetManager {
                     until: now + Duration::from_millis(STARTLE_MS),
                     away,
                 };
-                self.next_step = Some(now);
+                self.next_step = None;
             }
             return true;
         }
@@ -883,11 +883,16 @@ impl PetManager {
                     consider(t);
                 }
             }
-            PetState::Startled { until, .. } | PetState::Munch { until, .. } => {
+            PetState::Munch { until, .. } => {
                 consider(until);
                 if let Some(t) = self.next_step {
                     consider(t);
                 }
+            }
+            PetState::Startled { until, .. } => {
+                consider(until);
+                // Keep the startle arc smooth with short wakes while airborne.
+                consider(now + Duration::from_millis(120));
             }
         }
         if let PetState::Nap { started, .. } = self.state {
