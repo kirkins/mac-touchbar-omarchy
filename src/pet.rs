@@ -823,31 +823,32 @@ impl PetManager {
         let dir = diff.signum();
         self.facing = dir;
         let next = (self.pos + dir * cadence.px_per_step).clamp(self.min_x(), self.max_x());
-        if span_at(&self.spans, next).is_some() && span_at(&self.spans, self.pos).is_none() {
-            // Hop politely over the widget instead of walking across it.
-            let span = span_at(&self.spans, next).copied().unwrap();
-            let landing = if dir > 0.0 {
-                span.right + self.half_w() + HOP_MARGIN
-            } else {
-                span.left - self.half_w() - HOP_MARGIN
-            }
-            .clamp(self.min_x(), self.max_x());
-            if span_at(&self.spans, landing).is_none()
-                && (landing - self.pos).abs() > cadence.px_per_step
-            {
-                self.hop = Some(Hop {
-                    from: self.pos,
-                    to: landing,
-                    started: now,
-                    until: now + Duration::from_millis(HOP_MS),
-                });
-                // One leg-frame flip mid-hop.
-                self.next_step = Some(now + Duration::from_millis(HOP_MS / 2));
-                return;
+        if span_at(&self.spans, self.pos).is_none() {
+            // Hop politely over the whole run of touching widgets instead
+            // of walking across it, landing at the nearest free spot beyond.
+            if let Some((left, right)) = run_at(&self.spans, next) {
+                let landing = if dir > 0.0 {
+                    spot_right(right, &self.spans, self.max_x(), HOP_MARGIN)
+                } else {
+                    spot_left(left, &self.spans, self.min_x(), HOP_MARGIN)
+                };
+                if let Some(to) = landing.filter(|to| (*to - self.pos).abs() > cadence.px_per_step)
+                {
+                    self.hop = Some(Hop {
+                        from: self.pos,
+                        to,
+                        started: now,
+                        until: now + Duration::from_millis(HOP_MS),
+                    });
+                    // One leg-frame flip mid-hop.
+                    self.next_step = Some(now + Duration::from_millis(HOP_MS / 2));
+                    return;
+                }
             }
         }
-        if next == self.pos {
-            // Pinned at a bound by an unreachable target: give up and idle.
+        if next == self.pos || span_at(&self.spans, next).is_some() {
+            // Pinned at a bound, or facing widgets with no free spot toward
+            // the target: give up and idle.
             self.state = PetState::Idle {
                 until: now + Duration::from_millis(BRIEF_IDLE_MS),
             };
@@ -935,30 +936,105 @@ fn half_sprite_w() -> f64 {
     grid_w(WALK_A) * SCALE / 2.0
 }
 
-/// Nudge `x` out of any occupied span, preferring the nearer edge. Retries in
-/// case nudging out of one span lands inside a neighbor.
-fn clamp_outside(x: f64, spans: &[Span], min_x: f64, max_x: f64) -> f64 {
-    let mut x = x.clamp(min_x, max_x);
-    for _ in 0..=spans.len() {
-        let Some(span) = span_at(spans, x).copied() else {
-            return x;
-        };
-        let width = half_sprite_w() + HOP_MARGIN;
-        x = if x - span.left < span.right - x {
-            span.left - width
-        } else {
-            span.right + width
+/// The maximal run of touching or overlapping spans around `x`, which the
+/// pet treats as a single obstacle.
+fn run_at(spans: &[Span], x: f64) -> Option<(f64, f64)> {
+    let (mut left, mut right) = spans
+        .iter()
+        .find(|span| x >= span.left && x <= span.right)
+        .map(|span| (span.left, span.right))?;
+    loop {
+        let mut grew = false;
+        for span in spans {
+            if span.left <= right && span.right >= left {
+                if span.left < left {
+                    left = span.left;
+                    grew = true;
+                }
+                if span.right > right {
+                    right = span.right;
+                    grew = true;
+                }
+            }
         }
-        .clamp(min_x, max_x);
+        if !grew {
+            return Some((left, right));
+        }
     }
-    x
+}
+
+/// Nearest resting position left of `edge`: one with the sprite fully clear
+/// of widgets plus `margin` when the neighboring gap allows it, otherwise
+/// that gap's center, so packed bars still leave somewhere to stand. `None`
+/// when no free position exists on that side.
+fn spot_left(edge: f64, spans: &[Span], min_x: f64, margin: f64) -> Option<f64> {
+    if edge <= min_x {
+        return None;
+    }
+    let polite = (edge - half_sprite_w() - margin).max(min_x);
+    if run_at(spans, polite).is_none() {
+        return Some(polite);
+    }
+    let neighbor = spans
+        .iter()
+        .filter(|span| span.right < edge)
+        .map(|span| span.right)
+        .reduce(f64::max)?;
+    Some(((neighbor + edge) / 2.0).max(min_x))
+}
+
+/// Nearest resting position right of `edge`, mirroring [`spot_left`].
+fn spot_right(edge: f64, spans: &[Span], max_x: f64, margin: f64) -> Option<f64> {
+    if edge >= max_x {
+        return None;
+    }
+    let polite = (edge + half_sprite_w() + margin).min(max_x);
+    if run_at(spans, polite).is_none() {
+        return Some(polite);
+    }
+    let neighbor = spans
+        .iter()
+        .filter(|span| span.left > edge)
+        .map(|span| span.left)
+        .reduce(f64::min)?;
+    Some(((neighbor + edge) / 2.0).min(max_x))
+}
+
+/// Rest `x` at a standable position: unchanged when its center is already
+/// outside every widget, otherwise at the nearer free spot beside the run of
+/// touching spans around it.
+fn clamp_outside(x: f64, spans: &[Span], min_x: f64, max_x: f64) -> f64 {
+    let x = x.clamp(min_x, max_x);
+    let Some((left, right)) = run_at(spans, x) else {
+        return x;
+    };
+    let near_left = x - left < right - x;
+    match (
+        spot_left(left, spans, min_x, HOP_MARGIN),
+        spot_right(right, spans, max_x, HOP_MARGIN),
+    ) {
+        (Some(l), Some(r)) => {
+            if near_left {
+                l
+            } else {
+                r
+            }
+        }
+        (Some(l), None) => l,
+        (None, Some(r)) => r,
+        (None, None) => x,
+    }
 }
 
 /// Where to curl up: beside the clock widget when the home bar has one,
 /// otherwise wherever the pet already is.
 fn nap_spot(spans: &[Span], pos: f64, min_x: f64, max_x: f64) -> f64 {
     if let Some(clock) = spans.iter().find(|span| span.clock) {
-        return (clock.left - half_sprite_w() - NAP_GAP).clamp(min_x, max_x);
+        if let Some((left, right)) = run_at(spans, clock.left) {
+            return spot_left(left, spans, min_x, NAP_GAP)
+                .or_else(|| spot_right(right, spans, max_x, NAP_GAP))
+                .unwrap_or(pos);
+        }
     }
     clamp_outside(pos, spans, min_x, max_x)
 }
@@ -1139,6 +1215,55 @@ mod tests {
             "pet must land beyond the widget, got {}",
             p.pos
         );
+    }
+
+    #[test]
+    fn packed_bars_rest_in_gaps_and_hop_widget_to_widget() {
+        // The shipped home bars pack adjacent widgets with only a button
+        // spacing between them - far too narrow for the sprite - so the pet
+        // rests at gap centers and hops across one widget at a time.
+        let mut keys: Vec<ButtonConfig> = (0..11)
+            .map(|i| ButtonConfig {
+                text: Some(format!("F{i}")),
+                ..ButtonConfig::default()
+            })
+            .collect();
+        keys.push(ButtonConfig {
+            time: Some("24hr".into()),
+            ..ButtonConfig::default()
+        });
+        let layer = FunctionLayer::with_config(keys);
+        let spans = layer.layout_spans(WIDTH as i32);
+        assert_eq!(spans.len(), 12);
+        for pair in spans.windows(2) {
+            assert!(
+                pair[1].left - pair[0].right < half_sprite_w() * 2.0,
+                "test layout must be packed"
+            );
+        }
+        let mut p = pet();
+        let mut now = Instant::now();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..4000 {
+            tick(&mut p, &mut now, &spans, 60);
+            if p.hop.is_none() {
+                assert!(
+                    span_at(&spans, p.pos).is_none(),
+                    "pet stood inside a widget at iteration {i}: {}",
+                    p.pos
+                );
+            }
+            seen.insert((p.pos * 4.0).round() as i64);
+        }
+        assert!(
+            seen.len() > 3,
+            "pet must move around a packed bar, saw {} positions",
+            seen.len()
+        );
+        let clock = spans.last().unwrap();
+        let spot = nap_spot(&spans, 100.0, p.min_x(), p.max_x());
+        assert!(span_at(&spans, spot).is_none(), "nap spot must be free");
+        assert!(spot < clock.left && clock.left - spot < 24.0);
     }
 
     #[test]
