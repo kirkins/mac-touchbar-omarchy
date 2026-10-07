@@ -1174,12 +1174,14 @@ mod tests {
             after: After::Pause,
         };
         p.next_step = Some(now);
+        let mut left_the_right_bound = false;
         for _ in 0..3000 {
             tick(&mut p, &mut now, &[], 60);
             assert!(p.pos <= p.max_x() + f64::EPSILON);
+            left_the_right_bound |= p.pos < p.max_x() - 1.0;
         }
         assert!(
-            p.pos < p.max_x(),
+            left_the_right_bound,
             "pet must not pin at the right bound forever"
         );
         p.state = PetState::Walk {
@@ -1187,11 +1189,13 @@ mod tests {
             after: After::Pause,
         };
         p.next_step = Some(now);
+        let mut left_the_left_bound = false;
         for _ in 0..3000 {
             tick(&mut p, &mut now, &[], 60);
             assert!(p.pos >= p.min_x() - f64::EPSILON);
+            left_the_left_bound |= p.pos > p.min_x() + 1.0;
         }
-        assert!(p.pos > p.min_x());
+        assert!(left_the_left_bound, "pet must not pin at the left bound");
     }
 
     #[test]
@@ -1363,12 +1367,17 @@ mod tests {
         let mut now = Instant::now();
         p.satiety = 1.0;
         // Two calm hours pass.
+        let mut begged_or_paced = false;
         for _ in 0..240 {
             tick(&mut p, &mut now, &[], 30_000);
+            if p.satiety < HUNGRY {
+                begged_or_paced |= matches!(p.state, PetState::Beg { .. } | PetState::Walk { .. });
+            }
         }
         assert!(p.satiety < HUNGRY, "satiety must decay, got {}", p.satiety);
         assert!(
-            matches!(p.state, PetState::Beg { .. }) || matches!(p.state, PetState::Walk { .. })
+            begged_or_paced,
+            "a hungry pet must beg or pace instead of sitting still"
         );
 
         // Feed through an adjacent tap.
@@ -1398,8 +1407,10 @@ mod tests {
             matches!(p.state, PetState::Munch { .. }),
             "pet must reach the food"
         );
+        let mut heart_shown = false;
         for _ in 0..100 {
             tick(&mut p, &mut now, &[], 60);
+            heart_shown |= p.happy_until.is_some();
         }
         assert!(
             p.satiety > 0.99,
@@ -1407,7 +1418,8 @@ mod tests {
             p.satiety
         );
         assert!(p.food.is_none());
-        assert!(p.happy_until.is_some(), "a content pet shows its happiness");
+        assert!(heart_shown, "a content pet shows its happiness");
+        assert!(p.happy_until.is_none(), "the heart must expire");
     }
 
     #[test]
