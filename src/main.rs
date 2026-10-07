@@ -31,12 +31,15 @@ use std::{
     cmp::min,
     collections::HashMap,
     fs::{self, File, OpenOptions},
+    io::{Read, Write},
     os::{
         fd::{AsFd, AsRawFd},
-        unix::{fs::OpenOptionsExt, io::OwnedFd},
+        unix::{fs::OpenOptionsExt, io::OwnedFd, net::UnixStream},
     },
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, SyncSender},
+    thread,
     time::{Duration, Instant},
 };
 use udev::MonitorBuilder;
@@ -59,11 +62,141 @@ const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 48;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatteryState {
     NotCharging,
     Charging,
     Low,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BatterySource {
+    id: String,
+    label: String,
+    device: bool,
+    capacity: u32,
+    state: BatteryState,
+}
+
+#[derive(Default)]
+struct BatteryWidget {
+    sources: Vec<BatterySource>,
+    // None always means the system battery, even if it is currently absent.
+    selected: Option<String>,
+    return_at: Option<Instant>,
+    cycling: bool,
+    timeout: Duration,
+}
+
+impl BatteryWidget {
+    fn source(&self) -> Option<&BatterySource> {
+        self.sources.iter().find(|source| match &self.selected {
+            Some(id) => source.device && source.id == *id,
+            None => !source.device,
+        })
+    }
+
+    fn can_cycle(&self) -> bool {
+        self.cycling && self.sources.iter().any(|source| source.device)
+    }
+
+    fn label(&self) -> Option<&str> {
+        if let Some(source) = self.source().filter(|source| source.device) {
+            Some(&source.label)
+        } else if self.can_cycle() {
+            Some("SYS")
+        } else {
+            None
+        }
+    }
+
+    fn cycle(&mut self, now: Instant) -> bool {
+        if !self.can_cycle() {
+            return false;
+        }
+        let mut devices = self.sources.iter().filter(|source| source.device);
+        if let Some(id) = &self.selected {
+            devices.find(|source| source.id == *id);
+        }
+        self.selected = devices.next().map(|source| source.id.clone());
+        self.return_at = self.selected.as_ref().map(|_| now + self.timeout);
+        true
+    }
+
+    // Return whether a source switch occurred, so the input owner can release
+    // held keys and discard touches just as it does for a layer switch.
+    fn refresh(
+        &mut self,
+        sources: &[BatterySource],
+        enabled: bool,
+        timeout: Duration,
+        now: Instant,
+    ) -> bool {
+        if self.sources != sources {
+            self.sources = sources.to_vec();
+        }
+        self.cycling = enabled;
+        self.timeout = timeout;
+        if self.selected.is_some()
+            && (!enabled
+                || self.source().is_none()
+                || self.return_at.is_some_and(|deadline| now >= deadline))
+        {
+            self.selected = None;
+            self.return_at = None;
+            return true;
+        }
+        false
+    }
+}
+
+// Sysfs enumeration and reads stay on this worker. Rendering and touch input
+// only consume cached snapshots; a nonblocking socket wakes the existing epoll.
+struct BatteryMonitor {
+    requests: SyncSender<()>,
+    updates: Receiver<Vec<BatterySource>>,
+    wake: UnixStream,
+    sources: Vec<BatterySource>,
+}
+
+impl BatteryMonitor {
+    fn new(path: PathBuf) -> Self {
+        let (requests, refresh) = mpsc::sync_channel(1);
+        let (snapshots, updates) = mpsc::channel();
+        let (wake, mut notify) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        notify.set_nonblocking(true).unwrap();
+        thread::spawn(move || loop {
+            if snapshots.send(read_battery_sources(&path)).is_err() {
+                break;
+            }
+            let _ = notify.write(&[1]);
+            match refresh.recv_timeout(Duration::from_secs(10)) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {
+                    // Coalesce hotplug/change bursts into one fresh snapshot.
+                    while refresh.try_recv().is_ok() {}
+                }
+            }
+        });
+        Self {
+            requests,
+            updates,
+            wake,
+            sources: Vec::new(),
+        }
+    }
+
+    fn request_refresh(&self) {
+        let _ = self.requests.try_send(());
+    }
+
+    fn update(&mut self) {
+        while matches!(self.wake.read(&mut [0; 64]), Ok(n) if n > 0) {}
+        if let Some(sources) = self.updates.try_iter().last() {
+            self.sources = sources;
+        }
+    }
 }
 
 struct BatteryImages {
@@ -93,7 +226,7 @@ enum ButtonImage {
     Svg(Handle),
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
-    Battery(String, BatteryIconMode, BatteryImages),
+    Battery(BatteryWidget, BatteryIconMode, BatteryImages),
     Spacer,
 }
 
@@ -195,60 +328,99 @@ fn try_load_image(
     Err(last_err.context(format!("failed loading all possible paths for icon {name}")))
 }
 
-fn find_battery_device() -> Option<String> {
-    let power_supply_path = "/sys/class/power_supply";
-    if let Ok(entries) = fs::read_dir(power_supply_path) {
-        for entry in entries.flatten() {
-            let dev_path = entry.path();
-            let type_path = dev_path.join("type");
-            if let Ok(typ) = fs::read_to_string(&type_path) {
-                if typ.trim() == "Battery" {
-                    if let Some(name) = dev_path.file_name().and_then(|n| n.to_str()) {
-                        return Some(name.to_string());
-                    }
-                }
-            }
+fn read_battery_sources(root: &Path) -> Vec<BatterySource> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let read = |name| fs::read_to_string(path.join(name)).ok();
+        if read("type").is_none_or(|kind| kind.trim() != "Battery")
+            || read("present").is_some_and(|present| present.trim() == "0")
+        {
+            continue;
         }
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let scope = read("scope");
+        let priority = match scope.as_deref().map(str::trim) {
+            Some("System") => 0,
+            None => 1, // Older system batteries may omit scope.
+            Some("Device") => 2,
+            _ => continue,
+        };
+        let device = priority == 2;
+        // hidpp supplies can remain in sysfs with a cached capacity while the
+        // mouse is disconnected; those drivers expose online rather than present.
+        if device && read("online").is_some_and(|online| online.trim() == "0") {
+            continue;
+        }
+        let capacity = read("capacity").and_then(|s| s.trim().parse::<u32>().ok());
+        let charge = || {
+            let now = read("charge_now")?.trim().parse::<f64>().ok()?;
+            let full = read("charge_full")?.trim().parse::<f64>().ok()?;
+            (now.is_finite() && full.is_finite() && now >= 0.0 && full > 0.0)
+                .then(|| ((now / full) * 100.0).round() as u32)
+        };
+        // Keep the T2 system-battery charge ratio; peripherals generally only
+        // expose capacity, including hidpp mice on x86_64.
+        let capacity = if cfg!(target_arch = "x86_64") && !device {
+            charge().or(capacity)
+        } else {
+            capacity.or_else(charge)
+        };
+        let Some(capacity) = capacity else {
+            continue;
+        };
+        let capacity = capacity.min(100);
+        let state = match read("status").as_deref().map(str::trim) {
+            Some("Charging" | "Full") => BatteryState::Charging,
+            Some("Discharging") if capacity < 10 => BatteryState::Low,
+            _ => BatteryState::NotCharging,
+        };
+        let label: String = read("model_name")
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| id.clone())
+            .trim()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(10)
+            .collect();
+        sources.push((
+            priority,
+            BatterySource {
+                id,
+                label,
+                device,
+                capacity,
+                state,
+            },
+        ));
     }
-    None
-}
-
-fn get_battery_state(battery: &str) -> (u32, BatteryState) {
-    let status_path = format!("/sys/class/power_supply/{}/status", battery);
-    let status = fs::read_to_string(&status_path).unwrap_or_else(|_| "Unknown".to_string());
-
-    let capacity = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let charge_now_path = format!("/sys/class/power_supply/{}/charge_now", battery);
-            let charge_full_path = format!("/sys/class/power_supply/{}/charge_full", battery);
-            let charge_now = fs::read_to_string(&charge_now_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok());
-            let charge_full = fs::read_to_string(&charge_full_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok());
-            match (charge_now, charge_full) {
-                (Some(now), Some(full)) if full > 0.0 => ((now / full) * 100.0).round() as u32,
-                _ => 100,
-            }
+    sources.sort_by(|(a, left), (b, right)| (a, &left.id).cmp(&(b, &right.id)));
+    let mut sources: Vec<_> = sources.into_iter().map(|(_, source)| source).collect();
+    let mut system_seen = false;
+    sources.retain(|source| {
+        if source.device {
+            true
+        } else if system_seen {
+            false
+        } else {
+            system_seen = true;
+            true
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let capacity_path = format!("/sys/class/power_supply/{}/capacity", battery);
-            fs::read_to_string(&capacity_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(100)
-        }
-    };
-
-    let status = match status.trim() {
-        "Charging" | "Full" => BatteryState::Charging,
-        "Discharging" if capacity < 10 => BatteryState::Low,
-        _ => BatteryState::NotCharging,
-    };
-    (capacity, status)
+    });
+    // Distinguish devices even when their model names are identical.
+    for (i, source) in sources
+        .iter_mut()
+        .filter(|source| source.device)
+        .enumerate()
+    {
+        source.label = format!("{} {}", source.label.trim_end(), i + 1);
+    }
+    sources
 }
 
 impl Button {
@@ -266,11 +438,7 @@ impl Button {
         } else if let Some(time) = cfg.time {
             Button::new_time(cfg.action, &time, cfg.locale.as_deref())
         } else if let Some(battery_mode) = cfg.battery {
-            if let Some(battery) = find_battery_device() {
-                Button::new_battery(cfg.action, battery, battery_mode, cfg.theme)
-            } else {
-                Button::new_text("Battery N/A".to_string(), cfg.action)
-            }
+            Button::new_battery(cfg.action, battery_mode, cfg.theme)
         } else {
             Button::new_spacer()
         }
@@ -323,7 +491,6 @@ impl Button {
     }
     fn new_battery(
         action: ButtonAction,
-        battery: String,
         battery_mode: String,
         theme: Option<impl AsRef<str>>,
     ) -> Button {
@@ -364,7 +531,7 @@ impl Button {
             active: false,
             changed: false,
             image: ButtonImage::Battery(
-                battery,
+                BatteryWidget::default(),
                 battery_mode,
                 BatteryImages {
                     plain,
@@ -407,12 +574,12 @@ impl Button {
         match &self.image {
             ButtonImage::Time(items, _) => items.iter().any(|item| {
                 use chrono::format::{Item, Numeric};
-                match item {
+                matches!(
+                    item,
                     Item::Numeric(Numeric::Second, _)
-                    | Item::Numeric(Numeric::Nanosecond, _)
-                    | Item::Numeric(Numeric::Timestamp, _) => true,
-                    _ => false,
-                }
+                        | Item::Numeric(Numeric::Nanosecond, _)
+                        | Item::Numeric(Numeric::Timestamp, _)
+                )
             }),
             _ => false,
         }
@@ -464,7 +631,42 @@ impl Button {
                 c.show_text(&formatted_time).unwrap();
             }
             ButtonImage::Battery(battery, battery_mode, icons) => {
-                let (capacity, state) = get_battery_state(battery);
+                let Some(source) = battery.source() else {
+                    let text = "Battery N/A";
+                    let extents = c.text_extents(text).unwrap();
+                    c.move_to(
+                        button_left_edge + (button_width as f64 - extents.width()) / 2.0,
+                        y_shift + (height as f64 + extents.height()) / 2.0,
+                    );
+                    c.show_text(text).unwrap();
+                    return;
+                };
+                let (capacity, state) = (source.capacity, source.state);
+                c.save().unwrap();
+                let label = battery.label();
+                let icon_size = if label.is_some() {
+                    32.0
+                } else {
+                    DEFAULT_ICON_SIZE as f64
+                };
+                let content_center = if label.is_some() {
+                    height as f64 * 0.65
+                } else {
+                    height as f64 / 2.0
+                };
+                if let Some(label) = label {
+                    c.set_font_size(12.0);
+                    let extents = c.text_extents(label).unwrap();
+                    let scale = ((button_width as f64 - 8.0).max(1.0) / extents.width()).min(1.0);
+                    c.set_font_size(12.0 * scale);
+                    let extents = c.text_extents(label).unwrap();
+                    c.move_to(
+                        button_left_edge + (button_width as f64 - extents.width()) / 2.0,
+                        y_shift + 15.0,
+                    );
+                    c.show_text(label).unwrap();
+                    c.set_font_size(24.0);
+                }
                 let icon = if battery_mode.should_draw_icon() {
                     Some(match state {
                         BatteryState::Charging => match capacity {
@@ -492,35 +694,47 @@ impl Button {
                 } else {
                     None
                 };
-                let percent_str = format!("{:.0}%", capacity);
+                let percent_str = format!("{}%", capacity);
                 let extents = c.text_extents(&percent_str).unwrap();
-                let mut width = extents.width();
-                let mut text_offset = 0;
+                let text_width = if battery_mode.should_draw_text() {
+                    extents.width()
+                } else {
+                    0.0
+                };
+                let width = text_width + if icon.is_some() { icon_size } else { 0.0 };
+                let scale = if label.is_some() {
+                    ((button_width as f64 - 8.0).max(1.0) / width).min(1.0)
+                } else {
+                    1.0
+                };
+                let left = button_left_edge + ((button_width as f64 - width * scale) / 2.0).round();
+                let mut text_offset = 0.0;
                 if let Some(svg) = icon {
-                    if !battery_mode.should_draw_text() {
-                        width = DEFAULT_ICON_SIZE as f64;
-                    } else {
-                        width += DEFAULT_ICON_SIZE as f64;
-                    }
-                    text_offset = DEFAULT_ICON_SIZE;
-                    let x = button_left_edge + (button_width as f64 / 2.0 - width / 2.0).round();
-                    let y = y_shift + ((height as f64 - DEFAULT_ICON_SIZE as f64) / 2.0).round();
-
+                    let size = icon_size * scale;
                     svg.render_document(
                         c,
-                        &Rectangle::new(x, y, DEFAULT_ICON_SIZE as f64, DEFAULT_ICON_SIZE as f64),
+                        &Rectangle::new(
+                            left,
+                            y_shift + (content_center - size / 2.0).round(),
+                            size,
+                            size,
+                        ),
                     )
                     .unwrap();
+                    text_offset = size;
                 }
                 if battery_mode.should_draw_text() {
+                    if label.is_some() {
+                        c.set_font_size(24.0 * scale);
+                    }
+                    let extents = c.text_extents(&percent_str).unwrap();
                     c.move_to(
-                        button_left_edge
-                            + (button_width as f64 / 2.0 - width / 2.0 + text_offset as f64)
-                                .round(),
-                        y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
+                        left + text_offset,
+                        y_shift + (content_center + extents.height() / 2.0).round(),
                     );
                     c.show_text(&percent_str).unwrap();
                 }
+                c.restore().unwrap();
             }
             ButtonImage::Spacer => (),
         }
@@ -537,8 +751,11 @@ impl Button {
     }
     fn set_background_color(&self, c: &Context, color: f64) {
         if let ButtonImage::Battery(battery, _, _) = &self.image {
-            let (_, state) = get_battery_state(battery);
-            match state {
+            match battery
+                .source()
+                .map(|source| source.state)
+                .unwrap_or(BatteryState::NotCharging)
+            {
                 BatteryState::NotCharging => c.set_source_rgb(color, color, color),
                 BatteryState::Charging => c.set_source_rgb(0.0, color, 0.0),
                 BatteryState::Low => c.set_source_rgb(color, 0.0, 0.0),
@@ -552,7 +769,6 @@ impl Button {
 #[derive(Default)]
 pub struct FunctionLayer {
     displays_time: bool,
-    displays_battery: bool,
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
@@ -566,7 +782,6 @@ impl FunctionLayer {
 
         let mut virtual_button_count = 0;
         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
-        let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
         let buttons = cfg
             .into_iter()
             .scan(&mut virtual_button_count, |state, cfg| {
@@ -583,7 +798,6 @@ impl FunctionLayer {
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
         FunctionLayer {
             displays_time,
-            displays_battery,
             buttons,
             virtual_button_count,
             faster_refresh,
@@ -821,6 +1035,38 @@ impl LayerDeck {
         &mut self.layers[self.active]
     }
 
+    fn refresh_batteries(
+        &mut self,
+        sources: &[BatterySource],
+        enabled: bool,
+        timeout: Duration,
+        now: Instant,
+        emit_keys: &mut impl FnMut(&[Key], bool),
+    ) -> Option<Duration> {
+        let mut switched = false;
+        let mut next_timeout = None;
+        for layer in &mut self.layers {
+            for (_, button) in &mut layer.buttons {
+                if let ButtonImage::Battery(battery, _, _) = &mut button.image {
+                    let old_source = battery.source().cloned();
+                    let old_label = battery.label().map(str::to_owned);
+                    switched |= battery.refresh(sources, enabled, timeout, now);
+                    button.changed |= old_source.as_ref() != battery.source()
+                        || old_label.as_deref() != battery.label();
+                    if let Some(deadline) = battery.return_at {
+                        let remaining = deadline.saturating_duration_since(now);
+                        next_timeout =
+                            Some(next_timeout.map_or(remaining, |old| min(old, remaining)));
+                    }
+                }
+            }
+        }
+        if switched {
+            self.release_all(emit_keys);
+        }
+        next_timeout
+    }
+
     fn release_all(&mut self, emit_keys: &mut impl FnMut(&[Key], bool)) {
         for layer in &mut self.layers {
             for (_, button) in &mut layer.buttons {
@@ -893,6 +1139,14 @@ impl LayerDeck {
         self.touch_up(slot, emit_keys);
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
             return false;
+        }
+        if let ButtonImage::Battery(battery, _, _) = &mut self.current_mut().buttons[button].1.image
+        {
+            if battery.cycle(Instant::now()) {
+                self.current_mut().buttons[button].1.changed = true;
+                self.release_all(emit_keys);
+                return true;
+            }
         }
         if let ButtonAction::SwitchLayer(name) = &self.current().buttons[button].1.action {
             let name = name.clone();
@@ -1028,6 +1282,8 @@ fn real_main(drm: &mut DrmBackend) {
         .apply()
         .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
 
+    let mut battery_monitor = BatteryMonitor::new(PathBuf::from("/sys/class/power_supply"));
+
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
     let mut needs_complete_redraw = true;
@@ -1054,6 +1310,12 @@ fn real_main(drm: &mut DrmBackend) {
         .unwrap();
     epoll
         .add(&udev_monitor, EpollEvent::new(EpollFlags::EPOLLIN, 3))
+        .unwrap();
+    epoll
+        .add(
+            &battery_monitor.wake,
+            EpollEvent::new(EpollFlags::EPOLLIN, 4),
+        )
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
@@ -1098,6 +1360,20 @@ fn real_main(drm: &mut DrmBackend) {
         let ms_left = ((60 - now.second()) * 1000) as i32;
         let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
 
+        battery_monitor.update();
+        if let Some(remaining) = layers.refresh_batteries(
+            &battery_monitor.sources,
+            cfg.battery_cycle_enabled,
+            Duration::from_secs(cfg.battery_cycle_timeout_secs.into()),
+            Instant::now(),
+            &mut |keys, active| toggle_keys(&mut uinput, keys, active as i32),
+        ) {
+            next_timeout_ms = min(
+                next_timeout_ms,
+                remaining.as_millis().max(1).min(TIMEOUT_MS as u128) as i32,
+            );
+        }
+
         if cfg.enable_pixel_shift {
             let (pixel_shift_needs_redraw, pixel_shift_next_timeout_ms) = pixel_shift.update();
             if pixel_shift_needs_redraw {
@@ -1115,14 +1391,6 @@ fn real_main(drm: &mut DrmBackend) {
             needs_complete_redraw = true;
             last_redraw_ts = current_ts;
         }
-        if layers.current().displays_battery {
-            for button in &mut layers.current_mut().buttons {
-                if let ButtonImage::Battery(_, _, _) = button.1.image {
-                    button.1.changed = true;
-                }
-            }
-        }
-
         if needs_complete_redraw || layers.current().buttons.iter().any(|b| b.1.changed) {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
@@ -1151,7 +1419,9 @@ fn real_main(drm: &mut DrmBackend) {
             e => e.unwrap(),
         };
 
-        _ = udev_monitor.iter().last();
+        if udev_monitor.iter().last().is_some() {
+            battery_monitor.request_refresh();
+        }
 
         input_tb.dispatch().unwrap();
         input_main.dispatch().unwrap();
@@ -1245,6 +1515,413 @@ fn real_main(drm: &mut DrmBackend) {
 mod tests {
     use super::*;
 
+    struct PowerSupplyFixture(PathBuf);
+    impl PowerSupplyFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dfr-battery-test-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn add(&self, name: &str, fields: &[(&str, &str)]) {
+            let path = self.0.join(name);
+            fs::create_dir(&path).unwrap();
+            for (field, value) in fields {
+                fs::write(path.join(field), value).unwrap();
+            }
+        }
+    }
+    impl Drop for PowerSupplyFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn sample_sources() -> Vec<BatterySource> {
+        [
+            ("BAT0", false, 53),
+            ("hidpp_mouse", true, 80),
+            ("keyboard", true, 4),
+        ]
+        .into_iter()
+        .map(|(id, device, capacity)| BatterySource {
+            id: id.into(),
+            label: id.into(),
+            device,
+            capacity,
+            state: if capacity < 10 {
+                BatteryState::Low
+            } else {
+                BatteryState::NotCharging
+            },
+        })
+        .collect()
+    }
+
+    fn battery_button(action: ButtonAction) -> Button {
+        let icon = Handle::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/share/tiny-dfr/bolt.svg"
+        ))
+        .unwrap();
+        let mut button = Button::new_text(String::new(), action);
+        button.image = ButtonImage::Battery(
+            BatteryWidget::default(),
+            BatteryIconMode::Both,
+            BatteryImages {
+                plain: vec![icon.clone(); 8],
+                charging: vec![icon.clone(); 7],
+                bolt: icon,
+            },
+        );
+        button
+    }
+
+    fn battery_deck() -> LayerDeck {
+        let mut layer = FunctionLayer::with_config(vec![
+            keys("Held", &[Key::LeftCtrl, Key::F1]),
+            keys("Battery", &[Key::Battery]),
+        ]);
+        layer.buttons[1].1 = battery_button(ButtonAction::Keys(vec![Key::Battery]));
+        LayerDeck::new(vec![("home".into(), layer)], 0, None, false)
+    }
+
+    fn widget(deck: &LayerDeck) -> &BatteryWidget {
+        let ButtonImage::Battery(widget, _, _) = &deck.current().buttons[1].1.image else {
+            panic!()
+        };
+        widget
+    }
+
+    #[test]
+    fn power_supplies_distinguish_system_and_devices_and_skip_absent_or_unreadable() {
+        let fixture = PowerSupplyFixture::new();
+        fixture.add(
+            "hidpp_mouse",
+            &[
+                ("type", "Battery\n"),
+                ("scope", "Device\n"),
+                ("capacity", "80\n"),
+                ("model_name", "MX Master 3S\n"),
+            ],
+        );
+        fixture.add(
+            "keyboard",
+            &[
+                ("type", "Battery"),
+                ("scope", "Device"),
+                ("capacity", "4"),
+                ("status", "Discharging"),
+            ],
+        );
+        fixture.add(
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("scope", "System"),
+                ("capacity", "53"),
+                ("charge_now", "60"),
+                ("charge_full", "100"),
+                ("status", "Charging"),
+            ],
+        );
+        fixture.add("BAT1", &[("type", "Battery"), ("capacity", "90")]);
+        fixture.add("A_no_scope", &[("type", "Battery"), ("capacity", "90")]);
+        fixture.add(
+            "offline_hidpp",
+            &[
+                ("type", "Battery"),
+                ("scope", "Device"),
+                ("online", "0"),
+                ("capacity", "80"),
+            ],
+        );
+        fixture.add(
+            "absent",
+            &[
+                ("type", "Battery"),
+                ("scope", "Device"),
+                ("present", "0"),
+                ("capacity", "70"),
+            ],
+        );
+        fixture.add(
+            "unreadable",
+            &[
+                ("type", "Battery"),
+                ("scope", "Device"),
+                ("capacity", "Unknown"),
+            ],
+        );
+        fixture.add("AC", &[("type", "Mains"), ("capacity", "100")]);
+        let sources = read_battery_sources(&fixture.0);
+        assert_eq!(
+            sources.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["BAT0", "hidpp_mouse", "keyboard"]
+        );
+        assert!(!sources[0].device);
+        assert_eq!(
+            sources[0].capacity,
+            if cfg!(target_arch = "x86_64") { 60 } else { 53 }
+        );
+        assert_eq!(sources[0].state, BatteryState::Charging);
+        assert!(sources[1].device);
+        assert_eq!(sources[1].capacity, 80); // Capacity-only peripherals work on x86_64 too.
+        assert_eq!(sources[1].label, "MX Master 1");
+        assert_eq!(sources[2].state, BatteryState::Low);
+        fs::remove_dir_all(fixture.0.join("hidpp_mouse")).unwrap();
+        fs::write(fixture.0.join("keyboard/present"), "0").unwrap();
+        assert_eq!(read_battery_sources(&fixture.0).len(), 1);
+        assert!(read_battery_sources(&fixture.0.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn battery_cycles_system_devices_system_and_timeout_is_from_last_tap() {
+        let sources = sample_sources();
+        let now = Instant::now();
+        let timeout = Duration::from_secs(15);
+        let mut battery = BatteryWidget::default();
+        battery.refresh(&sources, true, timeout, now);
+        assert_eq!(battery.source().unwrap().id, "BAT0");
+        assert_eq!(battery.label(), Some("SYS"));
+        assert!(battery.cycle(now));
+        assert_eq!(battery.source().unwrap().capacity, 80);
+        assert_eq!(battery.label(), Some("hidpp_mouse"));
+        assert!(battery.cycle(now + Duration::from_secs(10)));
+        assert_eq!(battery.source().unwrap().id, "keyboard");
+        assert!(!battery.refresh(&sources, true, timeout, now + timeout));
+        assert!(battery.refresh(&sources, true, timeout, now + Duration::from_secs(25)));
+        assert_eq!(battery.source().unwrap().id, "BAT0");
+        assert!(battery.return_at.is_none());
+        for expected in ["hidpp_mouse", "keyboard", "BAT0", "hidpp_mouse"] {
+            assert!(battery.cycle(now));
+            assert_eq!(battery.source().unwrap().id, expected);
+        }
+    }
+
+    #[test]
+    fn hotplug_preserves_source_identity_and_removal_or_disabling_returns_to_system() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(15);
+        let mut sources = sample_sources();
+        let mut battery = BatteryWidget::default();
+        battery.refresh(&sources, true, timeout, now);
+        battery.cycle(now);
+        sources[1].capacity = 75;
+        sources.insert(
+            1,
+            BatterySource {
+                id: "new".into(),
+                label: "new".into(),
+                device: true,
+                capacity: 50,
+                state: BatteryState::NotCharging,
+            },
+        );
+        assert!(!battery.refresh(&sources, true, timeout, now));
+        assert_eq!(battery.source().unwrap().id, "hidpp_mouse");
+        assert_eq!(battery.source().unwrap().capacity, 75);
+        sources.retain(|source| source.id != "hidpp_mouse");
+        assert!(battery.refresh(&sources, true, timeout, now));
+        assert_eq!(battery.source().unwrap().id, "BAT0");
+        battery.cycle(now);
+        assert!(battery.refresh(&sources, false, timeout, now));
+        assert!(!battery.cycle(now));
+        assert!(battery.label().is_none());
+        battery.refresh(&sources[..1], true, timeout, now);
+        assert!(!battery.cycle(now));
+        assert!(battery.label().is_none());
+        battery.refresh(&[], true, timeout, now);
+        assert!(battery.source().is_none());
+        assert!(!battery.cycle(now));
+        battery.refresh(&sources[1..], true, timeout, now);
+        assert!(battery.source().is_none()); // A peripheral never masquerades as the computer.
+        assert!(battery.cycle(now));
+        assert!(battery.source().unwrap().device);
+    }
+
+    #[test]
+    fn cycling_releases_keys_and_does_not_send_the_battery_action_or_repeat_on_motion() {
+        let mut deck = battery_deck();
+        let sources = sample_sources();
+        deck.refresh_batteries(
+            &sources,
+            true,
+            Duration::from_secs(15),
+            Instant::now(),
+            &mut |_, _| {},
+        );
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.touch_down(0, 0, &mut emit);
+        assert!(deck.touch_down(1, 1, &mut emit));
+        assert!(deck.touches.is_empty());
+        assert_eq!(widget(&deck).source().unwrap().id, "hidpp_mouse");
+        deck.touch_motion(1, true, &mut emit);
+        deck.touch_motion(0, true, &mut emit);
+        deck.touch_up(1, &mut emit);
+        assert_eq!(widget(&deck).source().unwrap().id, "hidpp_mouse");
+        assert!(deck.touch_down(1, 1, &mut emit));
+        assert_eq!(widget(&deck).source().unwrap().id, "keyboard");
+        assert_eq!(
+            events,
+            vec![
+                (vec![Key::LeftCtrl, Key::F1], true),
+                (vec![Key::LeftCtrl, Key::F1], false)
+            ]
+        );
+    }
+
+    #[test]
+    fn timed_return_and_selected_device_removal_release_newly_held_keys() {
+        for removal in [false, true] {
+            let mut deck = battery_deck();
+            let sources = sample_sources();
+            let timeout = Duration::from_secs(15);
+            deck.refresh_batteries(&sources, true, timeout, Instant::now(), &mut |_, _| {});
+            deck.touch_down(0, 1, &mut |_, _| {});
+            let deadline = widget(&deck).return_at.unwrap();
+            let mut events = Vec::new();
+            let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+            deck.touch_down(1, 0, &mut emit);
+            let snapshot = if removal { &sources[..1] } else { &sources[..] };
+            let now = if removal {
+                deadline - timeout
+            } else {
+                deadline
+            };
+            assert!(deck
+                .refresh_batteries(snapshot, true, timeout, now, &mut emit)
+                .is_none());
+            assert_eq!(widget(&deck).source().unwrap().id, "BAT0");
+            assert!(deck.touches.is_empty());
+            deck.touch_motion(1, true, &mut emit);
+            deck.touch_up(1, &mut emit);
+            assert_eq!(
+                events,
+                vec![
+                    (vec![Key::LeftCtrl, Key::F1], true),
+                    (vec![Key::LeftCtrl, Key::F1], false)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_cycling_and_no_device_retain_legacy_battery_key_action() {
+        let sources = sample_sources();
+        for (enabled, snapshot) in [(false, &sources[..]), (true, &sources[..1])] {
+            let mut deck = battery_deck();
+            deck.refresh_batteries(
+                snapshot,
+                enabled,
+                Duration::from_secs(15),
+                Instant::now(),
+                &mut |_, _| {},
+            );
+            let mut events = Vec::new();
+            let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+            assert!(!deck.touch_down(0, 1, &mut emit));
+            deck.touch_up(0, &mut emit);
+            assert_eq!(widget(&deck).source().unwrap().id, "BAT0");
+            assert!(widget(&deck).label().is_none());
+            assert_eq!(
+                events,
+                vec![(vec![Key::Battery], true), (vec![Key::Battery], false)]
+            );
+        }
+    }
+
+    #[test]
+    fn background_battery_monitor_wakes_epoll_for_initial_and_hotplug_snapshots() {
+        let fixture = PowerSupplyFixture::new();
+        fixture.add("BAT0", &[("type", "Battery"), ("capacity", "53")]);
+        let mut monitor = BatteryMonitor::new(fixture.0.clone());
+        let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
+        epoll
+            .add(&monitor.wake, EpollEvent::new(EpollFlags::EPOLLIN, 0))
+            .unwrap();
+        let mut events = [EpollEvent::empty()];
+        assert_eq!(epoll.wait(&mut events, 2000u16).unwrap(), 1);
+        monitor.update();
+        assert_eq!(monitor.sources.len(), 1);
+        fixture.add(
+            "hidpp_mouse",
+            &[("type", "Battery"), ("scope", "Device"), ("capacity", "80")],
+        );
+        monitor.request_refresh();
+        assert_eq!(epoll.wait(&mut events, 2000u16).unwrap(), 1);
+        monitor.update();
+        assert_eq!(monitor.sources.len(), 2);
+        fs::remove_dir_all(fixture.0.join("hidpp_mouse")).unwrap();
+        monitor.request_refresh();
+        assert_eq!(epoll.wait(&mut events, 2000u16).unwrap(), 1);
+        monitor.update();
+        assert_eq!(monitor.sources.len(), 1);
+    }
+
+    #[test]
+    fn every_battery_mode_renders_source_labels_and_keeps_the_legacy_display() {
+        fn render(button: &Button) -> Vec<u8> {
+            let mut surface = ImageSurface::create(Format::ARgb32, 200, 60).unwrap();
+            {
+                let c = Context::new(&surface).unwrap();
+                c.set_font_size(32.0);
+                c.set_source_rgb(1.0, 1.0, 1.0);
+                button.render(&c, 60, 0.0, 200, 0.0);
+                assert_eq!(c.font_matrix().xx(), 32.0); // The next widget keeps its font size.
+            }
+            let pixels = surface.data().unwrap().to_vec();
+            pixels
+        }
+        for mode in [
+            BatteryIconMode::Icon,
+            BatteryIconMode::Percentage,
+            BatteryIconMode::Both,
+        ] {
+            let mut button = battery_button(ButtonAction::default());
+            let ButtonImage::Battery(battery, battery_mode, _) = &mut button.image else {
+                panic!()
+            };
+            *battery_mode = mode;
+            let mut sources = sample_sources();
+            for source in &mut sources {
+                source.capacity = 50;
+                source.state = BatteryState::NotCharging;
+            }
+            let now = Instant::now();
+            let timeout = Duration::from_secs(15);
+            battery.refresh(&sources, true, timeout, now);
+            let system = render(&button);
+            let ButtonImage::Battery(battery, _, _) = &mut button.image else {
+                panic!()
+            };
+            battery.cycle(now);
+            let mouse = render(&button);
+            let ButtonImage::Battery(battery, _, _) = &mut button.image else {
+                panic!()
+            };
+            battery.cycle(now);
+            let keyboard = render(&button);
+            // Equal readings and icons still render differently for each source.
+            assert_ne!(system, mouse);
+            assert_ne!(mouse, keyboard);
+            let ButtonImage::Battery(battery, _, _) = &mut button.image else {
+                panic!()
+            };
+            battery.refresh(&sources, false, timeout, now);
+            let disabled = render(&button);
+            let ButtonImage::Battery(battery, _, _) = &mut button.image else {
+                panic!()
+            };
+            battery.refresh(&sources[..1], true, timeout, now);
+            assert_eq!(disabled, render(&button));
+        }
+    }
+
     fn text(label: &str, action: ButtonAction) -> ButtonConfig {
         ButtonConfig {
             text: Some(label.into()),
@@ -1302,6 +1979,8 @@ mod tests {
             adaptive_brightness: false,
             active_brightness: 128,
             double_press_switch_layers: 0,
+            battery_cycle_enabled: true,
+            battery_cycle_timeout_secs: 15,
         };
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();

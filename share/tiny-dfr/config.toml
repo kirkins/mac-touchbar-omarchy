@@ -40,6 +40,13 @@ ActiveBrightness = 128
 # A sensible value to try is around 200.
 DoublePressSwitchLayers = 0
 
+# Tap a battery widget to cycle from the system battery through connected
+# device batteries. Set false to retain the widget's configured Action.
+BatteryCycleEnabled = true
+# Return to the system battery this many seconds after the last cycling tap.
+# Must be greater than zero; defaults to 15 even with older base configs.
+BatteryCycleTimeoutSecs = 15
+
 # This key defines the contents of the primary layer
 # (the one with F{number} keys)
 # You can change the individual buttons, add, or remove them
