@@ -456,6 +456,13 @@ impl PetManager {
             return (redraw, i32::MAX);
         }
 
+        // An expired heart overlay must come off the bar even without a
+        // state transition to redraw it.
+        if self.happy_until.is_some_and(|until| until <= now) {
+            self.happy_until = None;
+            redraw = true;
+        }
+
         if !self.placed {
             self.placed = true;
             self.pos = clamp_outside(
@@ -1391,8 +1398,10 @@ mod tests {
             matches!(p.state, PetState::Munch { .. }),
             "pet must reach the food"
         );
+        let mut heart_shown = false;
         for _ in 0..100 {
             tick(&mut p, &mut now, &[], 60);
+            heart_shown |= p.happy_until.is_some();
         }
         assert!(
             p.satiety > 0.99,
@@ -1400,7 +1409,8 @@ mod tests {
             p.satiety
         );
         assert!(p.food.is_none());
-        assert!(p.happy_until.is_some(), "a content pet shows its happiness");
+        assert!(heart_shown, "a content pet shows its happiness");
+        assert!(p.happy_until.is_none(), "the heart must expire");
     }
 
     #[test]
