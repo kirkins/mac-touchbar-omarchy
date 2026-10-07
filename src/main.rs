@@ -574,12 +574,12 @@ impl Button {
         match &self.image {
             ButtonImage::Time(items, _) => items.iter().any(|item| {
                 use chrono::format::{Item, Numeric};
-                match item {
+                matches!(
+                    item,
                     Item::Numeric(Numeric::Second, _)
-                    | Item::Numeric(Numeric::Nanosecond, _)
-                    | Item::Numeric(Numeric::Timestamp, _) => true,
-                    _ => false,
-                }
+                        | Item::Numeric(Numeric::Nanosecond, _)
+                        | Item::Numeric(Numeric::Timestamp, _)
+                )
             }),
             _ => false,
         }
@@ -1874,7 +1874,8 @@ mod tests {
                 button.render(&c, 60, 0.0, 200, 0.0);
                 assert_eq!(c.font_matrix().xx(), 32.0); // The next widget keeps its font size.
             }
-            surface.data().unwrap().to_vec()
+            let pixels = surface.data().unwrap().to_vec();
+            pixels
         }
         for mode in [
             BatteryIconMode::Icon,
