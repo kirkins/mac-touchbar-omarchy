@@ -21,13 +21,13 @@ CARGO_BUILD_JOBS=1 cargo build --locked --release
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
-presses/releases, battery widget cycling, and the virtual pet state machine
-(wander bounds, hop-over, nap gating and placement, satiety decay and feeding,
-startle, tap consumption, and reload transitions). Physical layout, touch
-accuracy, brightness, media-key delivery to the desktop, live battery/clock
-refresh, and the pet's on-glass charm still need a device test; battery checks
-there must include repeated tap-to-cycle, device labels in each display mode,
-hotplug, and timed return.
+presses/releases, battery widget cycling, and the virtual pet (pet-layer wiring
+and button toggle, wander bounds, pause and resume across layer switches, nap
+gating and placement, satiety decay and feeding, startle, tap consumption, and
+reload transitions). Physical layout, touch accuracy, brightness, media-key
+delivery to the desktop, live battery/clock refresh, and the pet's on-glass
+charm still need a device test; battery checks there must include repeated
+tap-to-cycle, device labels in each display mode, hotplug, and timed return.
 
 ## Named bars
 
@@ -87,31 +87,47 @@ discard existing touches; fingers already down must lift before pressing again.
 
 ## Touch Bar pet
 
-A small virtual pet, in the spirit of the 2016 Touchbar Pet, lives on the home
-bar (a behavioral homage written from scratch - no original assets or code).
-It wanders left and right with brief pauses, hops politely over buttons rather
-than walking across them, and curls up for naps beside the clock widget. Tapping
-the pet directly startles it (it jumps and scurries away); when it gets hungry
-it sits and begs, and tapping the pet itself or the bar next to it drops a
-kibble it walks over and munches. A satiety value decays over about an hour and
-gates the behavior: hungry pets beg and never nap, well-fed pets nap and wander.
-A direct tap on the pet is always consumed and never fires the widget
-underneath; nearby taps are consumed only while the pet is hungry, whether it
-is idling, walking, or begging.
-The pet is drawn as tiny per-state pixel frames through the existing cairo
-surface - no images are loaded and no font glyphs are required.
+A small virtual pet, in the spirit of the 2016 Touchbar Pet, lives on its own
+pet layer (a behavioral homage written from scratch - no original assets or
+code). With `PetEnabled = true` the home bar gains a Pet button beside the
+other navigation buttons - the same styling as Functions and Media - that
+opens the pet layer, a bar carrying a Home button like every other sub-bar
+and otherwise open ground. The pet exists and animates only inside its
+layer; it never renders on or interferes with the home bar or any other
+layer, and the layer follows the same rules as any named bar, including Fn
+behavior, invalid-config safety, and input release on layer switches.
+Closing the layer pauses the pet in place, and its state survives layer
+switches and config reloads.
+
+Inside the layer the pet wanders left and right with brief pauses and curls
+up for naps. The layer is painted as a little scene: a blue sky with a sun
+and clouds above the green ground strip the pet walks on, while buttons
+keep their normal deck look. The cat is a chunky orange tabby - big head,
+tabby stripes, white muzzle and chest, pink nose and inner ears, green
+eyes - drawn as per-state pixel frames through the existing cairo surface
+(no images are loaded and no font glyphs are required). It is noticeably
+larger than the original pet, about four fifths of the bar height.
+Tapping the pet directly startles it (it jumps and scurries away); when it
+gets hungry it sits and begs, and tapping the pet itself or the bar next to
+it drops a kibble it walks over and munches. A satiety value decays over
+about an hour and gates the behavior: hungry pets beg and never nap,
+well-fed pets nap and wander. A direct tap on the pet is always consumed
+and never fires the button underneath; nearby taps are consumed only while
+the pet is hungry, whether it is idling, walking, or begging.
 
 ```toml
-PetEnabled = true   # set false to remove the pet entirely
+PetEnabled = true   # set false to remove the Pet button and pet layer
 PetVariant = "cat"  # or "fox"
 PetEnergy = "calm"  # or "rowdy" for a faster, hungrier pet
 ```
 
-Invalid values are rejected like the other knobs, configurations without pet
-keys keep the defaults above, and the pet survives config reloads in place
-(nap, position, and satiety included). The pet only ever appears on the home
-bar; sub-bars and the Fn layer are pet-free. There is no scripting, network
-access, or persistence beyond the running daemon.
+Invalid values are rejected like the other knobs, and configurations without
+pet keys keep the defaults above. A `[[Layers]]` entry named `pet` replaces
+the synthesized playground, and an existing visible home-bar button targeting
+`pet` replaces the synthesized Pet button. With the pet disabled the name
+`pet` no longer exists, so buttons still targeting it are rejected like any
+unknown layer. There is no scripting, network access, or persistence beyond
+the running daemon.
 
 Unknown targets, duplicate or empty names, and empty bars reject the candidate
 configuration. Invalid TOML or layer definitions at startup log an error and use
@@ -157,7 +173,8 @@ sudo systemctl status tiny-dfr.service --no-pager
 ```
 
 On the device, check Home → Functions → Home and Home → Media → Home, all
-F1-F12/media controls, the battery and clock, and Fn press/release. Hold a key
+F1-F12/media controls, the battery and clock, and Home → Pet → pet
+wandering, feeding, and startling → Home, plus Fn press/release. Hold a key
 while switching with another finger and while saving a valid configuration;
 verify its release and that the old finger cannot activate a new button. Test an
 invalid target reload, an atomic save, and returning to the previous configuration.

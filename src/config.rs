@@ -20,6 +20,14 @@ use std::{
 const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
 const BASE_CFG_PATH: &str = "/usr/share/tiny-dfr/config.toml";
 
+/// Name of the pet's own layer. When the pet is enabled, a layer with this
+/// name is synthesized if the configuration does not define one, and the
+/// home bar gains a Pet button opening it.
+const PET_LAYER: &str = "pet";
+/// Free button spaces after the Home button inside the synthesized pet
+/// layer: open ground for the pet to wander.
+const PET_LAYER_STRETCH: usize = 7;
+
 pub struct Config {
     pub show_button_outlines: bool,
     pub enable_pixel_shift: bool,
@@ -174,7 +182,7 @@ impl ConfigProxy {
         };
         let mut names = HashSet::new();
         for layer in &layers {
-            if layer.name.trim().is_empty() || !names.insert(layer.name.as_str()) {
+            if layer.name.trim().is_empty() || !names.insert(layer.name.clone()) {
                 bail!("layer names must be nonempty and unique: {:?}", layer.name);
             }
             if layer.keys.is_empty() {
@@ -209,6 +217,51 @@ impl ConfigProxy {
                 })
                 .transpose()?
         };
+        // The pet lives on its own layer, opened by a Pet button on the home
+        // bar whenever PetEnabled is on. A user-defined layer named "pet"
+        // replaces the synthesized playground, and an existing visible
+        // button targeting it replaces the synthesized Pet button.
+        if self.pet_enabled.unwrap_or(true) {
+            if names.insert(PET_LAYER.to_owned()) {
+                layers.push(LayerConfig {
+                    name: PET_LAYER.into(),
+                    keys: vec![
+                        ButtonConfig {
+                            text: Some("Home".into()),
+                            action: ButtonAction::SwitchLayer(home_name.to_owned()),
+                            ..ButtonConfig::default()
+                        },
+                        ButtonConfig {
+                            stretch: Some(PET_LAYER_STRETCH),
+                            ..ButtonConfig::default()
+                        },
+                    ],
+                });
+            }
+            let home_layer = &mut layers[home];
+            let has_pet_button = home_layer.keys.iter().any(|button| {
+                button.action == ButtonAction::SwitchLayer(PET_LAYER.into())
+                    && button.text.as_deref().map_or(
+                        button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
+                        |text| !text.trim().is_empty(),
+                    )
+            });
+            if !has_pet_button {
+                let at = home_layer
+                    .keys
+                    .iter()
+                    .rposition(|button| matches!(button.action, ButtonAction::SwitchLayer(_)))
+                    .map_or(home_layer.keys.len(), |last| last + 1);
+                home_layer.keys.insert(
+                    at,
+                    ButtonConfig {
+                        text: Some("Pet".into()),
+                        action: ButtonAction::SwitchLayer(PET_LAYER.into()),
+                        ..ButtonConfig::default()
+                    },
+                );
+            }
+        }
         for layer in &layers {
             for button in &layer.keys {
                 if let ButtonAction::SwitchLayer(target) = &button.action {
@@ -314,6 +367,15 @@ fn load_config(
         Err(err) => return Err(err.into()),
     };
     let (base, layout) = parse_config(&read_to_string(base_path)?, user.as_deref(), width)?;
+    let pet_enabled = base.pet_enabled.unwrap_or(true);
+    let pet_layer = pet_enabled
+        .then(|| {
+            layout
+                .layers
+                .iter()
+                .position(|layer| layer.name == PET_LAYER)
+        })
+        .flatten();
     let layers = LayerDeck::new(
         layout
             .layers
@@ -322,6 +384,7 @@ fn load_config(
             .collect(),
         layout.home,
         layout.fn_layer,
+        pet_layer,
         layout.legacy,
     );
     let cfg = Config {
@@ -333,7 +396,7 @@ fn load_config(
         double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
         battery_cycle_enabled: base.battery_cycle_enabled.unwrap_or(true),
         battery_cycle_timeout_secs: base.battery_cycle_timeout_secs.unwrap_or(15),
-        pet_enabled: base.pet_enabled.unwrap_or(true),
+        pet_enabled,
         pet_variant: base
             .pet_variant
             .as_deref()
@@ -504,7 +567,7 @@ DoublePressSwitchLayers = 200
             );
             let (cfg, layout) = parse_config(BASE, Some(&user), 2008).unwrap();
             assert!(layout.legacy);
-            assert_eq!(layout.layers.len(), 2);
+            assert_eq!(layout.layers.len(), 3);
             assert_eq!(layout.home, usize::from(media_default));
             assert_eq!(layout.fn_layer, Some(1 - layout.home));
             assert_eq!(
@@ -519,7 +582,7 @@ DoublePressSwitchLayers = 200
             assert_eq!(cfg.active_brightness, Some(128));
         }
         let (_, stock) = parse_config(BASE, None, 2008).unwrap();
-        assert_eq!(stock.layers[0].keys.len(), 12);
+        assert_eq!(stock.layers[0].keys.len(), 13);
         assert_eq!(stock.layers[1].keys.len(), 12);
     }
 
@@ -541,7 +604,16 @@ DoublePressSwitchLayers = 200
             }
         }
         let (_, legacy) = parse_config(BASE, None, 2170).unwrap();
-        assert!(legacy.layers.iter().all(|layer| layer.keys.len() == 13));
+        assert!(legacy
+            .layers
+            .iter()
+            .all(|layer| layer.keys[0].action == ButtonAction::Keys(vec![Key::Esc])));
+        // The legacy primary bar ends with the synthesized Pet button.
+        let primary = &legacy.layers[0];
+        assert_eq!(primary.keys.len(), 14);
+        let pet_button = primary.keys.last().unwrap();
+        assert_eq!(pet_button.text.as_deref(), Some("Pet"));
+        assert_eq!(pet_button.action, ButtonAction::SwitchLayer("pet".into()));
     }
 
     #[test]
@@ -553,7 +625,12 @@ DoublePressSwitchLayers = 200
         assert_eq!(layout.home, 1);
         assert_eq!(layout.fn_layer, None);
         // Existing visible navigation to the default already provides a return path.
+        assert_eq!(layout.layers[0].keys[0].text.as_deref(), Some("Functions"));
         assert_eq!(layout.layers[0].keys.len(), 1);
+        // The Pet button joins whatever layer is the home bar, here "function".
+        let home = &layout.layers[layout.home];
+        assert_eq!(home.keys.len(), 2);
+        assert_eq!(home.keys.last().unwrap().text.as_deref(), Some("Pet"));
     }
 
     #[test]
@@ -578,11 +655,11 @@ DoublePressSwitchLayers = 200
             2008,
         )
         .unwrap();
-        assert_eq!(layout.layers.len(), 3);
+        assert_eq!(layout.layers.len(), 4);
         let home = &layout.layers[layout.home];
         assert!(home.keys.iter().any(|key| key.time.is_some()));
         assert!(home.keys.iter().any(|key| key.battery.is_some()));
-        for name in ["function", "media"] {
+        for name in ["function", "media", "pet"] {
             assert!(home
                 .keys
                 .iter()
@@ -601,6 +678,20 @@ DoublePressSwitchLayers = 200
                 1
             );
         }
+        // The Pet button joins the navigation cluster after Functions and
+        // Media, matching their styling.
+        let positions: Vec<usize> = ["function", "media", "pet"]
+            .into_iter()
+            .map(|name| {
+                home.keys
+                    .iter()
+                    .position(|key| key.action == ButtonAction::SwitchLayer(name.into()))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(positions, vec![6, 7, 8]);
+        let pet_button = &home.keys[positions[2]];
+        assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout
             .layers
             .iter()
@@ -811,7 +902,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let mut manager = ConfigManager::with_paths(base, path.clone());
         let (_, mut deck) = manager.load_config(2008);
         assert!(!deck.legacy);
-        assert_eq!(deck.layers.len(), 2);
+        assert_eq!(deck.layers.len(), 3);
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
@@ -892,7 +983,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let (_, mut deck) = manager.load_config(2008);
         assert!(deck.legacy);
         assert_eq!(deck.active, 0);
-        assert_eq!(deck.layers.len(), 2);
+        assert_eq!(deck.layers.len(), 3);
 
         fs::write(&path, NAMED).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();
@@ -908,7 +999,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         deck.replace(replacement, &mut emit);
         assert!(deck.legacy);
         assert_eq!(deck.active, deck.home);
-        assert_eq!(deck.layers.len(), 2);
+        assert_eq!(deck.layers.len(), 3);
         assert!(deck.touches.is_empty());
         deck.touch_up(0, &mut emit);
         assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
@@ -933,6 +1024,117 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let (cfg, deck) = manager.load_config(2008);
         assert_eq!(cfg.double_press_switch_layers, 0);
         assert!(!deck.legacy);
-        assert_eq!(deck.layers.len(), 3);
+        assert_eq!(deck.layers.len(), 4);
+    }
+
+    #[test]
+    fn pet_enabled_synthesizes_a_pet_layer_and_home_button() {
+        for width in [2008, 2170] {
+            let (_, layout) = parse_config(BASE, Some(NAMED), width).unwrap();
+            let pet = layout
+                .layers
+                .iter()
+                .find(|layer| layer.name == "pet")
+                .expect("the pet layer is synthesized");
+            let offset = usize::from(width >= 2170);
+            let home_button = &pet.keys[offset];
+            assert_eq!(home_button.text.as_deref(), Some("Home"));
+            assert_eq!(home_button.action, ButtonAction::SwitchLayer("home".into()));
+            let ground = &pet.keys[offset + 1];
+            assert_eq!(ground.stretch, Some(PET_LAYER_STRETCH));
+            assert!(ground.text.is_none() && ground.icon.is_none());
+            // The home bar gains a Pet button right after its Functions nav.
+            let home = &layout.layers[layout.home];
+            let functions = home
+                .keys
+                .iter()
+                .position(|key| key.action == ButtonAction::SwitchLayer("function".into()))
+                .unwrap();
+            let pet_button = &home.keys[functions + 1];
+            assert_eq!(pet_button.text.as_deref(), Some("Pet"));
+            assert_eq!(pet_button.action, ButtonAction::SwitchLayer("pet".into()));
+        }
+    }
+
+    #[test]
+    fn pet_disabled_restores_the_pre_pet_home_bar_and_layer_list() {
+        let config = format!("PetEnabled = false\n{NAMED}");
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        assert_eq!(layout.layers.len(), 2);
+        assert!(layout.layers.iter().all(|layer| layer.name != "pet"));
+        let home = &layout.layers[layout.home];
+        assert_eq!(home.keys.len(), 1);
+        assert_eq!(home.keys[0].text.as_deref(), Some("Functions"));
+        assert!(!home
+            .keys
+            .iter()
+            .any(|key| key.text.as_deref() == Some("Pet")));
+        // The disabled pet is also absent from legacy layouts.
+        let (_, legacy) = parse_config(
+            &text_only_base().replace("PetEnabled = true", "PetEnabled = false"),
+            None,
+            2008,
+        )
+        .unwrap();
+        assert_eq!(legacy.layers.len(), 2);
+        assert!(legacy.layers.iter().all(|layer| layer.name != "pet"));
+    }
+
+    #[test]
+    fn a_user_pet_layer_replaces_the_synthesized_playground() {
+        let config = format!(
+            "{NAMED}\n\
+[[Layers]]\n\
+Name = \"pet\"\n\
+Keys = [{{ Text = \"P1\" }}]\n"
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        assert_eq!(layout.layers.len(), 3);
+        let pet = &layout.layers[2];
+        assert_eq!(pet.name, "pet");
+        // The user's buttons are kept and gain only the generic Home button,
+        // never the synthesized playground spacer.
+        assert_eq!(pet.keys.len(), 2);
+        assert_eq!(pet.keys[0].text.as_deref(), Some("Home"));
+        assert_eq!(pet.keys[1].text.as_deref(), Some("P1"));
+        // The home bar still gets its Pet button, now targeting the user's
+        // layer; an author-provided visible button would replace it.
+        let home = &layout.layers[layout.home];
+        assert!(home
+            .keys
+            .iter()
+            .any(|key| key.action == ButtonAction::SwitchLayer("pet".into())));
+        let with_own_button = config.replace(
+            "{ Text = \"Functions\", Action = { Layer = \"function\" } }",
+            "{ Text = \"Functions\", Action = { Layer = \"function\" } }, { Text = \"Kitty\", Action = { Layer = \"pet\" } }",
+        );
+        let (_, layout) = parse_config(BASE, Some(&with_own_button), 2008).unwrap();
+        let home = &layout.layers[layout.home];
+        assert_eq!(
+            home.keys
+                .iter()
+                .filter(|key| key.action == ButtonAction::SwitchLayer("pet".into()))
+                .count(),
+            1
+        );
+        assert!(home
+            .keys
+            .iter()
+            .any(|key| key.text.as_deref() == Some("Kitty")));
+        assert!(!home
+            .keys
+            .iter()
+            .any(|key| key.text.as_deref() == Some("Pet")));
+    }
+
+    #[test]
+    fn disabling_the_pet_rejects_stale_references_to_the_pet_layer() {
+        // With the pet disabled the synthesized layer no longer exists, so a
+        // button still naming it is an unknown target like any other.
+        let config = format!("PetEnabled = false\n{NAMED}").replace(
+            "{ Text = \"Functions\", Action = { Layer = \"function\" } }",
+            "{ Text = \"Functions\", Action = { Layer = \"function\" } }, { Text = \"Pet\", Action = { Layer = \"pet\" } }",
+        );
+        assert!(parse_config(BASE, Some(&config), 2008).is_err());
     }
 }

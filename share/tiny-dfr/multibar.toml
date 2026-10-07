@@ -53,4 +53,7 @@ Keys = [
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,
 # then add a button with Action = { Layer = "that-name" } to a reachable bar.
 # A Home button is inserted automatically on sub-bars that lack a visible
-# button targeting DefaultLayer. No command execution or external service is used.
+# button targeting DefaultLayer. With PetEnabled (see config.toml) the home
+# bar also gains a Pet button opening the daemon's own pet layer, unless a
+# layer named "pet" is defined here. No command execution or external
+# service is used.

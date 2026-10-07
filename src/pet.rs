@@ -1,28 +1,29 @@
-//! A small virtual pet that lives on the home bar, in the spirit of the
-//! 2016 Touchbar Pet. The pet is a behavior state machine driven by the same
+//! A small virtual pet that lives on its own pet layer, opened by a Pet
+//! button on the home bar, in the spirit of the 2016 Touchbar Pet. The pet
+//! is a behavior state machine driven by the same
 //! background tick machinery as pixel shift and the battery widgets: every
 //! daemon loop iteration calls [`PetManager::update`] with the current time,
 //! which returns whether a redraw is needed and when the next tick is due so
 //! the shared epoll wait wakes in time. Sprites are tiny per-state pixel
 //! frames composed from constant grids and drawn through the existing cairo
-//! surface - no image loading, no new rendering architecture. Taps are offered
-//! to the pet before the layer's hit testing, so a consumed tap never
-//! activates the widget underneath.
+//! surface - no image loading, no new rendering architecture. The pet
+//! layer also gets a painted backdrop scene: blue sky, a green ground strip
+//! with the sun and clouds above it. Taps inside
+//! the pet layer are offered to the pet before the layer's hit testing, so a
+//! consumed tap never activates the button underneath; the pet pauses while
+//! any other layer is displayed and resumes with its state intact.
 
 use cairo::Context;
 use rand::Rng;
 use std::time::{Duration, Instant};
 
-/// Pixels per sprite pixel. 3 keeps a 12x9 grid legible on a 60 px tall bar.
-const SCALE: f64 = 3.0;
+/// Pixels per sprite pixel. 4 turns a 17x12 grid into a 68x48 sprite,
+/// a chunky cat that still fits a 60 px tall bar.
+const SCALE: f64 = 4.0;
 /// Blank margins from the bar ends the pet treats as its territory.
 const EDGE_MARGIN: f64 = 26.0;
-/// How far beyond a widget the hop lands.
-const HOP_MARGIN: f64 = 6.0;
-/// Hop duration; horizontal travel interpolates across it.
-const HOP_MS: u64 = 650;
-/// Peak hop height above the ground.
-const HOP_HEIGHT: f64 = 26.0;
+/// Distance kept beyond a button edge when standing or landing beside it.
+const CLEAR_MARGIN: f64 = 6.0;
 /// Extra tap slop around the sprite in every direction.
 const TAP_PAD: f64 = 9.0;
 /// Taps this far to either side of the pet drop food while it is hungry.
@@ -45,12 +46,12 @@ const BRIEF_IDLE_MS: u64 = 700;
 /// Flee distance after a startle.
 const FLEE_PX: f64 = 140.0;
 
-/// Bar geometry and visibility for one tick. `home_active` gates the pet to
-/// the home layer, matching where it is allowed to wander.
+/// Bar geometry and visibility for one tick. `active` gates the pet to its
+/// own layer, the only place it is allowed to wander and drawn.
 pub struct Bar {
     pub width: f64,
     pub height: f64,
-    pub home_active: bool,
+    pub active: bool,
 }
 
 /// An occupied horizontal span of the bar in layout coordinates mirroring
@@ -85,16 +86,22 @@ impl PetVariant {
     fn palette(self) -> Palette {
         match self {
             Self::Cat => Palette {
-                body: (0.82, 0.82, 0.86),
-                dark: (0.12, 0.12, 0.16),
-                light: (0.94, 0.94, 0.96),
-                nose: (0.92, 0.55, 0.62),
+                body: (0.95, 0.55, 0.18),
+                stripe: (0.72, 0.33, 0.10),
+                dark: (0.25, 0.13, 0.08),
+                light: (0.98, 0.95, 0.90),
+                nose: (0.98, 0.55, 0.62),
+                ear: (0.97, 0.62, 0.66),
+                eye: (0.10, 0.55, 0.25),
             },
             Self::Fox => Palette {
-                body: (0.90, 0.48, 0.13),
-                dark: (0.18, 0.10, 0.07),
-                light: (0.97, 0.92, 0.82),
-                nose: (0.98, 0.98, 0.98),
+                body: (0.90, 0.42, 0.10),
+                stripe: (0.72, 0.30, 0.06),
+                dark: (0.20, 0.10, 0.06),
+                light: (0.97, 0.93, 0.85),
+                nose: (0.25, 0.15, 0.12),
+                ear: (0.95, 0.60, 0.50),
+                eye: (0.15, 0.12, 0.10),
             },
         }
     }
@@ -150,126 +157,180 @@ const ROWDY: Cadence = Cadence {
 
 struct Palette {
     body: (f64, f64, f64),
+    stripe: (f64, f64, f64),
     dark: (f64, f64, f64),
     light: (f64, f64, f64),
     nose: (f64, f64, f64),
+    ear: (f64, f64, f64),
+    eye: (f64, f64, f64),
 }
 
 impl Palette {
     fn get(&self, ch: char) -> Option<(f64, f64, f64)> {
         match ch {
             'B' => Some(self.body),
+            'S' => Some(self.stripe),
             'D' => Some(self.dark),
             'W' => Some(self.light),
             'N' => Some(self.nose),
+            'P' => Some(self.ear),
+            'E' => Some(self.eye),
             _ => None,
         }
     }
 }
 
 // Per-state sprite frames, drawn facing right and mirrored for leftward
-// travel. '.' is transparent; B body, D dark, W light, N nose.
+// travel. '.' is transparent; B body, S stripe, D dark outline, W white,
+// N nose, P inner ear, E eye. The cat is a chibi orange tabby: big head,
+// tabby stripes, white muzzle and chest, pink nose and inner ears.
 const WALK_A: &[&str] = &[
-    "D...........",
-    "DBD...DD....",
-    "DBD..DBBD...",
-    ".DBDDBBWBD..",
-    ".DBBBBBBBBD.",
-    ".DBWBBBBBBD.",
-    ".DB.DB..DBD.",
-    ".DD...D..DD.",
+    "...........D..D..",
+    "..........DPDDPD.",
+    "..S.......DBBBBD.",
+    "..SS.....DBSBBED.",
+    "...SS..SDBSBWWND.",
+    "....SSDBBBBBWWWD.",
+    "....DBBBBBBBWWWD.",
+    "....DBSBSBBBDDDD.",
+    "....DBBBBBBD.....",
+    "....DB..DBBD.....",
+    "....DB...DBD.....",
+    "....DD...DWD.....",
 ];
 const WALK_B: &[&str] = &[
-    ".D..........",
-    "DBD...DD....",
-    "DBD..DBBD...",
-    ".DBDDBBWBD..",
-    ".DBBBBBBBBD.",
-    ".DBWBBBBBBD.",
-    ".DBD..DBBD..",
-    ".DD....DD...",
+    "...........D..D..",
+    "..........DPDDPD.",
+    "..S.......DBBBBD.",
+    "..SS.....DBSBBED.",
+    "...SS..SDBSBWWND.",
+    "....SSDBBBBBWWWD.",
+    "....DBBBBBBBWWWD.",
+    "....DBSBSBBBDDDD.",
+    "....DBBBBBBD.....",
+    ".....DBD.DBD.....",
+    ".....DBD..DB.....",
+    ".....DWD..DW.....",
 ];
 const SIT: &[&str] = &[
-    "..DD....DD..",
-    "..DBD..DBD..",
-    "..DBBDDDBD..",
-    ".DBDBBBDBBD.",
-    ".DBBBNNBBBD.",
-    "..DBBBBBBD..",
-    "..DBWBBWBD..",
-    "..DDDDDDDD..",
+    "...........D..D..",
+    "..........DPDDPD.",
+    "..........DBBBBD.",
+    "..........DBSBED.",
+    "..........DBWWND.",
+    "..........DBWWWD.",
+    ".......DDDDBBBBD.",
+    ".....SDBBBBBBBWD.",
+    "....DSBSBBBBBBWD.",
+    "....DBBBBBBBBBWD.",
+    "....DB.BB..BB.DD.",
+    "....DD.DWW.DWWD..",
 ];
 const BEG_A: &[&str] = &[
-    "..DD....DD..",
-    "..DBD..DBD..",
-    "..DBBDDDBD..",
-    ".DBDBBBDBBD.",
-    ".DBBBNNBBBD.",
-    ".WDBBBBBBD..",
-    "..DBBBBBD...",
-    "..DBWBBBD...",
-    "..DDDDDDD...",
+    "...........D..D..",
+    "..........DPDDPD.",
+    "..........DBBBBD.",
+    "..........DBSBED.",
+    "..........DBWWND.",
+    "......DDDDDBWWWD.",
+    "....SDBBBBBBDDDD.",
+    "...DSBSBBBBBD....",
+    "...DBBBBBBBBD....",
+    "...DBBBBBBBBD....",
+    "...DBD...DBD.....",
+    "...DWD...DWD.....",
 ];
 const BEG_B: &[&str] = &[
-    "..DD....DD..",
-    "..DBD..DBD..",
-    "..DBBDDDBD..",
-    ".DBDBBBDBBD.",
-    ".DBBBNNBBBD.",
-    "..DBBBBBBD.W",
-    "...DBBBBD...",
-    "...DBBBWBD..",
-    "...DDDDDD...",
+    "..........D..D...",
+    ".........DPDDPD..",
+    ".........DBBBBD..",
+    ".........DBSBED..",
+    ".........DBWWND..",
+    ".....DDDDDBWWWD..",
+    "...SDBBBBBBDDDD..",
+    "..DSBSBBBBBD.W...",
+    "..DBBBBBBBBD.....",
+    "..DBBBBBBBBD.....",
+    "..DBD...DBD......",
+    "..DWD...DWD......",
 ];
 const SLEEP: &[&str] = &[
-    "............",
-    "..DDDDDD....",
-    ".DBBBBBBD...",
-    "DBDBBBBBBD..",
-    "DBBBBBBBBBD.",
-    ".DBBBBBBBD..",
-    "..DDDDDDD...",
-    "............",
+    "................",
+    "................",
+    "................",
+    "................",
+    ".......DDDD.....",
+    ".....DDBSSBDD...",
+    "...DDBBBBBBBBD..",
+    "..DBBBBBBBBBSBD.",
+    "..DBBBBBBBBBSBD.",
+    "..DBNWWBBBBBSBD.",
+    "..DWWWWDBBBBSBD.",
+    "...DDDDDDDDDDDD.",
 ];
 const STARTLE: &[&str] = &[
-    ".DD......DD.",
-    ".DBD....DBD.",
-    "..DBD..DBD..",
-    "..DBDDBBD...",
-    "..DBBBBBD...",
-    ".DBBBBBBBD..",
-    ".DBDBDBBD...",
-    ".DD.DD.DD...",
+    "................",
+    "..D..S........D.",
+    "..DPDSS......DPD",
+    "..DBBBSDDDD..DBD",
+    "...DBBBBBBBDDBBD",
+    "...DBBBBBBBBBD..",
+    "..DBSBSBSBBBD...",
+    "..DBBBBBBBBD....",
+    "..DBD.DBD.DD....",
+    "..DD...DD.......",
+    "................",
+    "................",
 ];
 const MUNCH_A: &[&str] = &[
-    "............",
-    "............",
-    ".DD......D..",
-    ".DBD...DBBD.",
-    ".DBBDDBBBBD.",
-    ".DBBBBBBBD..",
-    ".DBWBBBBD...",
-    ".DB..DBD....",
-    ".DD...DD....",
+    "................",
+    "................",
+    "..........D..D..",
+    ".........DPDDPD.",
+    "....S.....DBBBBD",
+    "...SS....DBSBED.",
+    "..SS..SDBSBWWND.",
+    "...SDBBBBBWWWWWD",
+    "...DBSBSBBDDDDDD",
+    "...DBBBBBBD.....",
+    "...DB..DBBD.....",
+    "...DD..DWWD.....",
 ];
 const MUNCH_B: &[&str] = &[
-    "............",
-    "............",
-    ".DD......D..",
-    ".DBD...DBBD.",
-    ".DBBDDBBD...",
-    ".DBBB.BBD...",
-    ".DBWBBBBD...",
-    ".DB..DBD....",
-    ".DD...DD....",
+    "................",
+    "................",
+    "..........D..D..",
+    ".........DPDDPD.",
+    "....S.....DBBBBD",
+    "...SS....DBSBED.",
+    "..SS..SDBSBWWND.",
+    "...SDBBBBBWWWWWD",
+    "...DBSBSBBD.DDD.",
+    "...DBBBBBBD.....",
+    "...DB..DBBD.....",
+    "...DD..DWWD.....",
 ];
-const BANG: &[&str] = &[".D.", ".D.", ".D.", "...", ".D."];
+const BANG: &[&str] = &[".DD.", ".DD.", ".DD.", "....", ".DD."];
 const ZZZ: &[&str] = &["DDDD", "..D.", ".D..", "DDDD"];
-const HEART: &[&str] = &[".D.D.", "DDDDD", ".DDD.", "..D.."];
+const HEART: &[&str] = &[".DD.DD.", "DDDDDDD", ".DDDDD.", "..DDD..", "...D..."];
 const KIBBLE: &[&str] = &[".KK.", "KKKK", ".KK."];
 const KIBBLE_RGB: (f64, f64, f64) = (0.62, 0.38, 0.15);
 const OVERLAY_DARK: (f64, f64, f64) = (0.95, 0.95, 0.95);
-const OVERLAY_HEART: (f64, f64, f64) = (0.95, 0.45, 0.55);
+const OVERLAY_HEART: (f64, f64, f64) = (0.98, 0.35, 0.5);
+
+// The pet layer's backdrop: a blue sky above a green ground strip, with a
+// sun and clouds, painted only across the layer's open ground so the Home
+// button keeps its normal deck look.
+const CLOUD: &[&str] = &["..CCCC..", ".CCCCCC.", "CCCCCCCC"];
+const SUN: &[&str] = &["..YY..", ".YYYY.", "YYYYYY", "YYYYYY", ".YYYY.", "..YY.."];
+const CLOUD_RGB: (f64, f64, f64) = (0.97, 0.99, 1.0);
+const SUN_RGB: (f64, f64, f64) = (1.0, 0.85, 0.25);
+/// Fraction of the bar height where the ground strip begins; the pet's
+/// feet rest inside it.
+const GROUND_TOP: f64 = 0.80;
+const SKY_RGB: (f64, f64, f64) = (0.47, 0.72, 0.96);
+const GROUND_RGB: (f64, f64, f64) = (0.35, 0.68, 0.32);
+const GRASS_RGB: (f64, f64, f64) = (0.22, 0.50, 0.22);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PetState {
@@ -306,30 +367,6 @@ enum After {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Hop {
-    from: f64,
-    to: f64,
-    started: Instant,
-    until: Instant,
-}
-
-impl Hop {
-    fn progress(self, now: Instant) -> f64 {
-        let total = self.until.saturating_duration_since(self.started);
-        if total.is_zero() {
-            return 1.0;
-        }
-        (now.saturating_duration_since(self.started).as_secs_f64() / total.as_secs_f64())
-            .clamp(0.0, 1.0)
-    }
-
-    fn x_at(self, now: Instant) -> f64 {
-        let t = self.progress(now);
-        self.from + (self.to - self.from) * t
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 struct Food {
     x: f64,
 }
@@ -341,7 +378,6 @@ pub struct PetManager {
     visible: bool,
     placed: bool,
     state: PetState,
-    hop: Option<Hop>,
     food: Option<Food>,
     /// Horizontal center in layout coordinates (before pixel-shift offset).
     pos: f64,
@@ -373,7 +409,6 @@ impl PetManager {
             state: PetState::Idle {
                 until: now + Duration::from_millis(800),
             },
-            hop: None,
             food: None,
             pos: 0.0,
             facing: 1.0,
@@ -402,6 +437,13 @@ impl PetManager {
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// Horizontal center in layout coordinates, for tests asserting that
+    /// layer switches never teleport the pet.
+    #[cfg(test)]
+    pub(crate) fn position(&self) -> f64 {
+        self.pos
     }
 
     fn cadence(&self) -> &'static Cadence {
@@ -440,8 +482,8 @@ impl PetManager {
     /// redraw and how long until the next interesting moment, in milliseconds.
     pub fn update(&mut self, now: Instant, bar: &Bar, spans: &[Span]) -> (bool, i32) {
         let mut redraw = false;
-        if self.visible != (self.enabled && bar.home_active) {
-            self.visible = self.enabled && bar.home_active;
+        if self.visible != (self.enabled && bar.active) {
+            self.visible = self.enabled && bar.active;
             // Repaint either clears a hidden pet or restores a shown one.
             redraw = true;
         }
@@ -454,6 +496,8 @@ impl PetManager {
         self.satiety = (self.satiety - self.cadence().decay_per_ms * dt_ms).max(0.0);
 
         if !self.visible {
+            // Paused while another layer is displayed: the state machine and
+            // position freeze, only the metabolism keeps running.
             return (redraw, i32::MAX);
         }
 
@@ -475,11 +519,9 @@ impl PetManager {
             redraw = true;
         }
         self.pos = self.pos.clamp(self.min_x(), self.max_x());
-        // A grounded pet never stands inside a widget; this also relocates
+        // A grounded pet never stands inside a button; this also relocates
         // it politely when a reload changes the layout underneath.
-        if self.hop.is_none() {
-            self.pos = clamp_outside(self.pos, spans, self.min_x(), self.max_x());
-        }
+        self.pos = clamp_outside(self.pos, spans, self.min_x(), self.max_x());
         // The same reload can drop widgets onto a chosen target or waiting
         // food; keep both standable against the layout now in force.
         let (min_x, max_x) = (self.min_x(), self.max_x());
@@ -504,26 +546,12 @@ impl PetManager {
                 }
             }
             PetState::Walk { .. } => {
-                // Finish a completed hop first so stepping resumes from the
-                // landing spot rather than spinning on a due hop deadline.
-                if self.hop.is_some_and(|hop| now >= hop.until) {
-                    let hop = self.hop.unwrap();
-                    self.pos = hop.to;
-                    self.hop = None;
-                    self.next_step = Some(now);
-                    redraw = true;
-                }
                 while matches!(self.state, PetState::Walk { .. })
                     && self.next_step.is_some_and(|t| now >= t)
                 {
                     self.walk_step(now);
                     redraw = true;
                 }
-                if let Some(hop) = self.hop {
-                    self.pos = hop.x_at(now);
-                    redraw = true;
-                }
-                self.lift = hop_lift(self.hop, now);
             }
             PetState::Nap { started, until } => {
                 let blink = zzz_visible(started, now);
@@ -620,7 +648,6 @@ impl PetManager {
                 self.spawn_food(drop_x, now);
             } else if !matches!(self.state, PetState::Munch { .. }) {
                 let away = if x >= screen_x { -1.0 } else { 1.0 };
-                self.hop = None;
                 self.lift = 0.0;
                 self.state = PetState::Startled {
                     started: now,
@@ -647,7 +674,6 @@ impl PetManager {
             self.max_x(),
         );
         self.food = Some(Food { x });
-        self.hop = None;
         self.lift = 0.0;
         if (x - self.pos).abs() < self.cadence().px_per_step {
             self.state = PetState::Munch {
@@ -664,13 +690,14 @@ impl PetManager {
         }
     }
 
-    /// Draw the pet onto the bar surface. `c` must carry the same
+    /// Draw the pet onto its layer. `c` must carry the same
     /// translate/rotate transform the layer draw sets up, `shift` the total
     /// pixel-shift offset applied to widgets.
     pub fn draw(&self, c: &Context, height: i32, shift: (f64, f64), now: Instant) {
         if !self.visible {
             return;
         }
+        self.draw_scene(c, height as f64, shift);
         let feet = height as f64 * 0.88 + shift.1 - self.lift;
         if let Some(food) = &self.food {
             draw_grid(
@@ -708,6 +735,72 @@ impl PetManager {
                 }
             }
         }
+    }
+
+    /// The pet layer's backdrop: blue sky above a green ground strip in
+    /// every open stretch of the layer, plus a sun and clouds in the sky.
+    /// Button columns are left untouched so widgets keep their deck look.
+    fn draw_scene(&self, c: &Context, height: f64, shift: (f64, f64)) {
+        let ground_top = height * GROUND_TOP;
+        let overdraw = 16.0;
+        for (a, b, reaches_right_edge) in free_intervals(&self.spans, self.width) {
+            let (a, mut b) = (a + shift.0, b + shift.0);
+            if reaches_right_edge {
+                b += overdraw;
+            }
+            c.set_source_rgb(SKY_RGB.0, SKY_RGB.1, SKY_RGB.2);
+            c.rectangle(
+                a,
+                shift.1 - overdraw,
+                b - a,
+                ground_top - shift.1 + overdraw,
+            );
+            c.fill().unwrap();
+            c.set_source_rgb(GROUND_RGB.0, GROUND_RGB.1, GROUND_RGB.2);
+            c.rectangle(
+                a,
+                ground_top + shift.1,
+                b - a,
+                height - ground_top + overdraw,
+            );
+            c.fill().unwrap();
+            c.set_source_rgb(GRASS_RGB.0, GRASS_RGB.1, GRASS_RGB.2);
+            c.rectangle(a, ground_top + shift.1, b - a, 2.5);
+            c.fill().unwrap();
+        }
+        // The sun and clouds float over the widest stretch of open sky.
+        let Some((a, b, _)) = free_intervals(&self.spans, self.width)
+            .into_iter()
+            .max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
+            .filter(|&(a, b, _)| b - a > 240.0)
+        else {
+            return;
+        };
+        let span = b - a;
+        draw_grid(
+            c,
+            SUN,
+            a + span * 0.86 + shift.0,
+            30.0 + shift.1,
+            |ch| (ch == 'Y').then_some(SUN_RGB),
+            false,
+        );
+        draw_grid(
+            c,
+            CLOUD,
+            a + span * 0.22 + shift.0,
+            20.0 + shift.1,
+            |ch| (ch == 'C').then_some(CLOUD_RGB),
+            false,
+        );
+        draw_grid(
+            c,
+            CLOUD,
+            a + span * 0.52 + shift.0,
+            26.0 + shift.1,
+            |ch| (ch == 'C').then_some(CLOUD_RGB),
+            false,
+        );
     }
 
     fn current_grid(&self) -> (&'static [&'static str], bool) {
@@ -799,19 +892,11 @@ impl PetManager {
             return;
         };
         let cadence = self.cadence();
-        if let Some(hop) = self.hop {
-            // Mid-hop only the animation frame advances; the arc itself is
-            // interpolated continuously in update().
-            self.phase += 1;
-            self.next_step = Some(hop.until);
-            return;
-        }
         let diff = target - self.pos;
         if diff.abs() <= cadence.px_per_step {
             // Arrival.
             self.pos = target;
             self.phase += 1;
-            self.lift = 0.0;
             match after {
                 After::Pause => {
                     self.state = PetState::Idle {
@@ -846,32 +931,9 @@ impl PetManager {
         let dir = diff.signum();
         self.facing = dir;
         let next = (self.pos + dir * cadence.px_per_step).clamp(self.min_x(), self.max_x());
-        if span_at(&self.spans, self.pos).is_none() {
-            // Hop politely over the whole run of touching widgets instead
-            // of walking across it, landing at the nearest free spot beyond.
-            if let Some((left, right)) = run_at(&self.spans, next) {
-                let landing = if dir > 0.0 {
-                    spot_right(right, &self.spans, self.max_x(), HOP_MARGIN)
-                } else {
-                    spot_left(left, &self.spans, self.min_x(), HOP_MARGIN)
-                };
-                if let Some(to) = landing.filter(|to| (*to - self.pos).abs() > cadence.px_per_step)
-                {
-                    self.hop = Some(Hop {
-                        from: self.pos,
-                        to,
-                        started: now,
-                        until: now + Duration::from_millis(HOP_MS),
-                    });
-                    // One leg-frame flip mid-hop.
-                    self.next_step = Some(now + Duration::from_millis(HOP_MS / 2));
-                    return;
-                }
-            }
-        }
-        if next == self.pos || span_at(&self.spans, next).is_some() {
-            // Pinned at a bound, or facing widgets with no free spot toward
-            // the target: give up and idle.
+        if next == self.pos || sprite_blocked(&self.spans, next) {
+            // Pinned at a bound, or facing a button with no room to squeeze
+            // past: give up and idle.
             self.state = PetState::Idle {
                 until: now + Duration::from_millis(BRIEF_IDLE_MS),
             };
@@ -902,11 +964,7 @@ impl PetManager {
                 }
             }
             PetState::Walk { .. } => {
-                if let Some(hop) = self.hop {
-                    consider(hop.until);
-                    // Keep the arc smooth with short wakes while airborne.
-                    consider(now + Duration::from_millis(120));
-                } else if let Some(t) = self.next_step {
+                if let Some(t) = self.next_step {
                     consider(t);
                 }
             }
@@ -948,12 +1006,6 @@ fn frame_pair(
     }
 }
 
-fn hop_lift(hop: Option<Hop>, now: Instant) -> f64 {
-    hop.map_or(0.0, |hop| {
-        HOP_HEIGHT * (std::f64::consts::PI * hop.progress(now)).sin()
-    })
-}
-
 fn zzz_visible(started: Instant, now: Instant) -> bool {
     (now.saturating_duration_since(started).as_millis() / BLINK_MS as u128).is_multiple_of(2)
 }
@@ -962,18 +1014,26 @@ fn span_at(spans: &[Span], x: f64) -> Option<&Span> {
     spans.iter().find(|span| x >= span.left && x <= span.right)
 }
 
+/// Whether the whole sprite would overlap any button at center `x`.
+fn sprite_blocked(spans: &[Span], x: f64) -> bool {
+    let half = half_sprite_w();
+    spans
+        .iter()
+        .any(|span| x + half > span.left && x - half < span.right)
+}
+
 /// Half sprite width used for span clearance; a free function so it stays
 /// testable without an instance.
 fn half_sprite_w() -> f64 {
     grid_w(WALK_A) * SCALE / 2.0
 }
 
-/// The maximal run of touching or overlapping spans around `x`, which the
-/// pet treats as a single obstacle.
-fn run_at(spans: &[Span], x: f64) -> Option<(f64, f64)> {
+/// The maximal run of touching or overlapping spans intersecting
+/// `[from, to]`, which the pet treats as a single obstacle.
+fn run_overlapping(spans: &[Span], from: f64, to: f64) -> Option<(f64, f64)> {
     let (mut left, mut right) = spans
         .iter()
-        .find(|span| x >= span.left && x <= span.right)
+        .find(|span| span.left <= to && span.right >= from)
         .map(|span| (span.left, span.right))?;
     loop {
         let mut grew = false;
@@ -995,6 +1055,11 @@ fn run_at(spans: &[Span], x: f64) -> Option<(f64, f64)> {
     }
 }
 
+/// The run of touching spans around `x`.
+fn run_at(spans: &[Span], x: f64) -> Option<(f64, f64)> {
+    run_overlapping(spans, x, x)
+}
+
 /// Nearest resting position left of `edge`: one with the sprite fully clear
 /// of widgets plus `margin` when the neighboring gap allows it, otherwise
 /// that gap's center, so packed bars still leave somewhere to stand. `None`
@@ -1004,7 +1069,7 @@ fn spot_left(edge: f64, spans: &[Span], min_x: f64, margin: f64) -> Option<f64> 
         return None;
     }
     let polite = (edge - half_sprite_w() - margin).max(min_x);
-    if run_at(spans, polite).is_none() {
+    if !sprite_blocked(spans, polite) {
         return Some(polite);
     }
     let neighbor = spans
@@ -1021,7 +1086,7 @@ fn spot_right(edge: f64, spans: &[Span], max_x: f64, margin: f64) -> Option<f64>
         return None;
     }
     let polite = (edge + half_sprite_w() + margin).min(max_x);
-    if run_at(spans, polite).is_none() {
+    if !sprite_blocked(spans, polite) {
         return Some(polite);
     }
     let neighbor = spans
@@ -1032,18 +1097,19 @@ fn spot_right(edge: f64, spans: &[Span], max_x: f64, margin: f64) -> Option<f64>
     Some(((neighbor + edge) / 2.0).min(max_x))
 }
 
-/// Rest `x` at a standable position: unchanged when its center is already
-/// outside every widget, otherwise at the nearer free spot beside the run of
-/// touching spans around it.
+/// Rest `x` at a standable position: unchanged when the whole sprite is
+/// already clear of every button, otherwise at the nearer free spot beside
+/// the run of touching spans it overlaps.
 fn clamp_outside(x: f64, spans: &[Span], min_x: f64, max_x: f64) -> f64 {
     let x = x.clamp(min_x, max_x);
-    let Some((left, right)) = run_at(spans, x) else {
+    let Some((left, right)) = run_overlapping(spans, x - half_sprite_w(), x + half_sprite_w())
+    else {
         return x;
     };
     let near_left = x - left < right - x;
     match (
-        spot_left(left, spans, min_x, HOP_MARGIN),
-        spot_right(right, spans, max_x, HOP_MARGIN),
+        spot_left(left, spans, min_x, CLEAR_MARGIN),
+        spot_right(right, spans, max_x, CLEAR_MARGIN),
     ) {
         (Some(l), Some(r)) => {
             if near_left {
@@ -1058,7 +1124,7 @@ fn clamp_outside(x: f64, spans: &[Span], min_x: f64, max_x: f64) -> f64 {
     }
 }
 
-/// Where to curl up: beside the clock widget when the home bar has one,
+/// Where to curl up: beside the clock widget when the pet layer has one,
 /// otherwise wherever the pet already is.
 fn nap_spot(spans: &[Span], pos: f64, min_x: f64, max_x: f64) -> f64 {
     if let Some(clock) = spans.iter().find(|span| span.clock) {
@@ -1069,6 +1135,26 @@ fn nap_spot(spans: &[Span], pos: f64, min_x: f64, max_x: f64) -> f64 {
         }
     }
     clamp_outside(pos, spans, min_x, max_x)
+}
+
+/// Free horizontal stretches of a layer - the gaps between and beyond the
+/// button spans - as `(left, right, reaches_right_edge)` in layout
+/// coordinates.
+fn free_intervals(spans: &[Span], width: f64) -> Vec<(f64, f64, bool)> {
+    let mut spans: Vec<&Span> = spans.iter().collect();
+    spans.sort_by(|a, b| a.left.total_cmp(&b.left));
+    let mut out = Vec::new();
+    let mut cursor = 0.0;
+    for span in spans {
+        if span.left > cursor {
+            out.push((cursor, span.left.min(width), false));
+        }
+        cursor = cursor.max(span.right);
+    }
+    if cursor < width {
+        out.push((cursor, width, true));
+    }
+    out
 }
 
 fn grid_w(grid: &[&str]) -> f64 {
@@ -1125,11 +1211,11 @@ mod tests {
     const WIDTH: f64 = 2008.0;
     const HEIGHT: f64 = 60.0;
 
-    fn bar(home_active: bool) -> Bar {
+    fn bar(active: bool) -> Bar {
         Bar {
             width: WIDTH,
             height: HEIGHT,
-            home_active,
+            active,
         }
     }
 
@@ -1152,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_and_wander_stay_inside_bounds_and_outside_widgets() {
+    fn placement_and_wander_stay_inside_bounds_and_outside_buttons() {
         let spans = vec![
             Span {
                 left: 500.0,
@@ -1174,14 +1260,11 @@ mod tests {
                 "pet left the bar at iteration {i}: {}",
                 p.pos
             );
-            let grounded = p.hop.is_none();
-            if grounded {
-                assert!(
-                    span_at(&spans, p.pos).is_none(),
-                    "pet stood inside a widget at iteration {i}: {}",
-                    p.pos
-                );
-            }
+            assert!(
+                !sprite_blocked(&spans, p.pos),
+                "pet overlapped a button at iteration {i}: {}",
+                p.pos
+            );
         }
     }
 
@@ -1219,7 +1302,10 @@ mod tests {
     }
 
     #[test]
-    fn crossing_a_widget_hops_over_it() {
+    fn walking_into_a_button_stops_clear_of_it_and_recovers() {
+        // Buttons on the pet layer are walls, not hurdles: the pet never
+        // crosses or overlaps one, gives up on unreachable targets, and
+        // keeps living on its own side of the wall.
         let spans = vec![Span {
             left: 500.0,
             right: 700.0,
@@ -1233,31 +1319,29 @@ mod tests {
             after: After::Pause,
         };
         p.next_step = Some(now);
-        let mut hopped = false;
-        let mut lifted = false;
-        for _ in 0..400 {
+        let mut gave_up = false;
+        for i in 0..400 {
             tick(&mut p, &mut now, &spans, 40);
-            if p.hop.is_some() {
-                hopped = true;
-                if p.lift > 5.0 {
-                    lifted = true;
-                }
-            }
+            assert!(
+                !sprite_blocked(&spans, p.pos),
+                "pet overlapped the button at iteration {i}: {}",
+                p.pos
+            );
+            assert!(p.pos < 500.0, "pet must never cross the button");
+            gave_up |= matches!(p.state, PetState::Idle { .. });
         }
-        assert!(hopped, "pet must hop instead of walking through a widget");
-        assert!(lifted, "hop must lift the pet off the ground");
+        assert!(gave_up, "the pet must give up on the unreachable target");
         assert!(
-            p.pos > 700.0,
-            "pet must land beyond the widget, got {}",
+            p.pos < 500.0,
+            "pet stays alive on its side of the button, got {}",
             p.pos
         );
     }
 
     #[test]
-    fn packed_bars_rest_in_gaps_and_hop_widget_to_widget() {
-        // The shipped home bars pack adjacent widgets with only a button
-        // spacing between them - far too narrow for the sprite - so the pet
-        // rests at gap centers and hops across one widget at a time.
+    fn a_packed_layer_parks_the_pet_in_a_gap() {
+        // A packed user-authored pet layer leaves no fully clear spot, so
+        // the pet parks at a gap center and never overlaps a button.
         let mut keys: Vec<ButtonConfig> = (0..11)
             .map(|i| ButtonConfig {
                 text: Some(format!("F{i}")),
@@ -1279,27 +1363,52 @@ mod tests {
         }
         let mut p = pet();
         let mut now = Instant::now();
+        tick(&mut p, &mut now, &spans, 60);
+        let parked = p.pos;
+        for i in 0..4000 {
+            tick(&mut p, &mut now, &spans, 60);
+            assert!(
+                span_at(&spans, p.pos).is_none(),
+                "pet center left its gap at iteration {i}: {}",
+                p.pos
+            );
+        }
+        assert_eq!(p.pos, parked, "a packed layer leaves nowhere to walk");
+    }
+
+    #[test]
+    fn the_open_pet_layer_gives_the_pet_free_ground() {
+        // The synthesized pet layer is a Home button plus open ground: the
+        // pet never overlaps the button and roams the rest of the layer.
+        let layer = FunctionLayer::with_config(vec![
+            ButtonConfig {
+                text: Some("Home".into()),
+                ..ButtonConfig::default()
+            },
+            ButtonConfig {
+                stretch: Some(7),
+                ..ButtonConfig::default()
+            },
+        ]);
+        let spans = layer.layout_spans(WIDTH as i32, 0);
+        assert_eq!(spans.len(), 1, "spacers are free ground");
+        let mut p = pet();
+        let mut now = Instant::now();
         let mut seen = std::collections::HashSet::new();
         for i in 0..4000 {
             tick(&mut p, &mut now, &spans, 60);
-            if p.hop.is_none() {
-                assert!(
-                    span_at(&spans, p.pos).is_none(),
-                    "pet stood inside a widget at iteration {i}: {}",
-                    p.pos
-                );
-            }
+            assert!(
+                !sprite_blocked(&spans, p.pos),
+                "pet overlapped the Home button at iteration {i}: {}",
+                p.pos
+            );
             seen.insert((p.pos * 4.0).round() as i64);
         }
         assert!(
             seen.len() > 3,
-            "pet must move around a packed bar, saw {} positions",
+            "pet must roam its layer, saw {} positions",
             seen.len()
         );
-        let clock = spans.last().unwrap();
-        let spot = nap_spot(&spans, 100.0, p.min_x(), p.max_x());
-        assert!(span_at(&spans, spot).is_none(), "nap spot must be free");
-        assert!(spot < clock.left && clock.left - spot < 24.0);
     }
 
     #[test]
@@ -1329,7 +1438,7 @@ mod tests {
         };
         p.next_step = Some(now);
         p.food = Some(Food { x: 640.0 });
-        // The reloaded home bar places a widget over both.
+        // The reloaded pet layer places a button over both.
         let spans = vec![Span {
             left: 600.0,
             right: 690.0,
@@ -1341,17 +1450,15 @@ mod tests {
             if let Some(food) = &p.food {
                 assert!(
                     span_at(&spans, food.x).is_none(),
-                    "kibble must never sit on a widget (iteration {i}: {})",
+                    "kibble must never sit on a button (iteration {i}: {})",
                     food.x
                 );
             }
-            if p.hop.is_none() {
-                assert!(
-                    span_at(&spans, p.pos).is_none(),
-                    "pet stood inside a widget at iteration {i}: {}",
-                    p.pos
-                );
-            }
+            assert!(
+                span_at(&spans, p.pos).is_none(),
+                "pet stood inside a button at iteration {i}: {}",
+                p.pos
+            );
             reached_food |= matches!(p.state, PetState::Munch { .. });
             if reached_food {
                 break;
@@ -1558,7 +1665,7 @@ mod tests {
         // Tap aimed inside the widget while the hungry pet is nearby.
         assert!(p.tap(1550.0, HEIGHT / 2.0, now, 0.0));
         let dropped = p.food.unwrap().x;
-        assert_eq!(dropped, 1500.0 - half_sprite_w() - HOP_MARGIN);
+        assert_eq!(dropped, 1500.0 - half_sprite_w() - CLEAR_MARGIN);
         for _ in 0..3000 {
             tick(&mut p, &mut now, &spans, 60);
             if matches!(p.state, PetState::Munch { .. }) {
@@ -1673,6 +1780,75 @@ mod tests {
     }
 
     #[test]
+    fn the_pet_pauses_off_its_layer_and_resumes_with_state_intact() {
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.satiety = 0.9;
+        // Mid-walk when its layer closes.
+        p.pos = 400.0;
+        p.state = PetState::Walk {
+            target: 1200.0,
+            after: After::Pause,
+        };
+        p.next_step = Some(now);
+        tick(&mut p, &mut now, &[], 60);
+        assert!(p.is_visible());
+
+        // Closing the layer repaints once, needs no wakeups, and passes
+        // taps through while the pet waits unseen.
+        now += Duration::from_millis(60);
+        let (redraw, timeout) = p.update(now, &bar(false), &[]);
+        assert!(redraw, "closing the layer must repaint");
+        assert_eq!(timeout, i32::MAX);
+        assert!(!p.is_visible());
+        assert!(!p.tap(p.pos, HEIGHT / 2.0, now, 0.0));
+
+        // Ten minutes on another layer: the walk freezes in place, while
+        // the metabolism keeps running unseen.
+        now += Duration::from_millis(600_000);
+        let (_, timeout) = p.update(now, &bar(false), &[]);
+        assert_eq!(timeout, i32::MAX);
+        let (frozen_pos, frozen_state) = (p.pos, p.state);
+        now += Duration::from_millis(60);
+        p.update(now, &bar(false), &[]);
+        assert_eq!(p.pos, frozen_pos, "the walk must freeze while paused");
+        assert_eq!(p.state, frozen_state);
+        assert!(
+            p.satiety < 0.85,
+            "metabolism keeps running, got {}",
+            p.satiety
+        );
+
+        // Reopening resumes the walk from the same spot - one step, not a
+        // teleport to the target - and the walk then completes.
+        now += Duration::from_millis(60);
+        let (redraw, _) = p.update(now, &bar(true), &[]);
+        assert!(redraw, "reopening must repaint");
+        assert!(p.is_visible());
+        assert!(
+            matches!(p.state, PetState::Walk { .. }),
+            "the walk resumes, got {:?}",
+            p.state
+        );
+        assert!(
+            (p.pos - frozen_pos).abs() <= CALM.px_per_step,
+            "resume takes one step, not a teleport: {} -> {}",
+            frozen_pos,
+            p.pos
+        );
+        let mut reached = false;
+        for _ in 0..3000 {
+            tick(&mut p, &mut now, &[], 60);
+            reached |= (p.pos - 1200.0).abs() <= CALM.px_per_step;
+        }
+        assert!(
+            reached,
+            "the resumed walk reaches its target, got {}",
+            p.pos
+        );
+    }
+
+    #[test]
     fn sprites_render_distinctly_and_stay_inside_the_bar() {
         fn render(p: &PetManager) -> Vec<u8> {
             let mut surface =
@@ -1731,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_spans_report_widgets_for_hops_and_the_clock() {
+    fn layer_spans_report_buttons_and_the_clock() {
         let layer = FunctionLayer::with_config(vec![
             ButtonConfig {
                 text: Some("A".into()),
@@ -1789,7 +1965,72 @@ mod tests {
             assert!(grid
                 .iter()
                 .flat_map(|row| row.chars())
-                .all(|ch| matches!(ch, '.' | 'B' | 'D' | 'W' | 'N')));
+                .all(|ch| matches!(ch, '.' | 'B' | 'S' | 'D' | 'W' | 'N' | 'P' | 'E')));
         }
+        for (grid, ink) in [(CLOUD, 'C'), (SUN, 'Y'), (KIBBLE, 'K')] {
+            assert!(grid
+                .iter()
+                .flat_map(|row| row.chars())
+                .all(|ch| ch == '.' || ch == ink));
+        }
+    }
+
+    #[test]
+    fn the_pet_layer_paints_a_scene_of_sky_ground_sun_and_clouds() {
+        // The pet layer's backdrop: blue sky above a green ground strip in
+        // the open stretch beside the Home button, with a sun and clouds;
+        // button columns stay untouched.
+        let mut p = pet();
+        let spans = vec![Span {
+            left: 11.0,
+            right: 248.0,
+            clock: false,
+        }];
+        p.update(Instant::now(), &bar(true), &spans);
+        // Park the cat away from the scanned decoration bands.
+        p.pos = 1500.0;
+        let mut surface =
+            ImageSurface::create(Format::ARgb32, HEIGHT as i32, WIDTH as i32).unwrap();
+        {
+            let c = Context::new(&surface).unwrap();
+            c.translate(HEIGHT, 0.0);
+            c.rotate((90.0f64).to_radians());
+            p.draw(&c, HEIGHT as i32, (0.0, 0.0), Instant::now());
+        }
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        // Layout (x, y) lands at device (HEIGHT - y, x) under the transform.
+        let pixel = |x: i32, y: i32| -> (u8, u8, u8) {
+            let i = (x as usize) * stride + (HEIGHT as usize - y as usize) * 4;
+            (data[i + 2], data[i + 1], data[i])
+        };
+        let sky = pixel(1200, 10);
+        assert!(
+            sky.2 > 200 && sky.1 > 150 && sky.0 < 160,
+            "sky must be blue, got {sky:?}"
+        );
+        let ground = pixel(1200, 56);
+        assert!(
+            ground.1 > 140 && ground.0 < ground.1 && ground.2 < ground.1,
+            "ground must be green, got {ground:?}"
+        );
+        let (r, g, b, a) = {
+            let i = (100usize) * stride + (HEIGHT as usize - 10) * 4;
+            (data[i + 2], data[i + 1], data[i], data[i + 3])
+        };
+        assert_eq!((r, g, b, a), (0, 0, 0, 0), "button columns stay untouched");
+        let any = |x0: i32, x1: i32, y0: i32, y1: i32, pred: &dyn Fn((u8, u8, u8)) -> bool| {
+            (x0..x1)
+                .step_by(4)
+                .any(|x| (y0..y1).step_by(2).any(|y| pred(pixel(x, y))))
+        };
+        assert!(
+            any(400, 1300, 6, 26, &|p| p.0 > 230 && p.1 > 230 && p.2 > 230),
+            "a cloud must float in the sky"
+        );
+        assert!(
+            any(1600, 2008, 4, 30, &|p| p.0 > 220 && p.1 > 170 && p.2 < 120),
+            "the sun must shine in the sky"
+        );
     }
 }

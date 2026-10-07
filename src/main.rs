@@ -1031,6 +1031,7 @@ pub struct LayerDeck {
     names: HashMap<String, usize>,
     home: usize,
     fn_layer: Option<usize>,
+    pet_layer: Option<usize>,
     legacy: bool,
     active: usize,
     fn_pressed: bool,
@@ -1043,6 +1044,7 @@ impl LayerDeck {
         layers: Vec<(String, FunctionLayer)>,
         home: usize,
         fn_layer: Option<usize>,
+        pet_layer: Option<usize>,
         legacy: bool,
     ) -> Self {
         let names = layers
@@ -1055,6 +1057,7 @@ impl LayerDeck {
             names,
             home,
             fn_layer,
+            pet_layer,
             legacy,
             active: home,
             fn_pressed: false,
@@ -1069,6 +1072,12 @@ impl LayerDeck {
 
     fn current_mut(&mut self) -> &mut FunctionLayer {
         &mut self.layers[self.active]
+    }
+
+    /// Whether the pet's own layer is the one displayed; the pet exists
+    /// and animates only there.
+    fn pet_active(&self) -> bool {
+        self.pet_layer == Some(self.active)
     }
 
     fn refresh_batteries(
@@ -1420,19 +1429,20 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
         }
 
-        // The pet lives on the home bar; on other layers it waits unseen.
-        let home_active = layers.active == layers.home;
+        // The pet lives on its own layer, reached through the home bar's
+        // Pet button; everywhere else it waits unseen.
+        let pet_active = layers.pet_active();
         let pet_bar = PetBar {
             width: width as f64,
             height: height as f64,
-            home_active,
+            active: pet_active,
         };
         let pet_pixel_shift_width = if cfg.enable_pixel_shift {
             PIXEL_SHIFT_WIDTH_PX
         } else {
             0
         };
-        let pet_spans = if home_active {
+        let pet_spans = if pet_active {
             layers
                 .current()
                 .layout_spans(width as i32, pet_pixel_shift_width)
@@ -1677,7 +1687,7 @@ mod tests {
             keys("Battery", &[Key::Battery]),
         ]);
         layer.buttons[1].1 = battery_button(ButtonAction::Keys(vec![Key::Battery]));
-        LayerDeck::new(vec![("home".into(), layer)], 0, None, false)
+        LayerDeck::new(vec![("home".into(), layer)], 0, None, None, false)
     }
 
     fn widget(deck: &LayerDeck) -> &BatteryWidget {
@@ -2051,8 +2061,127 @@ mod tests {
             ],
             0,
             Some(1),
+            None,
             false,
         )
+    }
+
+    /// A deck shaped like the daemon builds it with the pet enabled: the
+    /// home bar ends with a Pet button opening the synthesized pet layer.
+    fn pet_deck() -> LayerDeck {
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        nav("Pet", "pet"),
+                    ]),
+                ),
+                (
+                    "pet".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        ButtonConfig {
+                            stretch: Some(7),
+                            ..ButtonConfig::default()
+                        },
+                    ]),
+                ),
+            ],
+            0,
+            None,
+            Some(1),
+            false,
+        )
+    }
+
+    #[test]
+    fn the_pet_button_opens_the_pet_layer_and_home_returns_with_input_release() {
+        let mut deck = pet_deck();
+        assert!(!deck.pet_active());
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        // Hold a key on the home bar, then open the pet layer: the held key
+        // is released and the old touch cannot act on the new layer.
+        assert!(!deck.touch_down(0, 0, &mut emit));
+        assert!(deck.touch_down(1, 1, &mut emit));
+        assert_eq!(deck.active, 1);
+        assert!(deck.pet_active());
+        assert!(deck.touches.is_empty());
+        deck.touch_motion(0, true, &mut emit);
+        deck.touch_up(0, &mut emit);
+        // The pet layer's Home button returns to the home bar.
+        assert!(deck.touch_down(2, 0, &mut emit));
+        assert_eq!(deck.active, deck.home);
+        assert!(!deck.pet_active());
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, button)| !button.active)));
+        assert_eq!(
+            events,
+            vec![
+                (vec![Key::LeftCtrl, Key::F1], true),
+                (vec![Key::LeftCtrl, Key::F1], false)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_pet_pauses_and_resumes_across_layer_switches() {
+        // The daemon drives the pet with Bar.active taken from the deck; the
+        // pet only exists while its own layer is displayed, and its state
+        // survives round trips through other layers.
+        let mut deck = pet_deck();
+        let mut pet = pet::PetManager::new(true, pet::PetVariant::Cat, pet::PetEnergy::Calm);
+        let bar = |active: bool| pet::Bar {
+            width: 2008.0,
+            height: 60.0,
+            active,
+        };
+        let spans_of = |deck: &LayerDeck| {
+            if deck.pet_active() {
+                deck.current().layout_spans(2008, 0)
+            } else {
+                Vec::new()
+            }
+        };
+        let mut now = Instant::now();
+        let step = |deck: &mut LayerDeck, pet: &mut pet::PetManager, now: &mut Instant| {
+            *now += Duration::from_millis(60);
+            let active = deck.pet_active();
+            let spans = spans_of(deck);
+            pet.update(*now, &bar(active), &spans);
+        };
+        // Settle on the home bar: the pet stays hidden there.
+        for _ in 0..10 {
+            step(&mut deck, &mut pet, &mut now);
+        }
+        assert!(!pet.is_visible());
+        // Open the pet layer: the pet appears and wanders its own layer.
+        assert!(deck.switch_named("pet", &mut |_, _| {}));
+        for _ in 0..20 {
+            step(&mut deck, &mut pet, &mut now);
+        }
+        assert!(pet.is_visible());
+        let mid_pos = pet.position();
+        // Back to home: hidden again, position kept for the return.
+        assert!(deck.switch_named("home", &mut |_, _| {}));
+        for _ in 0..20 {
+            step(&mut deck, &mut pet, &mut now);
+        }
+        assert!(!pet.is_visible());
+        // Reopen: still alive where it was, wandering on.
+        assert!(deck.switch_named("pet", &mut |_, _| {}));
+        step(&mut deck, &mut pet, &mut now);
+        assert!(pet.is_visible());
+        assert!(
+            (pet.position() - mid_pos).abs() < 200.0,
+            "no teleport: {} vs {}",
+            pet.position(),
+            mid_pos
+        );
     }
 
     #[test]
@@ -2179,6 +2308,7 @@ mod tests {
                 ],
                 home,
                 Some(1 - home),
+                None,
                 true,
             );
             let mut events = Vec::new();
@@ -2214,6 +2344,7 @@ mod tests {
                 FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]),
             )],
             0,
+            None,
             None,
             false,
         );

@@ -47,14 +47,17 @@ BatteryCycleEnabled = true
 # Must be greater than zero; defaults to 15 even with older base configs.
 BatteryCycleTimeoutSecs = 15
 
-# A small virtual pet wanders the home bar: it strolls, pauses, hops over
-# buttons, naps beside the clock, begs when hungry, startles when tapped,
-# and munches kibble dropped by tapping next to it. Set false to remove it.
+# A small virtual pet lives on its own pet layer: with this enabled the
+# home bar gains a Pet button beside the other navigation buttons that opens
+# a little scene - blue sky with sun and clouds over a green ground strip -
+# where an orange tabby cat strolls, pauses, naps, begs when hungry,
+# startles when tapped, and munches kibble dropped by tapping next to it.
+# Set false to remove the button and the layer entirely.
 PetEnabled = true
-# Sprite variant: "cat" (gray) or "fox" (orange).
+# Sprite variant: "cat" (orange tabby) or "fox" (red).
 PetVariant = "cat"
-# Energy dial: "calm" pets stroll and doze; "rowdy" pets dash, hop more,
-# and get hungry sooner.
+# Energy dial: "calm" pets stroll and doze; "rowdy" pets dash more and
+# get hungry sooner.
 PetEnergy = "calm"
 
 # This key defines the contents of the primary layer
