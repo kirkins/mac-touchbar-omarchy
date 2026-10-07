@@ -47,6 +47,16 @@ BatteryCycleEnabled = true
 # Must be greater than zero; defaults to 15 even with older base configs.
 BatteryCycleTimeoutSecs = 15
 
+# A small virtual pet wanders the home bar: it strolls, pauses, hops over
+# buttons, naps beside the clock, begs when hungry, startles when tapped,
+# and munches kibble dropped by tapping next to it. Set false to remove it.
+PetEnabled = true
+# Sprite variant: "cat" (gray) or "fox" (orange).
+PetVariant = "cat"
+# Energy dial: "calm" pets stroll and doze; "rowdy" pets dash, hop more,
+# and get hungry sooner.
+PetEnergy = "calm"
+
 # This key defines the contents of the primary layer
 # (the one with F{number} keys)
 # You can change the individual buttons, add, or remove them
