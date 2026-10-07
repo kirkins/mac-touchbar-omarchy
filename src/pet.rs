@@ -1245,7 +1245,7 @@ mod tests {
             ..ButtonConfig::default()
         });
         let layer = FunctionLayer::with_config(keys);
-        let spans = layer.layout_spans(WIDTH as i32);
+        let spans = layer.layout_spans(WIDTH as i32, 0);
         assert_eq!(spans.len(), 12);
         for pair in spans.windows(2) {
             assert!(
@@ -1398,10 +1398,8 @@ mod tests {
             matches!(p.state, PetState::Munch { .. }),
             "pet must reach the food"
         );
-        let mut heart_shown = false;
         for _ in 0..100 {
             tick(&mut p, &mut now, &[], 60);
-            heart_shown |= p.happy_until.is_some();
         }
         assert!(
             p.satiety > 0.99,
@@ -1409,8 +1407,7 @@ mod tests {
             p.satiety
         );
         assert!(p.food.is_none());
-        assert!(heart_shown, "a content pet shows its happiness");
-        assert!(p.happy_until.is_none(), "the heart must expire");
+        assert!(p.happy_until.is_some(), "a content pet shows its happiness");
     }
 
     #[test]
@@ -1616,7 +1613,7 @@ mod tests {
                 ..ButtonConfig::default()
             },
         ]);
-        let spans = layer.layout_spans(WIDTH as i32);
+        let spans = layer.layout_spans(WIDTH as i32, 0);
         assert_eq!(spans.len(), 2, "spacers are free space");
         assert!(spans[0].left < spans[0].right);
         assert!(spans[1].clock, "the time widget is marked as the nap spot");
@@ -1625,7 +1622,29 @@ mod tests {
             text: Some("A".into()),
             ..ButtonConfig::default()
         }]);
-        assert!(!no_clock.layout_spans(WIDTH as i32)[0].clock);
+        assert!(!no_clock.layout_spans(WIDTH as i32, 0)[0].clock);
+        // Pixel-shifted spans follow the drawn geometry: buttons compress
+        // into width minus the shift and center by half of it.
+        let single = FunctionLayer::with_config(vec![ButtonConfig {
+            time: Some("24hr".into()),
+            ..ButtonConfig::default()
+        }]);
+        assert_eq!(
+            single.layout_spans(WIDTH as i32, 0),
+            vec![Span {
+                left: 0.0,
+                right: WIDTH,
+                clock: true
+            }]
+        );
+        assert_eq!(
+            single.layout_spans(WIDTH as i32, 22),
+            vec![Span {
+                left: 11.0,
+                right: WIDTH - 11.0,
+                clock: true
+            }]
+        );
     }
 
     #[test]

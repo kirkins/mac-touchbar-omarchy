@@ -943,13 +943,15 @@ impl FunctionLayer {
         modified_regions
     }
 
-    /// Occupied widget spans of this layer in layout coordinates, matching
-    /// the hit-testing math. Spacers are free space; `clock` marks the time
-    /// widget the pet naps next to.
-    fn layout_spans(&self, width: i32) -> Vec<PetSpan> {
-        let virtual_button_width =
-            (width - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
-                / self.virtual_button_count as f64;
+    /// Occupied widget spans of this layer in layout coordinates, mirroring
+    /// the drawn button geometry including the static pixel-shift inset.
+    /// Spacers are free space; `clock` marks the time widget the pet naps
+    /// next to.
+    fn layout_spans(&self, width: i32, pixel_shift_width: u64) -> Vec<PetSpan> {
+        let virtual_button_width = ((width - pixel_shift_width as i32)
+            - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
+            as f64
+            / self.virtual_button_count as f64;
         let mut spans = Vec::new();
         for (i, (start, button)) in self.buttons.iter().enumerate() {
             if matches!(button.image, ButtonImage::Spacer) {
@@ -960,8 +962,9 @@ impl FunctionLayer {
             } else {
                 self.virtual_button_count
             };
-            let left_edge =
-                (*start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
+            let left_edge = (*start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+                .floor()
+                + (pixel_shift_width / 2) as f64;
             let button_width = virtual_button_width
                 + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
                     .floor();
@@ -1424,8 +1427,15 @@ fn real_main(drm: &mut DrmBackend) {
             height: height as f64,
             home_active,
         };
+        let pet_pixel_shift_width = if cfg.enable_pixel_shift {
+            PIXEL_SHIFT_WIDTH_PX
+        } else {
+            0
+        };
         let pet_spans = if home_active {
-            layers.current().layout_spans(width as i32)
+            layers
+                .current()
+                .layout_spans(width as i32, pet_pixel_shift_width)
         } else {
             Vec::new()
         };
