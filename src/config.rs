@@ -906,7 +906,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F1], true)]);
 
@@ -919,7 +919,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         events.clear();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F5], true)]);
 
@@ -934,7 +934,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         events.clear();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F6], true)]);
     }
@@ -951,7 +951,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         deck.switch_named("function", &mut |_, _| {});
         let mut keys = Vec::new();
         let mut emit = |codes: &[Key], active| keys.push((codes.to_vec(), active));
-        deck.touch_down(7, 1, &mut emit);
+        deck.touch_down(7, 1, 1500.0, 30.0, &mut emit);
         fs::write(
             &path,
             NAMED.replace("Layer = \"function\"", "Layer = \"missing\""),
@@ -992,7 +992,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         deck.replace(replacement, &mut emit);
         assert!(!deck.legacy);
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
 
         fs::remove_file(path).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();

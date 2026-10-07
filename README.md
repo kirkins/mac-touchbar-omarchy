@@ -21,13 +21,16 @@ CARGO_BUILD_JOBS=1 cargo build --locked --release
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
-presses/releases, battery widget cycling, and the virtual pet (pet-layer wiring
-and button toggle, wander bounds, pause and resume across layer switches, nap
-gating and placement, satiety decay and feeding, startle, tap consumption, and
-reload transitions). Physical layout, touch accuracy, brightness, media-key
-delivery to the desktop, live battery/clock refresh, and the pet's on-glass
-charm still need a device test; battery checks there must include repeated
-tap-to-cycle, device labels in each display mode, hotplug, and timed return.
+presses/releases, battery widget cycling, the transient volume slider (summon
+on volume press, drag position-to-level math, auto-collapse timing, live level
+rendering, mute interplay, and layer isolation), and the virtual pet (pet-layer
+wiring and button toggle, wander bounds, pause and resume across layer switches,
+nap gating and placement, satiety decay and feeding, startle, tap consumption,
+and reload transitions). Physical layout, touch accuracy, brightness, media-key
+delivery to the desktop, live battery/clock refresh, the volume slider's
+on-glass drag feel, and the pet's on-glass charm still need a device test;
+battery checks there must include repeated tap-to-cycle, device labels in each
+display mode, hotplug, and timed return.
 
 ## Named bars
 
@@ -84,6 +87,32 @@ return delay after the last cycling tap; it must be greater than zero. Both
 settings have these defaults when absent from older configurations. Cycling,
 automatic return, and removal of a selected source release held virtual keys and
 discard existing touches; fingers already down must lift before pressing again.
+
+### Transient volume slider
+
+On the home bar, tapping a volume button (`VolumeUp`, `VolumeDown`, or `Mute`)
+summons a macOS-style slider that expands over the contiguous volume cluster:
+a slim track showing the live level, which collapses back to the normal layout
+about two and a half seconds after the last interaction. The summoning press
+steps the level; once the slider is drawn it owns the whole segment, so the
+next touch lands on it and jumps to the touched position instead of pressing
+the covered buttons. A dimmed fill shows the muted state, and any volume
+change or drag clears it, matching how the desktop unmutes.
+
+The slider is draggable from the first touch: a speaker glyph at its left end
+is the mute affordance - tapping it toggles mute, and dragging from it still
+drags - and touching anywhere on the slider sets the volume to the touched
+position. A finger that began as the summoning press converts to the same
+drag once it moves. Dragging sets
+volume through the same uinput key events the volume buttons use, one tap per
+step. The daemon runs unprivileged and starts no external services, so it
+cannot read the desktop mixer directly; it tracks the level driven through its
+own key events from a midpoint estimate, and volume changes made outside the
+Touch Bar (keyboard keys, desktop mixer) are not reflected until the deck
+re-drives them. Layer navigation, Fn (including the legacy home-swap double
+press), reloads, and input release collapse the slider and restore the bar.
+Only the home bar summons it; volume buttons on other layers behave exactly as
+before.
 
 ## Touch Bar pet
 
