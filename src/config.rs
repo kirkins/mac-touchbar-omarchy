@@ -832,9 +832,10 @@ DoublePressSwitchLayers = 200
         let mic = home
             .keys
             .iter()
-            .position(|key| key.icon.as_deref() == Some("mic_off"))
+            .position(|key| key.text.as_deref() == Some("Mic"))
             .unwrap();
         assert_eq!(mic, 6);
+        assert_eq!(home.keys[mic].accent, Some(ButtonAccent::Cyan));
         assert_eq!(
             home.keys[mic].action,
             ButtonAction::CommandLayer {
