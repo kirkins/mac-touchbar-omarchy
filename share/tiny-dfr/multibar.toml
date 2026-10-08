@@ -14,7 +14,7 @@ Keys = [
     { Icon = "brightness_low", Action = "BrightnessDown" },
     { Icon = "brightness_high", Action = "BrightnessUp" },
     { Icon = "play_pause", Action = "PlayPause" },
-    { Icon = "mic_off", Action = { Command = "voice-dictate start", Layer = "recording" } },
+    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate start", Layer = "recording" } },
     { Text = "F1-F12", Action = { Layer = "function" } },
     { Text = "Media", Action = { Layer = "media" } },
     { Battery = "both", Stretch = 2 },
@@ -61,9 +61,9 @@ Keys = [
 [[Layers]]
 Name = "recording"
 Keys = [
-    { Text = "Cancel", Action = { Command = "voice-dictate cancel", Layer = "home" } },
-    { Text = "Recording", Stretch = 3 },
-    { Text = "Stop", Action = { Command = "voice-dictate stop", Layer = "home" } },
+    { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate cancel", Layer = "home" } },
+    { Text = "● Recording", Accent = "red", Stretch = 3 },
+    { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate stop", Layer = "home" } },
 ]
 
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,

@@ -44,6 +44,7 @@ use std::{
 };
 use udev::MonitorBuilder;
 
+mod appearance;
 mod backlight;
 mod command;
 mod config;
@@ -53,6 +54,7 @@ mod pet;
 mod pixel_shift;
 
 use crate::config::ConfigManager;
+use appearance::ButtonAccent;
 use backlight::BacklightManager;
 use command::CommandRunner;
 use config::{ButtonAction, ButtonConfig, Config};
@@ -63,7 +65,7 @@ use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
 const BUTTON_COLOR_ACTIVE: f64 = 0.400;
-const DEFAULT_ICON_SIZE: i32 = 48;
+const DEFAULT_ICON_SIZE: i32 = 40;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
 // Transient volume slider, macOS Touch Bar style: pressing a volume button on
@@ -295,6 +297,7 @@ struct Button {
     action: ButtonAction,
     icon_width: f64,
     icon_height: f64,
+    accent: Option<ButtonAccent>,
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -483,7 +486,7 @@ fn read_battery_sources(root: &Path) -> Vec<BatterySource> {
 
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
-        if let Some(text) = cfg.text {
+        let mut button = if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
         } else if let Some(icon) = cfg.icon {
             Button::new_icon(
@@ -499,7 +502,9 @@ impl Button {
             Button::new_battery(cfg.action, battery_mode, cfg.theme)
         } else {
             Button::new_spacer()
-        }
+        };
+        button.accent = cfg.accent;
+        button
     }
     fn new_spacer() -> Button {
         Button {
@@ -509,6 +514,7 @@ impl Button {
             image: ButtonImage::Spacer,
             icon_width: 0.0,
             icon_height: 0.0,
+            accent: None,
         }
     }
     fn new_text(text: String, action: ButtonAction) -> Button {
@@ -519,6 +525,7 @@ impl Button {
             image: ButtonImage::Text(text),
             icon_width: 0.0,
             icon_height: 0.0,
+            accent: None,
         }
     }
     fn new_icon(
@@ -537,6 +544,7 @@ impl Button {
             icon_height: icon_height as f64,
             active: false,
             changed: false,
+            accent: None,
         }
     }
     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
@@ -599,6 +607,7 @@ impl Button {
             ),
             icon_width: 0.0,
             icon_height: 0.0,
+            accent: None,
         }
     }
 
@@ -626,6 +635,7 @@ impl Button {
             image: ButtonImage::Time(format_items, locale),
             icon_width: 0.0,
             icon_height: 0.0,
+            accent: None,
         }
     }
     fn needs_faster_refresh(&self) -> bool {
@@ -652,51 +662,65 @@ impl Button {
     ) {
         match &self.image {
             ButtonImage::Text(text) => {
-                let extents = c.text_extents(text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
+                render_centered_text(
+                    c,
+                    text,
+                    button_left_edge,
+                    button_width as f64,
+                    height,
+                    y_shift,
                 );
-                c.show_text(text).unwrap();
             }
             ButtonImage::Svg(svg) => {
-                let x =
-                    button_left_edge + (button_width as f64 / 2.0 - self.icon_width / 2.0).round();
-                let y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
+                let scale = ((button_width as f64 - 20.0).max(1.0) / self.icon_width)
+                    .min((height as f64 - 16.0).max(1.0) / self.icon_height)
+                    .min(1.0);
+                let (icon_width, icon_height) = (self.icon_width * scale, self.icon_height * scale);
+                let x = button_left_edge + (button_width as f64 / 2.0 - icon_width / 2.0).round();
+                let y = y_shift + ((height as f64 - icon_height) / 2.0).round();
 
-                svg.render_document(c, &Rectangle::new(x, y, self.icon_width, self.icon_height))
+                svg.render_document(c, &Rectangle::new(x, y, icon_width, icon_height))
                     .unwrap();
             }
             ButtonImage::Bitmap(surf) => {
-                let x =
-                    button_left_edge + (button_width as f64 / 2.0 - self.icon_width / 2.0).round();
-                let y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
-                c.set_source_surface(surf, x, y).unwrap();
-                c.rectangle(x, y, self.icon_width, self.icon_height);
+                let scale = ((button_width as f64 - 20.0).max(1.0) / self.icon_width)
+                    .min((height as f64 - 16.0).max(1.0) / self.icon_height)
+                    .min(1.0);
+                let x = button_left_edge
+                    + (button_width as f64 / 2.0 - self.icon_width * scale / 2.0).round();
+                let y = y_shift + ((height as f64 - self.icon_height * scale) / 2.0).round();
+                c.save().unwrap();
+                c.translate(x, y);
+                c.scale(scale, scale);
+                c.set_source_surface(surf, 0.0, 0.0).unwrap();
+                c.rectangle(0.0, 0.0, self.icon_width, self.icon_height);
                 c.fill().unwrap();
+                c.restore().unwrap();
             }
             ButtonImage::Time(format, locale) => {
                 let current_time = Local::now();
                 let formatted_time = current_time
                     .format_localized_with_items(format.iter(), *locale)
                     .to_string();
-                let time_extents = c.text_extents(&formatted_time).unwrap();
-                c.move_to(
-                    button_left_edge
-                        + (button_width as f64 / 2.0 - time_extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + time_extents.height() / 2.0).round(),
+                render_centered_text(
+                    c,
+                    &formatted_time,
+                    button_left_edge,
+                    button_width as f64,
+                    height,
+                    y_shift,
                 );
-                c.show_text(&formatted_time).unwrap();
             }
             ButtonImage::Battery(battery, battery_mode, icons) => {
                 let Some(source) = battery.source() else {
-                    let text = "Battery N/A";
-                    let extents = c.text_extents(text).unwrap();
-                    c.move_to(
-                        button_left_edge + (button_width as f64 - extents.width()) / 2.0,
-                        y_shift + (height as f64 + extents.height()) / 2.0,
+                    render_centered_text(
+                        c,
+                        "Battery N/A",
+                        button_left_edge,
+                        button_width as f64,
+                        height,
+                        y_shift,
                     );
-                    c.show_text(text).unwrap();
                     return;
                 };
                 let (capacity, state) = (source.capacity, source.state);
@@ -807,21 +831,37 @@ impl Button {
             }
         }
     }
-    fn set_background_color(&self, c: &Context, color: f64) {
+    fn effective_accent(&self) -> ButtonAccent {
         if let ButtonImage::Battery(battery, _, _) = &self.image {
             match battery
                 .source()
                 .map(|source| source.state)
                 .unwrap_or(BatteryState::NotCharging)
             {
-                BatteryState::NotCharging => c.set_source_rgb(color, color, color),
-                BatteryState::Charging => c.set_source_rgb(0.0, color, 0.0),
-                BatteryState::Low => c.set_source_rgb(color, 0.0, 0.0),
+                BatteryState::Charging => return ButtonAccent::Green,
+                BatteryState::Low => return ButtonAccent::Red,
+                BatteryState::NotCharging => (),
             }
-        } else {
-            c.set_source_rgb(color, color, color);
         }
+        self.accent
+            .unwrap_or_else(|| ButtonAccent::for_action(&self.action))
     }
+}
+
+fn render_centered_text(c: &Context, text: &str, left: f64, width: f64, height: i32, y_shift: f64) {
+    c.save().unwrap();
+    let extents = c.text_extents(text).unwrap();
+    if extents.width() > 0.0 {
+        let scale = ((width - 20.0).max(1.0) / extents.width()).min(1.0);
+        c.set_font_size(c.font_matrix().xx() * scale);
+    }
+    let extents = c.text_extents(text).unwrap();
+    c.move_to(
+        left + (width - extents.width()) / 2.0 - extents.x_bearing(),
+        y_shift + (height as f64 - extents.height()) / 2.0 - extents.y_bearing(),
+    );
+    c.show_text(text).unwrap();
+    c.restore().unwrap();
 }
 
 #[derive(Default)]
@@ -891,9 +931,6 @@ impl FunctionLayer {
             - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
             as f64
             / self.virtual_button_count as f64;
-        let radius = 8.0f64;
-        let bot = (height as f64) * 0.15;
-        let top = (height as f64) * 0.85;
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
 
         if complete_redraw {
@@ -901,7 +938,7 @@ impl FunctionLayer {
             c.paint().unwrap();
         }
         c.set_font_face(&config.font_face);
-        c.set_font_size(32.0);
+        c.set_font_size(28.0);
 
         // The slider no longer covers a span it was drawn over: either it
         // collapsed, or it moved to another cluster. Erase that whole column
@@ -979,60 +1016,35 @@ impl FunctionLayer {
                 + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
                     .floor();
 
-            let color = if button.active {
-                BUTTON_COLOR_ACTIVE
-            } else if config.show_button_outlines {
-                BUTTON_COLOR_INACTIVE
-            } else {
-                0.0
-            };
             if !complete_redraw {
+                // Erase the entire column so fitted labels and pressed borders
+                // cannot leave pixels behind after an incremental redraw.
                 c.set_source_rgb(0.0, 0.0, 0.0);
-                c.rectangle(
-                    left_edge,
-                    bot - radius,
-                    button_width,
-                    top - bot + radius * 2.0,
-                );
+                c.rectangle(left_edge, 0.0, button_width.ceil(), height as f64);
                 c.fill().unwrap();
             }
-            if !matches!(button.image, ButtonImage::Spacer) {
-                button.set_background_color(&c, color);
-                // draw box with rounded corners
-                c.new_sub_path();
-                let left = left_edge + radius;
-                let right = (left_edge + button_width.ceil()) - radius;
-                c.arc(
-                    right,
-                    bot,
-                    radius,
-                    (-90.0f64).to_radians(),
-                    (0.0f64).to_radians(),
+            if !matches!(button.image, ButtonImage::Spacer)
+                && (button.active || config.show_button_outlines)
+            {
+                let accent = button.effective_accent();
+                accent.surface(&c, button.active, button.action.command().is_some());
+                // Visual inset only: layout, spacing and hit targets stay the same.
+                rounded_rect(
+                    &c,
+                    left_edge + 0.75,
+                    height as f64 * 0.1 + 0.75,
+                    (button_width.ceil() - 1.5).max(1.0),
+                    height as f64 * 0.8 - 1.5,
+                    10.0_f64.min(button_width / 2.0).min(height as f64 * 0.4),
                 );
-                c.arc(
-                    right,
-                    top,
-                    radius,
-                    (0.0f64).to_radians(),
-                    (90.0f64).to_radians(),
-                );
-                c.arc(
-                    left,
-                    top,
-                    radius,
-                    (90.0f64).to_radians(),
-                    (180.0f64).to_radians(),
-                );
-                c.arc(
-                    left,
-                    bot,
-                    radius,
-                    (180.0f64).to_radians(),
-                    (270.0f64).to_radians(),
-                );
-                c.close_path();
-                c.fill().unwrap();
+                c.fill_preserve().unwrap();
+                accent.outline(&c, button.active);
+                c.set_line_width(1.5);
+                c.stroke().unwrap();
             }
+            c.save().unwrap();
+            c.rectangle(left_edge, 0.0, button_width.ceil(), height as f64);
+            c.clip();
             c.set_source_rgb(1.0, 1.0, 1.0);
             button.render(
                 &c,
@@ -1041,15 +1053,16 @@ impl FunctionLayer {
                 button_width.ceil() as u64,
                 pixel_shift_y,
             );
+            c.restore().unwrap();
 
             button.changed = false;
 
             if !complete_redraw {
                 modified_regions.push(ClipRect::new(
-                    height as u16 - top as u16 - radius as u16,
-                    left_edge as u16,
-                    height as u16 - bot as u16 + radius as u16,
-                    left_edge as u16 + button_width as u16,
+                    0,
+                    left_edge.max(0.0) as u16,
+                    height as u16,
+                    (left_edge + button_width.ceil()).min(width as f64) as u16,
                 ));
             }
         }
@@ -1110,12 +1123,15 @@ impl FunctionLayer {
             let fill_width = (track_right - track_left - 2.0) * frac;
             if fill_width > 0.0 {
                 let fill_height = track_height - 2.0;
-                let fill = if volume.muted {
-                    BUTTON_COLOR_ACTIVE
+                if volume.muted {
+                    c.set_source_rgb(
+                        BUTTON_COLOR_ACTIVE,
+                        BUTTON_COLOR_ACTIVE,
+                        BUTTON_COLOR_ACTIVE,
+                    );
                 } else {
-                    1.0
-                };
-                c.set_source_rgb(fill, fill, fill);
+                    ButtonAccent::Cyan.foreground(&c);
+                }
                 rounded_rect(
                     &c,
                     track_left + 1.0,
@@ -2965,6 +2981,58 @@ mod tests {
         deck.current_mut()
             .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
+    }
+
+    #[test]
+    fn expressive_controls_redraw_without_residue_and_keep_the_touch_geometry() {
+        for width in [2008, 2170] {
+            for outlines in [true, false] {
+                let mut config = outline_config();
+                config.show_button_outlines = outlines;
+                let mut layer = FunctionLayer::with_config(vec![
+                    keys(
+                        "A deliberately long label that must fit its control",
+                        &[Key::F1],
+                    ),
+                    keys("Brightness", &[Key::BrightnessUp]),
+                    nav("Home", "home"),
+                ]);
+                let mut surface = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
+                let mut reference = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
+                layer.draw(&config, (width, 60), &surface, (0.0, 0.0), true, None);
+                let idle = surface.data().unwrap().to_vec();
+                let spans = layer.layout_spans(width, 0);
+                for (i, span) in spans.iter().enumerate() {
+                    let x = (span.left + span.right) / 2.0;
+                    for y in [6.0, 30.0, 54.0] {
+                        assert_eq!(layer.hit(width as u16, 60, x, y, None), Some(i));
+                    }
+                    assert_eq!(layer.hit(width as u16, 60, x, 5.0, None), None);
+                    layer.buttons[i].1.set_active(true, &mut |_, _| {});
+                    let clips = layer.draw(&config, (width, 60), &surface, (0.0, 0.0), false, None);
+                    assert!(clips
+                        .iter()
+                        .all(|clip| clip.x2() <= 60 && i32::from(clip.y2()) <= width));
+                    assert_ne!(&*surface.data().unwrap(), idle.as_slice());
+                    layer.draw(&config, (width, 60), &reference, (0.0, 0.0), true, None);
+                    let pressed = surface.data().unwrap().to_vec();
+                    assert_eq!(pressed, reference.data().unwrap().to_vec());
+                    layer.buttons[i].1.set_active(false, &mut |_, _| {});
+                    layer.draw(&config, (width, 60), &surface, (0.0, 0.0), false, None);
+                    assert_eq!(&*surface.data().unwrap(), idle.as_slice());
+                }
+                // Long text must not leak into the gaps or neighboring controls.
+                let stride = surface.stride() as usize;
+                let pixels = surface.data().unwrap();
+                for span in spans.windows(2) {
+                    let x = ((span[0].right + span[1].left) / 2.0) as usize;
+                    for y in 0..60 {
+                        let offset = x * stride + (59 - y) * 4;
+                        assert_eq!(&pixels[offset..offset + 3], &[0, 0, 0]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,19 @@ CARGO_BUILD_JOBS=1 cargo clippy --locked --all-targets
 CARGO_BUILD_JOBS=1 cargo build --locked --release
 ```
 
+For an offline visual check of the shipped named bars, the voice-dispatch test
+can also export actual Cairo frames without opening the Touch Bar or running
+the voice commands:
+
+```sh
+DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
+    cargo test --locked approved_multibar_preserves_voice_dispatch_and_renders_offline -- --test-threads=1
+```
+
+Inspect `implemented-home.png` and `implemented-recording.png` in that directory.
+These frames use the configured font and icon search paths; their battery and
+clock display is illustrative and they do not prove physical touch or dictation.
+
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
 presses/releases, battery widget cycling, the transient volume slider (summon
@@ -76,6 +89,21 @@ leaves named bars entirely under on-bar navigation. `MediaLayerDefault` and
 `PrimaryLayerKeys`/`MediaLayerKeys` configurations retain their Fn and double-Fn
 behavior, and `Action = "F1"` or `Action = ["LeftCtrl", "F1"]` still sends keys.
 Clock, battery, icons, spacers, and `Stretch` work in named bars as before.
+
+The deck uses cyan for audio controls and commands, amber for brightness,
+violet for navigation, and neutral surfaces for other keys, battery, and clock.
+White icons and centered bold labels stay legible on the inset rounded fills;
+pressing a control changes its fill and brightens its border. The existing
+16-pixel gaps and touch targets are unchanged. Icons default to 40 pixels,
+with `IconWidth` and `IconHeight` still available; icons and labels fit within
+their control. `ShowButtonOutlines = false` hides the idle fills and borders
+while preserving pressed feedback.
+
+An optional per-button `Accent` overrides the automatic color: `"neutral"`,
+`"cyan"`, `"amber"`, `"violet"`, `"red"`, or `"green"`. For example,
+`{ Text = "Home", Accent = "violet", Action = { Layer = "home" } }`.
+Battery charging and low-charge colors take precedence over this override.
+The transient volume slider uses the same cyan, with a subdued muted fill.
 
 Tap a battery widget to cycle from the system battery through connected device
 batteries (including `scope=Device` power supplies such as hidpp mice), then back
@@ -152,9 +180,10 @@ state for the ongoing recording - no dynamic widget is needed. That layer
 holds a `Stop` button (runs `voice-dictate stop`, which stops recording and
 types the transcript into whatever window has focus) and a `Cancel` button
 (runs `voice-dictate cancel`, discarding a mis-start); both return home. The
-mic button reuses the existing `mic_off` glyph from `share/tiny-dfr/`; a
-dedicated un-slashed `mic.svg` can be dropped into the icon search paths and
-swapped in later with `Icon = "mic"`. The `voice-dictate` helper itself is
+mic button has a bright cyan `Mic` label. A persistent red dot and `Recording`
+label distinguish the recording layer, with a prominent red Stop and quieter
+Cancel. This indicates the selected layer; it does not confirm microphone
+signal, helper startup, or transcription success. The `voice-dictate` helper itself is
 machine-local wiring and does not ship with the daemon; without it these
 presses still switch layers and log the failed command.
 

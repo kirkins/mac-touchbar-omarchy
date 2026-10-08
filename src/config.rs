@@ -1,3 +1,4 @@
+use crate::appearance::ButtonAccent;
 use crate::fonts::{FontConfig, Pattern};
 use crate::pet::{PetEnergy, PetVariant};
 use crate::{FunctionLayer, LayerDeck};
@@ -148,6 +149,7 @@ pub struct ButtonConfig {
     pub stretch: Option<usize>,
     pub icon_width: Option<i32>,
     pub icon_height: Option<i32>,
+    pub accent: Option<ButtonAccent>,
 }
 
 #[derive(Deserialize)]
@@ -595,6 +597,90 @@ Keys = [{ Text = "Functions", Action = { Layer = "function" } }]
 Name = "function"
 Keys = [{ Text = "F1", Action = "F1" }]
 "#;
+
+    #[test]
+    fn button_accents_are_optional_and_invalid_values_reject_the_candidate() {
+        let (_, old) = parse_config(BASE, Some(NAMED), 2008).unwrap();
+        assert_eq!(old.layers[0].keys[0].accent, None);
+        for (name, accent) in [
+            ("neutral", ButtonAccent::Neutral),
+            ("cyan", ButtonAccent::Cyan),
+            ("amber", ButtonAccent::Amber),
+            ("violet", ButtonAccent::Violet),
+            ("red", ButtonAccent::Red),
+            ("green", ButtonAccent::Green),
+        ] {
+            let candidate = NAMED.replace(
+                "Text = \"F1\"",
+                &format!("Accent = \"{name}\", Text = \"F1\""),
+            );
+            let (_, styled) = parse_config(BASE, Some(&candidate), 2008).unwrap();
+            let key = styled.layers[1].keys.last().unwrap();
+            assert_eq!(key.accent, Some(accent));
+            assert_eq!(key.action, ButtonAction::Keys(vec![Key::F1]));
+        }
+        let invalid = NAMED.replace("Text = \"F1\"", "Accent = \"magenta\", Text = \"F1\"");
+        assert!(parse_config(BASE, Some(&invalid), 2008).is_err());
+    }
+
+    #[test]
+    fn approved_multibar_preserves_voice_dispatch_and_renders_offline() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        let user_path = tmp.0.join("config.toml");
+        fs::write(&base_path, BASE).unwrap();
+        fs::write(&user_path, include_str!("../share/tiny-dfr/multibar.toml")).unwrap();
+        let (cfg, mut deck) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+
+        // Optional development artifact: this executes the same Cairo draw as
+        // the daemon without opening DRM, input devices, or the voice helper.
+        let render = |deck: &mut LayerDeck, name: &str| {
+            let portrait = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
+            deck.current_mut()
+                .draw(&cfg, (2008, 60), &portrait, (0.0, 0.0), true, None);
+            if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
+                fs::create_dir_all(&dir).unwrap();
+                let horizontal =
+                    cairo::ImageSurface::create(cairo::Format::ARgb32, 2008, 60).unwrap();
+                let c = cairo::Context::new(&horizontal).unwrap();
+                c.translate(0.0, 60.0);
+                c.rotate((-90.0_f64).to_radians());
+                c.set_source_surface(&portrait, 0.0, 0.0).unwrap();
+                c.paint().unwrap();
+                horizontal
+                    .write_to_png(&mut fs::File::create(Path::new(&dir).join(name)).unwrap())
+                    .unwrap();
+            }
+        };
+        let tap = |deck: &mut LayerDeck, label: &str, commands: &mut Vec<String>| {
+            let index = deck.current().buttons.iter().position(|(_, button)| {
+                matches!(&button.image, crate::ButtonImage::Text(text) if text == label)
+            }).unwrap();
+            let spans = deck.current().layout_spans(2008, 0);
+            let x = (spans[index].left + spans[index].right) / 2.0;
+            let mut emit = |keys: &[Key], _| assert!(keys.is_empty(), "voice button emitted keys");
+            deck.touch_down_at(0, x, 30.0, 2008, 60, &mut emit, &mut |command| {
+                commands.push(command.into())
+            });
+            deck.touch_up(0, &mut emit);
+        };
+        let mut commands = Vec::new();
+        render(&mut deck, "implemented-home.png");
+        tap(&mut deck, "Mic", &mut commands);
+        assert_eq!(deck.active, deck.names["recording"]);
+        render(&mut deck, "implemented-recording.png");
+        tap(&mut deck, "Stop", &mut commands);
+        assert_eq!(deck.active, deck.home);
+        tap(&mut deck, "Mic", &mut commands);
+        tap(&mut deck, "Cancel", &mut commands);
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(commands.len(), 4);
+        let actions: Vec<_> = commands
+            .iter()
+            .map(|command| command.split_whitespace().last().unwrap())
+            .collect();
+        assert_eq!(actions, ["start", "stop", "start", "cancel"]);
+    }
 
     #[test]
     fn upstream_layers_and_overrides_keep_key_actions() {
