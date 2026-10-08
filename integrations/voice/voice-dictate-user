@@ -33,10 +33,9 @@ def request(action, uid=1000, address=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("start", "stop", "cancel"))
-    parser.add_argument("--uid", type=int, default=1000, help="desktop user's UID (default: 1000)")
     args = parser.parse_args()
     try:
-        request(args.action, args.uid)
+        request(args.action)
     except (OSError, ValueError) as error:
         print(f"Voice handoff failed: {error}", file=sys.stderr)
         return 1

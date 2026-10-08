@@ -40,12 +40,12 @@ sudo systemctl daemon-reload
 sudo systemctl restart tiny-dfr.service
 ```
 
-The client defaults to desktop UID 1000. On other systems, add `--uid <UID>` to
-the three Touch Bar commands. The receiver derives its socket name from its
-own UID. If the daemon uses a different UID, adapt the receiver's allowed UID
-set after reviewing that boundary. Do not grant the daemon access to the user's
-home or runtime directory. The new drop-in restores the stock `ProtectHome`
-and `PrivateTmp` settings which the previous `runuser` deployment had relaxed.
+The client targets desktop UID 1000. The receiver derives its socket name
+from its own UID. If the daemon uses a different UID, adapt the receiver's
+allowed UID set after reviewing that boundary. Do not grant the daemon access
+to the user's home or runtime directory. The new drop-in restores the stock
+`ProtectHome` and `PrivateTmp` settings which the previous `runuser`
+deployment had relaxed.
 
 Use the existing mic / Stop / Cancel actions from
 [`share/tiny-dfr/multibar.toml`](../../share/tiny-dfr/multibar.toml) or change only
