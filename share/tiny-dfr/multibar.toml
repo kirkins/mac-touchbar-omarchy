@@ -14,7 +14,7 @@ Keys = [
     { Icon = "brightness_low", Action = "BrightnessDown" },
     { Icon = "brightness_high", Action = "BrightnessUp" },
     { Icon = "play_pause", Action = "PlayPause" },
-    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate start", Layer = "recording" } },
+    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } },
     { Text = "F1-F12", Action = { Layer = "function" } },
     { Text = "Media", Action = { Layer = "media" } },
     { Battery = "both", Stretch = 2 },
@@ -51,19 +51,19 @@ Keys = [
     { Icon = "volume_up", Action = "VolumeUp" },
 ]
 
-# Voice dictation: the home-bar mic button runs `voice-dictate start` and
+# Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
 # opens this recording layer in one press; the layer itself is the visual
 # state. Stop keeps the recording and types the transcript into the focused
 # window, Cancel discards a mis-start; both run their command and return
-# home. The helper is machine-local wiring and is not shipped with the
-# daemon (see README); without it these presses still switch layers and
-# log the failed command.
+# home. Install the optional integrations/voice client and desktop-session
+# service separately (see README); without the receiver these presses still
+# switch layers and log the failed command.
 [[Layers]]
 Name = "recording"
 Keys = [
-    { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate cancel", Layer = "home" } },
+    { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
     { Text = "● Recording", Accent = "red", Stretch = 3 },
-    { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate stop", Layer = "home" } },
+    { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
 ]
 
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,

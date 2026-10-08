@@ -1,0 +1,269 @@
+#!/usr/bin/python3
+"""Desktop-session recorder and narrow Touch Bar Unix-socket receiver."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import wave
+
+ACTIONS = frozenset(("start", "stop", "cancel"))
+
+
+class VoiceError(Exception):
+    pass
+
+
+def notify(message):
+    try:
+        subprocess.run(["notify-send", "-t", "2500", "Voice input", message],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def audio_source():
+    """Respect the intended session mic; never guess from ALSA ordering."""
+    try:
+        name = os.environ.get("VOICE_DICTATE_SOURCE") or subprocess.check_output(
+            ["pactl", "get-default-source"], text=True, timeout=3).strip()
+        rows = subprocess.check_output(
+            ["pactl", "list", "sources", "short"], text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise VoiceError("Cannot resolve the session microphone") from error
+    sources = {parts[1] for row in rows.splitlines() if len(parts := row.split()) >= 2}
+    if name not in sources or name.endswith(".monitor"):
+        raise VoiceError("Selected microphone is unavailable or is a speaker monitor")
+    return name
+
+
+class Dictation:
+    def __init__(self, state_dir=None, credential_path=None):
+        self.state_dir = Path(state_dir or Path(os.environ["XDG_RUNTIME_DIR"]) / "voice-dictate")
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.credential_path = Path(credential_path or Path.home() / ".config/herdr-telegram-bridge/config.toml")
+        self.recording = None
+        self.recorder = None
+        self.output = None
+
+    def dispatch(self, action):
+        if action not in ACTIONS:
+            raise VoiceError("Invalid action")
+        getattr(self, action)()
+
+    def start(self):
+        if self.recorder is not None:
+            if self.recorder.poll() is None:
+                notify("Already recording")
+                return
+            self.discard()
+        source = audio_source()
+        self.recording = tempfile.TemporaryDirectory(prefix="recording-", dir=self.state_dir)
+        raw = Path(self.recording.name) / "audio.raw"
+        self.output = raw.open("wb")
+        try:
+            self.recorder = subprocess.Popen(
+                ["pw-cat", "--record", "--rate", "16000", "--channels", "1",
+                 "--format", "s16", "--raw", "--target", source, "-"],
+                stdout=self.output, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 3
+            while self.recorder.poll() is None and raw.stat().st_size < 1600:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            if self.recorder.poll() is not None or raw.stat().st_size < 1600:
+                raise VoiceError("Microphone produced no capture data")
+        except (OSError, VoiceError):
+            self.discard()
+            raise
+        notify("Recording… press Stop to transcribe, or Cancel to discard")
+
+    def finish_capture(self):
+        if self.recorder is not None:
+            if self.recorder.poll() is None:
+                self.recorder.terminate()
+                try:
+                    self.recorder.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.recorder.kill()
+                    self.recorder.wait(timeout=5)
+            self.recorder = None
+        if self.output is not None:
+            self.output.close()
+            self.output = None
+
+    def discard(self):
+        self.finish_capture()
+        if self.recording is not None:
+            self.recording.cleanup()
+            self.recording = None
+
+    def cancel(self):
+        self.discard()
+        notify("Cancelled")
+
+    def stop(self):
+        if self.recording is None:
+            notify("Not recording")
+            return
+        try:
+            if self.recorder is None or self.recorder.poll() is not None:
+                raise VoiceError("Recorder exited before Stop")
+            self.finish_capture()
+            directory = Path(self.recording.name)
+            data = (directory / "audio.raw").read_bytes()
+            if len(data) < 1600:
+                raise VoiceError("Recording is too short to transcribe")
+            wav = directory / "audio.wav"
+            with wave.open(str(wav), "wb") as output:
+                output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                output.writeframes(data[:len(data) // 2 * 2])
+            self.insert(self.transcribe(wav))
+        finally:
+            self.discard()
+
+    def transcribe(self, wav):
+        try:
+            settings = tomllib.loads(self.credential_path.read_text())["stt"]
+            key = settings["api_key"]
+            if not isinstance(key, str) or not key or "\n" in key or "\r" in key:
+                raise ValueError("Invalid credential")
+        except (OSError, KeyError, ValueError, TypeError) as error:
+            raise VoiceError("Cannot read the private transcription credential") from error
+        with tempfile.TemporaryDirectory(prefix="request-", dir=self.state_dir) as temporary:
+            auth = Path(temporary) / "authorization"
+            auth.write_text("Authorization: Bearer " + key + "\n")
+            auth.chmod(0o600)
+            response = Path(temporary) / "response.json"
+            try:
+                result = subprocess.run(
+                    ["curl", "--silent", "--show-error", "--max-time", "90",
+                     "--output", str(response), "--write-out", "%{http_code}",
+                     "https://api.groq.com/openai/v1/audio/transcriptions",
+                     "--header", "@" + str(auth), "--form", "model=whisper-large-v3-turbo",
+                     "--form", "response_format=json", "--form", "file=@" + str(wav) + ";type=audio/wav"],
+                    capture_output=True, text=True, timeout=95)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise VoiceError("Transcription transport failed or timed out") from error
+            if result.returncode:
+                detail = result.stderr.strip().replace(key, "[redacted]")[:240]
+                raise VoiceError(f"Transcription transport failed ({result.returncode}): {detail}")
+            status = result.stdout.strip()
+            try:
+                body = json.loads(response.read_text())
+            except (OSError, ValueError) as error:
+                raise VoiceError(f"Transcription returned invalid JSON (HTTP {status})") from error
+            if status != "200":
+                provider_error = body.get("error") if isinstance(body, dict) else None
+                detail = str(provider_error.get("message", "Request rejected")) if isinstance(provider_error, dict) else "Request rejected"
+                raise VoiceError(f"Transcription failed (HTTP {status}): {detail.replace(key, '[redacted]')[:240]}")
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                raise VoiceError("Transcription returned no text")
+            return text.strip()
+
+    def insert(self, text):
+        try:
+            result = subprocess.run(["wtype", "--", text], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise VoiceError("Text insertion failed or timed out") from error
+        if result.returncode:
+            raise VoiceError(f"Text insertion failed (exit {result.returncode})")
+        notify(f"Typed {len(text)} characters")
+
+
+class Receiver:
+    def __init__(self, handler, address=None, allowed_uids=None):
+        self.handler = handler
+        self.address = address or "\0dfr-voice-" + str(os.getuid())
+        self.allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+        self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(4)
+
+    def handle(self, connection):
+        with connection:
+            connection.settimeout(2)
+            try:
+                _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if uid not in self.allowed_uids:
+                    raise VoiceError("Caller UID is not permitted")
+                request = bytearray()
+                while len(request) < 32:
+                    chunk = connection.recv(32 - len(request))
+                    if not chunk:
+                        break
+                    request.extend(chunk)
+                action = request.decode("ascii")
+                if action not in ACTIONS:
+                    raise VoiceError("Invalid action")
+                if not self.lock.acquire(blocking=False):
+                    raise VoiceError("Voice input is busy; retry after transcription finishes")
+                try:
+                    self.handler(action)
+                finally:
+                    self.lock.release()
+                reply = {"ok": True}
+            except (VoiceError, OSError, ValueError) as error:
+                message = str(error) if isinstance(error, VoiceError) else "Voice input operation failed"
+                print(message, file=sys.stderr, flush=True)
+                notify(message)
+                reply = {"ok": False, "error": message}
+            try:
+                connection.sendall(json.dumps(reply).encode())
+            except OSError:
+                pass
+
+    def serve(self):
+        def worker(connection):
+            try:
+                self.handle(connection)
+            finally:
+                self.slots.release()
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(self.address)
+            server.listen(4)
+            print("Voice input receiver ready", flush=True)
+            while True:
+                connection, _ = server.accept()
+                if not self.slots.acquire(blocking=False):
+                    connection.close()
+                    continue
+                threading.Thread(target=worker, args=(connection,), daemon=True).start()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("serve", "transcribe-file"))
+    parser.add_argument("file", nargs="?")
+    args = parser.parse_args()
+    engine = Dictation()
+    if args.mode == "transcribe-file":
+        if not args.file:
+            parser.error("transcribe-file requires a WAV file")
+        try:
+            print(engine.transcribe(Path(args.file)))
+        except VoiceError as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        Receiver(engine.dispatch).serve()
+    finally:
+        engine.discard()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -153,7 +153,7 @@ with - switching layers:
 
 ```toml
 { Text = "Sync", Action = { Command = "my-sync-script" } }
-{ Icon = "mic_off", Action = { Command = "voice-dictate start", Layer = "recording" } }
+{ Icon = "mic_off", Action = { Command = "voice-dictate-user start", Layer = "recording" } }
 ```
 
 A `Command` action runs the configured string verbatim through `/bin/sh -c`.
@@ -175,17 +175,21 @@ runs first, then the named layer opens. Combined buttons count as visible
 navigation, so a sub-bar whose Stop or Done button returns home through a
 command gets no extra Home button. The [multibar example](share/tiny-dfr/multibar.toml)
 uses this for voice dictation: the home-bar mic button runs
-`voice-dictate start` and opens a `recording` layer, which is the visual
+`voice-dictate-user start` and opens a `recording` layer, which is the visual
 state for the ongoing recording - no dynamic widget is needed. That layer
-holds a `Stop` button (runs `voice-dictate stop`, which stops recording and
+holds a `Stop` button (runs `voice-dictate-user stop`, which stops recording and
 types the transcript into whatever window has focus) and a `Cancel` button
-(runs `voice-dictate cancel`, discarding a mis-start); both return home. The
+(runs `voice-dictate-user cancel`, discarding a mis-start); both return home. The
 mic button has a bright cyan `Mic` label. A persistent red dot and `Recording`
 label distinguish the recording layer, with a prominent red Stop and quieter
 Cancel. This indicates the selected layer; it does not confirm microphone
-signal, helper startup, or transcription success. The `voice-dictate` helper itself is
-machine-local wiring and does not ship with the daemon; without it these
-presses still switch layers and log the failed command.
+signal, helper startup, or transcription success. The optional private
+[desktop-session integration](integrations/voice/README.md) supplies a client
+and recorder service. It crosses the daemon's unprivileged AF_UNIX boundary
+without changing its privilege drop or network restrictions. Install that
+integration separately; without a receiver these presses still switch layers
+and log the failed command. Check the desktop notification or receiver journal
+to confirm recording started.
 
 ## Touch Bar pet
 
@@ -277,9 +281,9 @@ sudo systemctl status tiny-dfr.service --no-pager
 On the device, check Home → Functions → Home and Home → Media → Home, all
 F1-F12/media controls, the battery and clock, and Home → Pet → pet
 wandering, feeding, and startling → Home, plus Fn press/release. With the
-machine-local `voice-dictate` helper installed, check the mic button opens
+desktop-session voice integration installed, check the mic button opens
 the recording layer while dictation starts, and that Stop types the
-transcript into the focused window while Cancel discards; without the helper
+transcript into the focused window while Cancel discards; without the receiver
 the layers still switch and the journal logs the failed command. Hold a key
 while switching with another finger and while saving a valid configuration;
 verify its release and that the old finger cannot activate a new button. Test an

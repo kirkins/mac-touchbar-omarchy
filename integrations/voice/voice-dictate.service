@@ -1,0 +1,16 @@
+[Unit]
+Description=Touch Bar desktop-session voice input
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+ExecStart=%h/.local/bin/voice-dictate serve
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=voice-dictate
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

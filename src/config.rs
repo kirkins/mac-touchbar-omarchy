@@ -818,14 +818,14 @@ DoublePressSwitchLayers = 200
         assert_eq!(
             recording.keys[0].action,
             ButtonAction::CommandLayer {
-                command: "voice-dictate cancel".into(),
+                command: "voice-dictate-user cancel".into(),
                 layer: "home".into()
             }
         );
         assert_eq!(
             recording.keys[2].action,
             ButtonAction::CommandLayer {
-                command: "voice-dictate stop".into(),
+                command: "voice-dictate-user stop".into(),
                 layer: "home".into()
             }
         );
@@ -838,7 +838,7 @@ DoublePressSwitchLayers = 200
         assert_eq!(
             home.keys[mic].action,
             ButtonAction::CommandLayer {
-                command: "voice-dictate start".into(),
+                command: "voice-dictate-user start".into(),
                 layer: "recording".into()
             }
         );
