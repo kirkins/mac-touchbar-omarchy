@@ -8,17 +8,15 @@ FnLayer = "function"
 [[Layers]]
 Name = "home"
 Keys = [
-    { Icon = "volume_down", Action = "VolumeDown" },
-    { Icon = "volume_off", Action = "Mute" },
-    { Icon = "volume_up", Action = "VolumeUp" },
+    { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
     { Icon = "brightness_low", Action = "BrightnessDown" },
     { Icon = "brightness_high", Action = "BrightnessUp" },
     { Icon = "play_pause", Action = "PlayPause" },
-    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } },
     { Text = "F1-F12", Action = { Layer = "function" } },
     { Text = "Media", Action = { Layer = "media" } },
     { Battery = "both", Stretch = 2 },
     { Time = "%H:%M", Stretch = 2 },
+    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } },
 ]
 
 [[Layers]]
@@ -46,9 +44,7 @@ Keys = [
     { Icon = "fast_rewind", Action = "PreviousSong" },
     { Icon = "play_pause", Action = "PlayPause" },
     { Icon = "fast_forward", Action = "NextSong" },
-    { Icon = "volume_off", Action = "Mute" },
-    { Icon = "volume_down", Action = "VolumeDown" },
-    { Icon = "volume_up", Action = "VolumeUp" },
+    { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
 ]
 
 # Voice dictation: the home-bar mic button runs `voice-dictate-user start` and

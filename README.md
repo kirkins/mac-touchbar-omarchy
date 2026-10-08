@@ -122,29 +122,37 @@ discard existing touches; fingers already down must lift before pressing again.
 
 ### Transient volume slider
 
-On the home bar, tapping a volume button (`VolumeUp`, `VolumeDown`, or `Mute`)
-summons a macOS-style slider that expands over the contiguous volume cluster:
-a slim track showing the live level, which collapses back to the normal layout
-about two and a half seconds after the last interaction. The summoning press
-steps the level; once the slider is drawn it owns the whole segment, so the
-next touch lands on it and jumps to the touched position instead of pressing
-the covered buttons. A dimmed fill shows the muted state, and any volume
-change or drag clears it, matching how the desktop unmutes.
+The named-bar example has one cyan volume button (`Action = "VolumeSlider"`)
+that opens the existing slider without changing the output. Its three-slot
+span retains room for dragging, and the home bar ends with the labeled Mic.
+The separate up/down and mute buttons are omitted on home and media.
 
-The slider is draggable from the first touch: a speaker glyph at its left end
-is the mute affordance - tapping it toggles mute, and dragging from it still
-drags - and touching anywhere on the slider sets the volume to the touched
-position. A finger that began as the summoning press converts to the same
-drag once it moves. Dragging sets
-volume through the same uinput key events the volume buttons use, one tap per
-step. The daemon runs unprivileged and starts no external services, so it
-cannot read the desktop mixer directly; it tracks the level driven through its
-own key events from a midpoint estimate, and volume changes made outside the
-Touch Bar (keyboard keys, desktop mixer) are not reflected until the deck
-re-drives them. Layer navigation, Fn (including the legacy home-swap double
-press), reloads, and input release collapse the slider and restore the bar.
-Only the home bar summons it; volume buttons on other layers behave exactly as
-before.
+Touching or dragging the slider selects an absolute output percentage: its
+far-left endpoint (including the speaker glyph) sets all output channels to
+zero; its far-right endpoint retains the 130% ceiling. Intermediate percentages
+are reachable across the track. The first finger can drag immediately after
+opening the slider, and a later touch grabs the drawn track directly. Moving
+volume above zero unmutes the selected output. The slider collapses about two
+and a half seconds after the last interaction; navigation, Fn, reload and input
+release also restore the bar.
+
+The [desktop audio receiver](integrations/audio/README.md) is required for the
+slider. It resolves the current output through the same Omarchy sink resolver
+as the keyboard helper, sets volume absolutely, and returns the mixer value.
+Requests execute in order outside the render loop, with fast drag updates
+coalesced to the latest target. Opening reads the current output, so changes
+made in the desktop mixer or keyboard are reflected when it reopens. Receiver
+failures are logged and collapse the overlay instead of reporting success.
+The thumb follows confirmed mixer readback; a pending or failed write never
+substitutes a guessed zero. No change to the user's existing 130% keyboard helper
+is needed.
+
+The daemon stays `nobody` with its existing home/tmp and AF_UNIX restrictions;
+a separate user-session receiver owns access to the mixer. The client checks
+the receiver's peer UID, and the receiver accepts only the desktop user or
+`nobody`. This does not use or alter the dictation receiver. Ordinary
+legacy volume-key controls continue to emit their configured keys on all layers.
+The explicit `VolumeSlider` action works on any named bar.
 
 ### Command buttons and voice dictation
 

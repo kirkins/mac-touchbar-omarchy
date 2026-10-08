@@ -67,6 +67,8 @@ struct ConfigProxy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ButtonAction {
+    /// Opens the absolute output-volume slider without stepping the mixer.
+    VolumeSlider,
     Keys(Vec<Key>),
     SwitchLayer(String),
     /// Runs a shell command on touch-down.
@@ -107,9 +109,14 @@ impl<'de> Deserialize<'de> for ButtonAction {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Action {
+            Slider(SliderAction),
             Key(Key),
             Keys(Vec<Key>),
             Table(TableAction),
+        }
+        #[derive(Deserialize)]
+        enum SliderAction {
+            VolumeSlider,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase", deny_unknown_fields)]
@@ -118,6 +125,7 @@ impl<'de> Deserialize<'de> for ButtonAction {
             command: Option<String>,
         }
         Ok(match Action::deserialize(deserializer)? {
+            Action::Slider(SliderAction::VolumeSlider) => Self::VolumeSlider,
             Action::Key(key) => Self::Keys(vec![key]),
             Action::Keys(keys) => Self::Keys(keys),
             Action::Table(action) => match (action.layer, action.command) {
@@ -287,7 +295,7 @@ impl ConfigProxy {
                 let at = home_layer
                     .keys
                     .iter()
-                    .rposition(|button| button.action.layer_target().is_some())
+                    .rposition(|button| matches!(button.action, ButtonAction::SwitchLayer(_)))
                     .map_or(home_layer.keys.len(), |last| last + 1);
                 home_layer.keys.insert(
                     at,
@@ -629,15 +637,27 @@ Keys = [{ Text = "F1", Action = "F1" }]
         let base_path = tmp.0.join("base.toml");
         let user_path = tmp.0.join("config.toml");
         fs::write(&base_path, BASE).unwrap();
-        fs::write(&user_path, include_str!("../share/tiny-dfr/multibar.toml")).unwrap();
+        let named = std::env::var_os("DFR_DECK_CONFIG_REVIEW_INPUT")
+            .map(fs::read_to_string)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| include_str!("../share/tiny-dfr/multibar.toml").into());
+        fs::write(&user_path, named).unwrap();
         let (cfg, mut deck) = load_config(2008, &base_path, Some(&user_path)).unwrap();
 
         // Optional development artifact: this executes the same Cairo draw as
         // the daemon without opening DRM, input devices, or the voice helper.
         let render = |deck: &mut LayerDeck, name: &str| {
             let portrait = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
+            deck.volume.pixel_shift_width = if cfg.enable_pixel_shift {
+                crate::PIXEL_SHIFT_WIDTH_PX
+            } else {
+                0
+            };
+            deck.volume.pixel_shift_x = 0.0;
+            let volume = deck.volume_render();
             deck.current_mut()
-                .draw(&cfg, (2008, 60), &portrait, (0.0, 0.0), true, None);
+                .draw(&cfg, (2008, 60), &portrait, (0.0, 0.0), true, volume);
             if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
                 fs::create_dir_all(&dir).unwrap();
                 let horizontal =
@@ -665,7 +685,51 @@ Keys = [{ Text = "F1", Action = "F1" }]
             deck.touch_up(0, &mut emit);
         };
         let mut commands = Vec::new();
+        assert!(matches!(&deck.current().buttons.last().unwrap().1.image,
+            crate::ButtonImage::Text(text) if text == "Mic"));
+        for layer in [deck.home, deck.names["media"]] {
+            assert_eq!(
+                deck.layers[layer]
+                    .buttons
+                    .iter()
+                    .filter(|(_, button)| button.action == ButtonAction::VolumeSlider)
+                    .count(),
+                1
+            );
+            assert!(!deck.layers[layer].buttons.iter().any(|(_, button)|
+                matches!(&button.action, ButtonAction::Keys(keys)
+                    if keys.iter().any(|key| matches!(key, Key::VolumeUp | Key::VolumeDown | Key::Mute)))));
+        }
         render(&mut deck, "implemented-home.png");
+        deck.switch_to(deck.names["media"], &mut |_, _| {});
+        render(&mut deck, "implemented-media.png");
+        deck.switch_to(deck.home, &mut |_, _| {});
+        let spans = deck.current().layout_spans(2008, 0);
+        let x = (spans[0].left + spans[0].right) / 2.0;
+        let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
+        deck.touch_down_at(0, x, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        let (left, right) = deck.volume_track(2008).unwrap();
+        deck.touch_motion(0, left, 30.0, 2008, 60, &mut emit);
+        deck.volume_reply(
+            deck.volume.revision,
+            Ok(crate::VolumeState {
+                percent: 0,
+                muted: false,
+            }),
+        );
+        render(&mut deck, "implemented-volume-zero.png");
+        deck.volume_drag_motion(0, right, 30.0, 2008, &mut emit);
+        deck.volume_reply(
+            deck.volume.revision,
+            Ok(crate::VolumeState {
+                percent: 130,
+                muted: false,
+            }),
+        );
+        assert_eq!(deck.volume.level, 130);
+        render(&mut deck, "implemented-volume-max.png");
+        deck.touch_up(0, &mut emit);
+        deck.volume_collapse();
         tap(&mut deck, "Mic", &mut commands);
         assert_eq!(deck.active, deck.names["recording"]);
         render(&mut deck, "implemented-recording.png");
@@ -834,7 +898,7 @@ DoublePressSwitchLayers = 200
             .iter()
             .position(|key| key.text.as_deref() == Some("Mic"))
             .unwrap();
-        assert_eq!(mic, 6);
+        assert_eq!(mic, home.keys.len() - 1);
         assert_eq!(home.keys[mic].accent, Some(ButtonAccent::Cyan));
         assert_eq!(
             home.keys[mic].action,
@@ -854,7 +918,7 @@ DoublePressSwitchLayers = 200
                     .unwrap()
             })
             .collect();
-        assert_eq!(positions, vec![7, 8, 9]);
+        assert_eq!(positions, vec![4, 5, 6]);
         let pet_button = &home.keys[positions[2]];
         assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout

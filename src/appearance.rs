@@ -19,6 +19,7 @@ pub enum ButtonAccent {
 impl ButtonAccent {
     pub fn for_action(action: &ButtonAction) -> Self {
         match action {
+            ButtonAction::VolumeSlider => Self::Cyan,
             ButtonAction::Keys(keys) if keys.len() == 1 => match keys[0] {
                 Key::BrightnessDown | Key::BrightnessUp | Key::IllumDown | Key::IllumUp => {
                     Self::Amber

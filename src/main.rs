@@ -52,6 +52,7 @@ mod display;
 mod fonts;
 mod pet;
 mod pixel_shift;
+mod volume;
 
 use crate::config::ConfigManager;
 use appearance::ButtonAccent;
@@ -61,6 +62,7 @@ use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+use volume::{Request as VolumeRequest, State as VolumeState, VolumeControl};
 
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
@@ -69,22 +71,18 @@ const DEFAULT_ICON_SIZE: i32 = 40;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
 // Transient volume slider, macOS Touch Bar style: pressing a volume button on
-// the home bar expands a draggable slider over the volume cluster, which
+// a bar expands a draggable slider over its reserved span, which
 // collapses again after a moment of inactivity.
-/// Discrete volume steps the slider tracks and renders. Every step is one
-/// VolumeUp/VolumeDown key tap delivered through the same uinput backend the
-/// volume buttons use; the daemon cannot read the desktop mixer (it runs as
-/// an unprivileged user and uses no external services), so it tracks the
-/// level driven through its own key events from a midpoint estimate.
-const VOLUME_LEVELS: u8 = 16;
-const VOLUME_INITIAL_LEVEL: u8 = VOLUME_LEVELS / 2;
+/// Absolute output percentage, including the user's existing 130% ceiling.
+const VOLUME_LEVELS: u8 = volume::MAX_PERCENT;
+const VOLUME_INITIAL_LEVEL: u8 = 0;
 /// How long the slider stays up after the last interaction.
 const VOLUME_SLIDER_LINGER: Duration = Duration::from_millis(2500);
 /// Presses on volume buttons become drags once the finger moves this far,
 /// so a shaky tap still taps while an intentional drag always drags.
 const VOLUME_DRAG_THRESHOLD_PX: f64 = 8.0;
-/// Width of the mute affordance anchoring the left end of the slider.
-const VOLUME_MUTE_ZONE_PX: f64 = 28.0;
+/// Width of the speaker glyph anchoring the left end of the slider.
+const VOLUME_SPEAKER_ZONE_PX: f64 = 28.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatteryState {
@@ -1099,8 +1097,8 @@ impl FunctionLayer {
 
             // The track and fill replace the cluster, macOS-style: a slim
             // rounded bar across the region with a fill up to the level,
-            // anchored left by the mute affordance.
-            let track_left = left_edge + VOLUME_MUTE_ZONE_PX + 2.0;
+            // anchored left by the speaker glyph.
+            let track_left = left_edge + VOLUME_SPEAKER_ZONE_PX + 2.0;
             let track_right = right_edge - 2.0;
             let track_height = 14.0;
             let track_top = (height as f64 - track_height) / 2.0 + pixel_shift_y;
@@ -1143,7 +1141,7 @@ impl FunctionLayer {
                 c.fill().unwrap();
             }
 
-            // The mute affordance: a speaker glyph on the bare segment left
+            // The speaker glyph sits on the bare segment left
             // of the track; muted adds a slash.
             let mid = track_top + track_height / 2.0;
             let glyph_x = left_edge + 8.0;
@@ -1262,30 +1260,35 @@ impl FunctionLayer {
 struct TouchState {
     button: usize,
     inside: bool,
-    // Set for presses on the home bar's volume cluster; crossing the drag
+    // Set for presses on a slider control; crossing the drag
     // threshold converts the press into a slider drag.
     volume: bool,
     start_x: f64,
     start_y: f64,
 }
 
-/// A finger currently dragging the volume slider. A touch that began on
-/// the mute affordance keeps its start position: released in place it
-/// toggles mute, moved past the drag threshold it becomes a level drag.
+/// A finger currently dragging the volume slider.
 struct VolumeDrag {
     slot: u32,
-    mute_start: Option<(f64, f64)>,
 }
 
-/// State of the transient volume slider on the home bar.
+/// State of the transient volume slider on its owning bar.
 struct VolumeOverlay {
     active: bool,
     level: u8,
     muted: bool,
-    /// Contiguous home-layer button indices (first, last) the slider covers.
+    /// Contiguous owner-layer button indices (first, last) the slider covers.
     region: Option<(usize, usize)>,
     deadline: Option<Instant>,
     drag: Option<VolumeDrag>,
+    layer: usize,
+    confirmed: bool,
+    revision: u64,
+    opened_revision: u64,
+    applied_revision: Option<u64>,
+    pixel_shift_width: u64,
+    pixel_shift_x: f64,
+    requests: Vec<(u64, VolumeRequest)>,
 }
 
 impl Default for VolumeOverlay {
@@ -1297,6 +1300,14 @@ impl Default for VolumeOverlay {
             region: None,
             deadline: None,
             drag: None,
+            layer: 0,
+            confirmed: false,
+            revision: rand::random(),
+            opened_revision: 0,
+            applied_revision: None,
+            pixel_shift_width: 0,
+            pixel_shift_x: 0.0,
+            requests: Vec::new(),
         }
     }
 }
@@ -1310,33 +1321,17 @@ struct VolumeRender {
     muted: bool,
 }
 
-/// The volume actions that summon and drive the slider.
-fn volume_key(action: &ButtonAction) -> Option<Key> {
-    if let ButtonAction::Keys(keys) = action {
-        match keys.as_slice() {
-            [Key::VolumeUp] | [Key::VolumeDown] | [Key::Mute] => Some(keys[0]),
-            _ => None,
-        }
-    } else {
-        None
-    }
+/// Only the explicit control opens the absolute slider. Ordinary legacy
+/// volume key bindings continue to emit their configured key events.
+fn volume_request(action: &ButtonAction) -> Option<VolumeRequest> {
+    (*action == ButtonAction::VolumeSlider).then_some(VolumeRequest::Get)
 }
 
-/// Map a touch position inside the slider region to a volume level.
+/// Map the drawn track's touch position to an absolute output percentage.
 fn volume_level_at(x: f64, left: f64, right: f64) -> u8 {
     let width = (right - left).max(1.0);
     let frac = ((x - left) / width).clamp(0.0, 1.0);
-    (frac * VOLUME_LEVELS as f64)
-        .round()
-        .min(VOLUME_LEVELS as f64) as u8
-}
-
-/// Move the real volume by delivering whole key taps through uinput.
-fn emit_volume_steps(emit_keys: &mut impl FnMut(&[Key], bool), key: Key, count: usize) {
-    for _ in 0..count {
-        emit_keys(&[key], true);
-        emit_keys(&[key], false);
-    }
+    (frac * VOLUME_LEVELS as f64).round() as u8
 }
 
 // Input state belongs to the deck, so transitions always release the old layer
@@ -1507,16 +1502,9 @@ impl LayerDeck {
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
             return false;
         }
-        // Pressing a volume-cluster button on the home bar summons the
-        // transient slider and steps its level; the key itself still follows
-        // the normal momentary press/release path below.
-        let volume = if self.active == self.home {
-            volume_key(&self.current().buttons[button].1.action)
-        } else {
-            None
-        };
-        if let Some(key) = volume {
-            self.volume_press(button, key);
+        let volume = volume_request(&self.current().buttons[button].1.action);
+        if let Some(request) = volume {
+            self.volume_press(button, request);
         }
         if let ButtonImage::Battery(battery, _, _) = &mut self.current_mut().buttons[button].1.image
         {
@@ -1599,14 +1587,11 @@ impl LayerDeck {
             && self.volume.active
             && (x - start_x).hypot(y - start_y) > VOLUME_DRAG_THRESHOLD_PX
         {
-            // An intentional drag: release the held key first, then set
-            // the level directly from the finger position.
+            // An intentional drag: release the button highlight, then set
+            // the absolute level directly from the finger position.
             self.touch_up(slot, emit_keys);
             if self.volume.drag.is_none() {
-                self.volume.drag = Some(VolumeDrag {
-                    slot,
-                    mute_start: None,
-                });
+                self.volume.drag = Some(VolumeDrag { slot });
                 if let Some((left, right)) = self.volume_track(width) {
                     self.volume_set_level(volume_level_at(x, left, right), emit_keys);
                 }
@@ -1631,19 +1616,6 @@ impl LayerDeck {
             .as_ref()
             .is_some_and(|drag| drag.slot == slot)
         {
-            // Released in place on the mute affordance: the tap toggles
-            // mute with one momentary key pair.
-            if self
-                .volume
-                .drag
-                .as_ref()
-                .is_some_and(|drag| drag.mute_start.is_some())
-            {
-                self.volume.muted = !self.volume.muted;
-                emit_keys(&[Key::Mute], true);
-                emit_keys(&[Key::Mute], false);
-                self.mark_volume_changed();
-            }
             self.volume.drag = None;
             self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
             return;
@@ -1661,35 +1633,65 @@ impl LayerDeck {
         *self = new;
     }
 
-    /// Expand the slider over the contiguous volume-cluster run around the
-    /// pressed home-layer button and apply the press to the tracked level.
-    fn volume_press(&mut self, button: usize, key: Key) {
-        let layer = &self.layers[self.home];
+    /// Expand the existing slider over the volume control's reserved span.
+    fn volume_press(&mut self, button: usize, request: VolumeRequest) {
+        let layer = self.current();
         let mut first = button;
-        while first > 0 && volume_key(&layer.buttons[first - 1].1.action).is_some() {
+        while first > 0 && volume_request(&layer.buttons[first - 1].1.action).is_some() {
             first -= 1;
         }
         let mut last = button;
         while last + 1 < layer.buttons.len()
-            && volume_key(&layer.buttons[last + 1].1.action).is_some()
+            && volume_request(&layer.buttons[last + 1].1.action).is_some()
         {
             last += 1;
         }
-        self.volume.active = true;
-        self.volume.region = Some((first, last));
-        match key {
-            Key::VolumeUp => {
-                self.volume.muted = false;
-                self.volume.level = (self.volume.level + 1).min(VOLUME_LEVELS);
-            }
-            Key::VolumeDown => {
-                self.volume.muted = false;
-                self.volume.level = self.volume.level.saturating_sub(1);
-            }
-            _ => self.volume.muted = !self.volume.muted,
+        if !self.volume.active {
+            self.volume.confirmed = false;
+            self.volume.opened_revision = self.volume.revision.wrapping_add(1);
+            self.volume.applied_revision = None;
         }
+        self.volume.active = true;
+        self.volume.layer = self.active;
+        self.volume.region = Some((first, last));
+        self.volume_queue(request);
         self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
         self.mark_volume_changed();
+    }
+
+    fn volume_queue(&mut self, request: VolumeRequest) {
+        self.volume.revision = self.volume.revision.wrapping_add(1);
+        self.volume.requests.push((self.volume.revision, request));
+    }
+
+    fn volume_reply(&mut self, revision: u64, result: std::io::Result<VolumeState>) {
+        // Show confirmed progress during a fast drag, even when a newer target
+        // is queued. Duplicate/out-of-order replies and earlier openings cannot
+        // overwrite a newer confirmed state or repaint a collapsed overlay.
+        if !self.volume.active
+            || revision < self.volume.opened_revision
+            || revision > self.volume.revision
+            || self
+                .volume
+                .applied_revision
+                .is_some_and(|last| revision <= last)
+        {
+            return;
+        }
+        match result {
+            Ok(state) => {
+                self.volume.applied_revision = Some(revision);
+                self.volume.confirmed = true;
+                self.volume.level = state.percent;
+                self.volume.muted = state.muted;
+                self.mark_volume_changed();
+            }
+            Err(error) if revision == self.volume.revision => {
+                eprintln!("Volume handoff failed: {error}");
+                self.volume_collapse();
+            }
+            Err(_) => {} // a newer queued operation still supplies its readback
+        }
     }
 
     fn volume_collapse(&mut self) {
@@ -1705,7 +1707,7 @@ impl LayerDeck {
 
     fn mark_volume_changed(&mut self) {
         if let Some((first, last)) = self.volume.region {
-            for (_, button) in &mut self.layers[self.home].buttons[first..=last] {
+            for (_, button) in &mut self.layers[self.volume.layer].buttons[first..=last] {
                 button.changed = true;
             }
         }
@@ -1714,12 +1716,16 @@ impl LayerDeck {
     /// Left/right pixel bounds of the slider region in hit-test coordinates.
     fn volume_region(&self, width: u16) -> Option<(f64, f64)> {
         let (first, last) = self.volume.region?;
-        let layer = &self.layers[self.home];
-        let virtual_button_width =
-            (width as i32 - (BUTTON_SPACING_PX * (layer.virtual_button_count - 1) as i32)) as f64
-                / layer.virtual_button_count as f64;
-        let left =
-            layer.buttons[first].0 as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64);
+        let layer = &self.layers[self.volume.layer];
+        let virtual_button_width = ((width as i32 - self.volume.pixel_shift_width as i32)
+            - (BUTTON_SPACING_PX * (layer.virtual_button_count - 1) as i32))
+            as f64
+            / layer.virtual_button_count as f64;
+        let left = (layer.buttons[first].0 as f64
+            * (virtual_button_width + BUTTON_SPACING_PX as f64))
+            .floor()
+            + self.volume.pixel_shift_x
+            + (self.volume.pixel_shift_width / 2) as f64;
         let end = if last + 1 < layer.buttons.len() {
             layer.buttons[last + 1].0
         } else {
@@ -1733,27 +1739,24 @@ impl LayerDeck {
     }
 
     /// Pixel bounds of the draggable track drawn inside the slider region,
-    /// after the mute affordance that anchors its left end.
+    /// after the speaker glyph that anchors its left end.
     fn volume_track(&self, width: u16) -> Option<(f64, f64)> {
         let (left, right) = self.volume_region(width)?;
-        Some((left + VOLUME_MUTE_ZONE_PX + 2.0, right - 2.0))
+        Some((left + VOLUME_SPEAKER_ZONE_PX + 2.0, right - 2.0))
     }
 
-    fn volume_set_level(&mut self, target: u8, emit_keys: &mut impl FnMut(&[Key], bool)) {
+    fn volume_set_level(&mut self, target: u8, _emit_keys: &mut impl FnMut(&[Key], bool)) {
         let target = target.min(VOLUME_LEVELS);
-        let delta = target as i32 - self.volume.level as i32;
-        if delta > 0 {
-            emit_volume_steps(emit_keys, Key::VolumeUp, delta as usize);
-        } else if delta < 0 {
-            emit_volume_steps(emit_keys, Key::VolumeDown, (-delta) as usize);
-        }
-        self.volume.level = target;
-        self.volume.muted = false;
+        // Absolute writes also reassert zero if another desktop control has
+        // moved the output while this slider still displays its left endpoint.
+        self.volume_queue(VolumeRequest::Set(target));
+        // Keep rendering the last confirmed mixer state until its readback
+        // arrives. In particular, a failed zero write must not look silent.
         self.mark_volume_changed();
     }
 
     /// A touch-down on the drawn slider grabs it right away at the touched
-    /// level; the speaker icon at its left end waits for a tap or a drag.
+    /// level; touching its left speaker glyph selects zero too.
     fn volume_drag_start(
         &mut self,
         slot: u32,
@@ -1764,7 +1767,8 @@ impl LayerDeck {
         emit_keys: &mut impl FnMut(&[Key], bool),
     ) -> bool {
         if !self.volume.active
-            || self.active != self.home
+            || !self.volume.confirmed
+            || self.active != self.volume.layer
             || self.volume.drag.is_some()
             || self.touches.contains_key(&slot)
         {
@@ -1776,19 +1780,10 @@ impl LayerDeck {
         if x < left || x > right || y < 0.1 * height as f64 || y > 0.9 * height as f64 {
             return false;
         }
-        // The speaker icon at the left end waits for a tap or a drag;
-        // everywhere else the track grabs the touch at its level.
-        let mute_start = if x < left + VOLUME_MUTE_ZONE_PX {
-            Some((x, y))
-        } else {
-            None
-        };
-        self.volume.drag = Some(VolumeDrag { slot, mute_start });
+        self.volume.drag = Some(VolumeDrag { slot });
         self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
-        if mute_start.is_none() {
-            if let Some((left, right)) = self.volume_track(width) {
-                self.volume_set_level(volume_level_at(x, left, right), emit_keys);
-            }
+        if let Some((left, right)) = self.volume_track(width) {
+            self.volume_set_level(volume_level_at(x, left, right), emit_keys);
         }
         true
     }
@@ -1799,22 +1794,12 @@ impl LayerDeck {
         &mut self,
         slot: u32,
         x: f64,
-        y: f64,
+        _y: f64,
         width: u16,
         emit_keys: &mut impl FnMut(&[Key], bool),
     ) -> bool {
         if !self.volume.active || !self.volume.drag.as_ref().is_some_and(|d| d.slot == slot) {
             return false;
-        }
-        if let Some((start_x, start_y)) = self.volume.drag.as_ref().and_then(|drag| drag.mute_start)
-        {
-            if (x - start_x).hypot(y - start_y) <= VOLUME_DRAG_THRESHOLD_PX {
-                self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
-                return true;
-            }
-            if let Some(drag) = self.volume.drag.as_mut() {
-                drag.mute_start = None;
-            }
         }
         if let Some((left, right)) = self.volume_track(width) {
             self.volume_set_level(volume_level_at(x, left, right), emit_keys);
@@ -1852,9 +1837,9 @@ impl LayerDeck {
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    /// Slider rendering info, only while summoned on the home bar itself.
+    /// Slider rendering info, only while its owning bar is displayed.
     fn volume_render(&self) -> Option<VolumeRender> {
-        if !self.volume.active || self.active != self.home {
+        if !self.volume.active || !self.volume.confirmed || self.active != self.volume.layer {
             return None;
         }
         let (first, last) = self.volume.region?;
@@ -1971,6 +1956,7 @@ fn real_main(drm: &mut DrmBackend) {
     // Command buttons spawn their configured commands through this runner,
     // detached from the render loop.
     let commands = CommandRunner::new();
+    let mut volume_control = VolumeControl::new();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -2003,6 +1989,12 @@ fn real_main(drm: &mut DrmBackend) {
         .add(
             &battery_monitor.wake,
             EpollEvent::new(EpollFlags::EPOLLIN, 4),
+        )
+        .unwrap();
+    epoll
+        .add(
+            &volume_control.wake,
+            EpollEvent::new(EpollFlags::EPOLLIN, 5),
         )
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
@@ -2061,6 +2053,13 @@ fn real_main(drm: &mut DrmBackend) {
                 next_timeout_ms,
                 remaining.as_millis().max(1).min(TIMEOUT_MS as u128) as i32,
             );
+        }
+
+        for (revision, request) in std::mem::take(&mut layers.volume.requests) {
+            volume_control.send(revision, request);
+        }
+        for (revision, result) in volume_control.update() {
+            layers.volume_reply(revision, result);
         }
 
         // The transient volume slider collapses on its own after a moment.
@@ -2122,6 +2121,14 @@ fn real_main(drm: &mut DrmBackend) {
             } else {
                 (0.0, 0.0)
             };
+            // Input uses the exact geometry of the last rendered frame, not
+            // an unshifted estimate of where the visible endpoints lie.
+            layers.volume.pixel_shift_width = if cfg.enable_pixel_shift {
+                PIXEL_SHIFT_WIDTH_PX
+            } else {
+                0
+            };
+            layers.volume.pixel_shift_x = shift.0;
             let volume_render = layers.volume_render();
             let clips = layers.current_mut().draw(
                 &cfg,
@@ -3232,15 +3239,23 @@ mod tests {
         assert_eq!(deck.home, 0);
     }
 
+    fn slider_button(label: &str) -> ButtonConfig {
+        ButtonConfig {
+            text: Some(label.into()),
+            action: ButtonAction::VolumeSlider,
+            ..ButtonConfig::default()
+        }
+    }
+
     fn volume_deck() -> LayerDeck {
         LayerDeck::new(
             vec![
                 (
                     "home".into(),
                     FunctionLayer::with_config(vec![
-                        keys("V-", &[Key::VolumeDown]),
-                        keys("Mute", &[Key::Mute]),
-                        keys("V+", &[Key::VolumeUp]),
+                        slider_button("V-"),
+                        slider_button("Volume"),
+                        slider_button("V+"),
                         nav("Functions", "function"),
                     ]),
                 ),
@@ -3259,279 +3274,274 @@ mod tests {
         )
     }
 
-    // 4 buttons on 2008px: b0 0..490, b1 506..996, b2 1012..1502, b3 1518..2008,
-    // so the volume cluster spans 0..1502 and its midpoint maps to level 8.
-
-    #[test]
-    fn volume_presses_summon_the_slider_and_grab_it_once_it_is_drawn() {
-        let mut deck = volume_deck();
-        let mut events = Vec::new();
-        assert!(!deck.volume.active);
-        assert!(!deck.touch_down_at(
-            0,
-            1260.0,
-            30.0,
-            2008,
-            60,
-            &mut |k, a| { events.push((k.to_vec(), a)) },
-            &mut |_| {}
-        ));
-        assert!(deck.volume.active);
-        assert_eq!(deck.volume.level, VOLUME_INITIAL_LEVEL + 1);
-        assert_eq!(deck.volume.region, Some((0, 2)));
-        deck.touch_up(0, &mut |k, a| events.push((k.to_vec(), a)));
-        assert_eq!(
-            events,
-            vec![(vec![Key::VolumeUp], true), (vec![Key::VolumeUp], false)]
-        );
-        events.clear();
-        // Once drawn, the slider owns the same spot: the press lands on
-        // the track and jumps to the touched level (1260px -> 13) instead
-        // of stepping, with whole key taps driving the change.
-        assert!(!deck.touch_down_at(
-            1,
-            1260.0,
-            30.0,
-            2008,
-            60,
-            &mut |k, a| { events.push((k.to_vec(), a)) },
-            &mut |_| {}
-        ));
-        assert_eq!(deck.volume.level, 13);
-        assert!(deck.volume.drag.is_some());
-        deck.touch_up(1, &mut |_, _| {});
-        assert_eq!(events.len(), 8);
-        assert!(events.iter().all(|(keys, _)| keys == &vec![Key::VolumeUp]));
-        events.clear();
-        // A press at the other end of the cluster jumps low: 200px -> 2.
-        assert!(!deck.touch_down_at(
-            2,
-            200.0,
-            30.0,
-            2008,
-            60,
-            &mut |k, a| { events.push((k.to_vec(), a)) },
-            &mut |_| {}
-        ));
-        assert_eq!(deck.volume.level, 2);
-        deck.touch_up(2, &mut |_, _| {});
-        assert!(events
-            .iter()
-            .all(|(keys, _)| keys == &vec![Key::VolumeDown]));
+    fn apply_mixer_requests(deck: &mut LayerDeck, actual: &mut u8) {
+        for (revision, request) in std::mem::take(&mut deck.volume.requests) {
+            match request {
+                VolumeRequest::Get => {}
+                VolumeRequest::Set(percent) => *actual = percent,
+            }
+            deck.volume_reply(
+                revision,
+                Ok(VolumeState {
+                    percent: *actual,
+                    muted: false,
+                }),
+            );
+        }
     }
 
     #[test]
-    fn the_drawn_slider_grabs_touches_on_its_covered_buttons() {
+    fn drag_to_left_silences_an_output_changed_outside_the_touch_bar() {
+        // These initial states exposed the old midpoint estimate bug. The
+        // pre-fix run is retained in the task proof; the 100% case also failed
+        // when the helper ceiling was100%, independently of the130% setting.
+        for initial in [40, 100, 130] {
+            let mut deck = volume_deck();
+            let mut actual = initial;
+            let mut emit = |_: &[Key], _: bool| panic!("slider emitted relative keys");
+            deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+            apply_mixer_requests(&mut deck, &mut actual);
+            deck.touch_motion(0, 0.0, 30.0, 2008, 60, &mut emit);
+            apply_mixer_requests(&mut deck, &mut actual);
+            deck.touch_up(0, &mut emit);
+            assert_eq!(deck.volume.level, 0);
+            assert_eq!(actual, 0, "left endpoint left audible volume");
+            // A mixer change outside the bar must not defeat a repeated zero.
+            actual = 100;
+            deck.touch_down_at(1, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+            apply_mixer_requests(&mut deck, &mut actual);
+            deck.touch_up(1, &mut emit);
+            assert_eq!(actual, 0);
+        }
+    }
+
+    #[test]
+    fn single_volume_control_opens_without_stepping_and_drags_the_full_range() {
+        for (width, layer) in [(2008, 0), (2170, 0), (2008, 1)] {
+            let slider = || ButtonConfig {
+                text: Some("Volume".into()),
+                stretch: Some(3),
+                action: ButtonAction::VolumeSlider,
+                ..ButtonConfig::default()
+            };
+            let mut deck = LayerDeck::new(
+                vec![
+                    (
+                        "home".into(),
+                        FunctionLayer::with_config(vec![slider(), nav("Media", "media")]),
+                    ),
+                    (
+                        "media".into(),
+                        FunctionLayer::with_config(vec![nav("Home", "home"), slider()]),
+                    ),
+                ],
+                0,
+                None,
+                None,
+                false,
+            );
+            deck.active = layer;
+            let index = usize::from(layer == 1);
+            let spans = deck.current().layout_spans(width, 0);
+            let x = (spans[index].left + spans[index].right) / 2.0;
+            let mut actual = 100;
+            let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
+            deck.touch_down_at(0, x, 30.0, width as u16, 60, &mut emit, &mut |_| {});
+            assert_eq!(deck.volume.requests.last().unwrap().1, VolumeRequest::Get);
+            apply_mixer_requests(&mut deck, &mut actual);
+            assert_eq!(actual, 100);
+            assert_eq!(deck.volume.level, 100);
+            let (left, right) = deck.volume_track(width as u16).unwrap();
+            deck.touch_motion(0, left, 30.0, width as u16, 60, &mut emit);
+            apply_mixer_requests(&mut deck, &mut actual);
+            assert_eq!(actual, 0);
+            for expected in [1, 25, 65, 100, 129, 130] {
+                let x = left + (right - left) * expected as f64 / 130.0;
+                assert!(deck.volume_drag_motion(0, x, 30.0, width as u16, &mut emit));
+                apply_mixer_requests(&mut deck, &mut actual);
+                assert_eq!(actual, expected);
+                assert_eq!(deck.volume.level, expected);
+            }
+            assert!(!deck.volume_drag_start(1, x, 30.0, width as u16, 60, &mut emit));
+            deck.touch_up(0, &mut emit);
+            assert!(deck.volume.drag.is_none());
+        }
+    }
+
+    #[test]
+    fn drawn_slider_owns_covered_buttons_and_the_speaker_selects_zero() {
         let mut deck = volume_deck();
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
-        deck.touch_up(0, &mut |_, _| {});
-        assert!(deck.volume.active);
-        // 751px is the middle of the covered Mute button, not a gap.
+        let mut actual = 100;
+        let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
+        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_up(0, &mut emit);
+        apply_mixer_requests(&mut deck, &mut actual);
         assert_eq!(deck.current().hit(2008, 60, 751.0, 30.0, None), Some(1));
-        // The slider owns the touch anyway: it jumps to the touched level
-        // without pressing the button or emitting its key.
-        let mut events = Vec::new();
-        assert!(!deck.touch_down_at(
-            1,
-            751.0,
-            30.0,
-            2008,
-            60,
-            &mut |k, a| { events.push((k.to_vec(), a)) },
-            &mut |_| {}
-        ));
-        assert_eq!(deck.volume.level, 8);
-        assert!(deck.volume.drag.is_some());
-        deck.touch_up(1, &mut |_, _| {});
-        assert_eq!(
-            events,
-            vec![
-                (vec![Key::VolumeDown], true),
-                (vec![Key::VolumeDown], false)
-            ]
-        );
+        deck.touch_down_at(1, 751.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        apply_mixer_requests(&mut deck, &mut actual);
+        assert_eq!(actual, volume_level_at(751.0, 30.0, 1500.0));
+        deck.touch_up(1, &mut emit);
+        deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        apply_mixer_requests(&mut deck, &mut actual);
+        deck.touch_up(2, &mut emit);
+        assert_eq!(actual, 0);
+        assert!(!deck.volume.muted);
     }
 
     #[test]
-    fn the_mute_affordance_taps_to_toggle_and_still_drags() {
+    fn old_readbacks_and_failed_writes_cannot_display_a_false_success() {
         let mut deck = volume_deck();
         deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
-        deck.touch_up(0, &mut |_, _| {});
-        assert!(deck.volume.active);
-        assert!(!deck.volume.muted);
-
-        // A tap on the speaker icon toggles mute, emits the key pair, and
-        // keeps the slider up without jumping the level.
-        let mut events = Vec::new();
-        assert!(!deck.touch_down_at(1, 10.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {}));
-        assert!(deck
-            .volume
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.mute_start.is_some()));
-        assert_eq!(deck.volume.level, VOLUME_INITIAL_LEVEL + 1);
-        deck.touch_up(1, &mut |k, a| events.push((k.to_vec(), a)));
-        assert!(deck.volume.muted);
-        assert!(deck.volume.active);
-        assert_eq!(
-            events,
-            vec![(vec![Key::Mute], true), (vec![Key::Mute], false)]
+        assert!(deck.volume_render().is_none()); // no guessed zero while reading
+        let old = deck.volume.revision;
+        deck.volume_reply(
+            old,
+            Ok(VolumeState {
+                percent: 100,
+                muted: false,
+            }),
         );
+        deck.touch_motion(0, 0.0, 30.0, 2008, 60, &mut |_, _| {});
+        deck.volume_reply(
+            old,
+            Ok(VolumeState {
+                percent: 130,
+                muted: false,
+            }),
+        );
+        assert_eq!(deck.volume_render().unwrap().level, 100); // stale reply ignored
+        let current = deck.volume.revision;
+        deck.volume_reply(current, Err(std::io::Error::other("receiver unavailable")));
+        assert!(!deck.volume.active);
+        assert!(deck.volume_render().is_none());
+        assert_eq!(deck.volume.level, 100); // failed zero was never displayed
+        deck.volume_reply(
+            current,
+            Ok(VolumeState {
+                percent: 0,
+                muted: false,
+            }),
+        );
+        assert!(!deck.volume.active);
+    }
 
-        // Jitter under the threshold stays a pending mute tap.
-        assert!(!deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {}));
-        assert!(deck.volume_drag_motion(2, 14.0, 31.0, 2008, &mut |_, _| {}));
+    #[test]
+    fn confirmed_drag_progress_renders_while_a_newer_target_is_pending() {
+        let mut deck = volume_deck();
+        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        let opening = deck.volume.revision;
+        deck.volume_set_level(10, &mut |_, _| {});
+        let first = deck.volume.revision;
+        deck.volume_set_level(20, &mut |_, _| {});
+        let latest = deck.volume.revision;
+        deck.volume_reply(
+            first,
+            Ok(VolumeState {
+                percent: 10,
+                muted: false,
+            }),
+        );
+        assert_eq!(deck.volume_render().unwrap().level, 10);
+        deck.volume_reply(
+            opening,
+            Ok(VolumeState {
+                percent: 100,
+                muted: false,
+            }),
+        );
+        assert_eq!(deck.volume_render().unwrap().level, 10);
+        deck.volume_reply(
+            latest,
+            Ok(VolumeState {
+                percent: 20,
+                muted: false,
+            }),
+        );
+        deck.volume_reply(
+            first,
+            Ok(VolumeState {
+                percent: 10,
+                muted: false,
+            }),
+        );
+        assert_eq!(deck.volume_render().unwrap().level, 20);
+        deck.volume_collapse();
+        deck.touch_down_at(1, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.volume_reply(
+            latest,
+            Ok(VolumeState {
+                percent: 20,
+                muted: false,
+            }),
+        );
+        assert!(deck.volume_render().is_none());
+    }
+
+    #[test]
+    fn repeated_open_before_readback_does_not_change_volume() {
+        let mut deck = volume_deck();
+        for slot in 0..2 {
+            deck.touch_down_at(
+                slot,
+                1260.0,
+                30.0,
+                2008,
+                60,
+                &mut |_, _| panic!("volume button emitted keys"),
+                &mut |_| {},
+            );
+            deck.touch_up(slot, &mut |_, _| {});
+        }
         assert!(deck
             .volume
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.mute_start.is_some()));
-        // Crossing the threshold converts to a grab: the touched level
-        // takes over and clears the muted display.
-        assert!(deck.volume_drag_motion(2, 60.0, 33.0, 2008, &mut |_, _| {}));
-        assert!(deck
-            .volume
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.mute_start.is_none()));
-        assert!(!deck.volume.muted);
-        assert_eq!(deck.volume.level, 0);
-        deck.touch_up(2, &mut |_, _| {});
-        assert!(!deck.volume.muted);
+            .requests
+            .iter()
+            .all(|(_, request)| *request == VolumeRequest::Get));
+        let mut actual = 100;
+        apply_mixer_requests(&mut deck, &mut actual);
+        assert_eq!(actual, 100);
+    }
+
+    #[test]
+    fn pixel_shifted_drawn_endpoints_still_set_zero_and_130() {
+        for width in [2008, 2170] {
+            for shift in [-11.0, 0.0, 11.0] {
+                let mut deck = volume_deck();
+                deck.volume.pixel_shift_width = PIXEL_SHIFT_WIDTH_PX;
+                deck.volume.pixel_shift_x = shift;
+                let spans = deck.current().layout_spans(width, PIXEL_SHIFT_WIDTH_PX);
+                // layout_spans is the actual widget geometry consumer. The
+                // drawn speaker zone and track insets remain30px /2px.
+                let left = spans[0].left + shift + 30.0;
+                let right = spans[2].right + shift - 2.0;
+                deck.touch_down_at(
+                    0,
+                    1260.0,
+                    30.0,
+                    width as u16,
+                    60,
+                    &mut |_, _| {},
+                    &mut |_| {},
+                );
+                let mut actual = 100;
+                apply_mixer_requests(&mut deck, &mut actual);
+                deck.touch_motion(0, left, 30.0, width as u16, 60, &mut |_, _| {});
+                apply_mixer_requests(&mut deck, &mut actual);
+                assert_eq!(actual, 0, "visible left endpoint at shift{shift}");
+                deck.volume_drag_motion(0, right, 30.0, width as u16, &mut |_, _| {});
+                apply_mixer_requests(&mut deck, &mut actual);
+                assert_eq!(actual, 130, "visible right endpoint at shift{shift}");
+            }
+        }
     }
 
     #[test]
     fn volume_level_math_rounds_and_clamps() {
         assert_eq!(volume_level_at(-50.0, 0.0, 1502.0), 0);
         assert_eq!(volume_level_at(0.0, 0.0, 1502.0), 0);
-        assert_eq!(volume_level_at(94.0, 0.0, 1502.0), 1);
-        assert_eq!(volume_level_at(141.5, 0.0, 1502.0), 2);
-        assert_eq!(volume_level_at(751.0, 0.0, 1502.0), 8);
-        assert_eq!(volume_level_at(1502.0, 0.0, 1502.0), 16);
-        assert_eq!(volume_level_at(5000.0, 0.0, 1502.0), 16);
-    }
-
-    #[test]
-    fn slider_touches_drag_right_away_and_emit_step_taps() {
-        let mut deck = volume_deck();
-        let mut events = Vec::new();
-        deck.touch_down(
-            0,
-            2,
-            1260.0,
-            30.0,
-            &mut |k, a| events.push((k.to_vec(), a)),
-            &mut |_| {},
-        ); // summon at level 9
-        deck.touch_up(0, &mut |_, _| {});
-        events.clear();
-
-        // Touching the slider itself (here the gap between cluster buttons)
-        // jumps straight to the touched level: 498px -> 5, four taps down.
-        assert!(
-            deck.volume_drag_start(1, 498.0, 30.0, 2008, 60, &mut |k, a| {
-                events.push((k.to_vec(), a))
-            })
-        );
-        assert_eq!(deck.volume.level, 5);
-        assert_eq!(events.len(), 8);
-        assert!(events
-            .iter()
-            .all(|(keys, _)| keys == &vec![Key::VolumeDown]));
-
-        // A second finger cannot steal the drag.
-        assert!(!deck.volume_drag_start(2, 300.0, 30.0, 2008, 60, &mut |_, _| {}));
-
-        // Motion drives the level live; equal positions emit nothing.
-        assert!(
-            deck.volume_drag_motion(1, 751.0, 30.0, 2008, &mut |k, a| events
-                .push((k.to_vec(), a)))
-        );
-        assert_eq!(deck.volume.level, 8);
-        let taps = events.len();
-        assert!(deck.volume_drag_motion(1, 751.0, 30.0, 2008, &mut |_, _| {}));
-        assert_eq!(events.len(), taps);
-        // Off the ends the level clamps instead of leaving the slider.
-        assert!(deck.volume_drag_motion(1, 1900.0, 30.0, 2008, &mut |_, _| {}));
-        assert_eq!(deck.volume.level, VOLUME_LEVELS);
-        assert!(deck.volume_drag_motion(1, -10.0, 30.0, 2008, &mut |_, _| {}));
-        assert_eq!(deck.volume.level, 0);
-
-        deck.touch_up(1, &mut |_, _| {});
-        assert!(deck.volume.drag.is_none());
-        assert!(deck.volume.active);
-    }
-
-    #[test]
-    fn a_volume_press_converts_to_a_drag_and_releases_the_held_key() {
-        let mut deck = volume_deck();
-        let mut events = Vec::new();
-        deck.touch_down(
-            0,
-            2,
-            1260.0,
-            30.0,
-            &mut |k, a| events.push((k.to_vec(), a)),
-            &mut |_| {},
-        ); // VolumeUp held, level 9
-        events.clear();
-
-        // A jitter under the threshold stays a press; the key stays held.
-        deck.touch_motion(0, 1264.0, 31.0, 2008, 60, &mut |_, _| {});
-        assert!(events.is_empty());
-        assert!(deck.touches.contains_key(&0));
-
-        // Crossing the threshold releases the key and starts dragging:
-        // 1280px -> level 14, five VolumeUp taps after the release.
-        deck.touch_motion(0, 1280.0, 30.0, 2008, 60, &mut |k, a| {
-            events.push((k.to_vec(), a))
-        });
-        assert_eq!(events[0], (vec![Key::VolumeUp], false));
-        assert_eq!(deck.volume.level, 14);
-        assert_eq!(events.len(), 11);
-        assert!(!deck.touches.contains_key(&0));
-
-        // The drag continues through the drag path until the finger lifts.
-        assert!(deck.volume_drag_motion(0, 1200.0, 30.0, 2008, &mut |_, _| {}));
-        assert_eq!(deck.volume.level, 13);
-        deck.touch_up(0, &mut |_, _| {});
-        assert!(deck.volume.drag.is_none());
-    }
-
-    #[test]
-    fn mute_toggles_the_displayed_state_and_volume_or_drag_clears_it() {
-        let mut deck = volume_deck();
-        let mut events = Vec::new();
-        deck.touch_down(
-            0,
-            1,
-            750.0,
-            30.0,
-            &mut |k, a| events.push((k.to_vec(), a)),
-            &mut |_| {},
-        );
-        assert!(deck.volume.active); // tapping mute can summon it too
-        assert!(deck.volume.muted);
-        deck.touch_up(0, &mut |k, a| events.push((k.to_vec(), a)));
-        assert_eq!(
-            events,
-            vec![(vec![Key::Mute], true), (vec![Key::Mute], false)]
-        );
-        let shown = deck.volume_render().unwrap();
-        assert!(shown.muted);
-        assert_eq!((shown.first, shown.last), (0, 2));
-
-        // A volume press clears the muted display, as the desktop does.
-        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {}, &mut |_| {});
-        assert!(!deck.volume.muted);
-        deck.touch_up(1, &mut |_, _| {});
-
-        // Muting again shows muted; dragging clears it once more.
-        deck.touch_down(2, 1, 750.0, 30.0, &mut |_, _| {}, &mut |_| {});
-        deck.touch_up(2, &mut |_, _| {});
-        assert!(deck.volume.muted);
-        assert!(deck.volume_drag_start(3, 751.0, 30.0, 2008, 60, &mut |_, _| {}));
-        assert!(!deck.volume.muted);
+        assert_eq!(volume_level_at(751.0, 0.0, 1502.0), 65);
+        assert_eq!(volume_level_at(1502.0, 0.0, 1502.0), 130);
+        assert_eq!(volume_level_at(5000.0, 0.0, 1502.0), 130);
     }
 
     #[test]
@@ -3623,9 +3633,10 @@ mod tests {
             .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
         let home_image = surface.data().unwrap().to_vec();
 
-        // Pressing volume up summons the slider over the whole cluster.
+        // Pressing a volume control summons the slider over the whole cluster.
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
+        apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.volume_render();
         deck.current_mut().draw(
             &config,
@@ -3641,6 +3652,7 @@ mod tests {
         // A higher level fills more of the track.
         deck.volume.level = VOLUME_LEVELS;
         deck.mark_volume_changed();
+        apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.volume_render();
         deck.current_mut().draw(
             &config,
@@ -3656,6 +3668,7 @@ mod tests {
         let full_level = surface.data().unwrap().to_vec();
         deck.volume.muted = true;
         deck.mark_volume_changed();
+        apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.volume_render();
         deck.current_mut().draw(
             &config,
@@ -3680,9 +3693,9 @@ mod tests {
             vec![(
                 "home".into(),
                 FunctionLayer::with_config(vec![
-                    keys("V-", &[Key::VolumeDown]),
-                    keys("Mute", &[Key::Mute]),
-                    keys("V+", &[Key::VolumeUp]),
+                    slider_button("V-"),
+                    slider_button("Mute"),
+                    slider_button("V+"),
                 ]),
             )],
             0,
@@ -3700,6 +3713,7 @@ mod tests {
         // framebuffer borders; its dirty clips must still fit inside them.
         deck.touch_down(0, 2, 1800.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
+        apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.volume_render().unwrap();
         assert_eq!((volume.first, volume.last), (0, 2));
         let clips = deck.current_mut().draw(
@@ -3745,12 +3759,12 @@ mod tests {
             vec![(
                 "home".into(),
                 FunctionLayer::with_config(vec![
-                    keys("V-", &[Key::VolumeDown]),
-                    keys("Mute", &[Key::Mute]),
-                    keys("V+", &[Key::VolumeUp]),
+                    slider_button("V-"),
+                    slider_button("Mute"),
+                    slider_button("V+"),
                     keys("Esc", &[Key::Esc]),
-                    keys("W-", &[Key::VolumeDown]),
-                    keys("W+", &[Key::VolumeUp]),
+                    slider_button("W-"),
+                    slider_button("W+"),
                 ]),
             )],
             0,
@@ -3769,6 +3783,7 @@ mod tests {
         deck.touch_down(0, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert_eq!(deck.volume.region, Some((0, 2)));
+        apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.volume_render();
         deck.current_mut().draw(
             &config,
@@ -3783,6 +3798,7 @@ mod tests {
         deck.touch_down(1, 4, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(1, &mut |_, _| {});
         assert_eq!(deck.volume.region, Some((4, 5)));
+        apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.volume_render();
         deck.current_mut().draw(
             &config,
@@ -3801,7 +3817,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_changes_and_input_release_end_the_slider_and_only_home_summons_it() {
+    fn layer_changes_end_the_slider_and_legacy_keys_still_emit_keys() {
         let mut deck = volume_deck();
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
@@ -3837,33 +3853,14 @@ mod tests {
     #[test]
     fn a_cancelled_drag_leaves_every_key_released() {
         let mut deck = volume_deck();
-        let mut events = Vec::new();
-        deck.touch_down(
-            0,
-            2,
-            1260.0,
-            30.0,
-            &mut |k, a| events.push((k.to_vec(), a)),
-            &mut |_| {},
-        );
-        deck.touch_motion(0, 1300.0, 30.0, 2008, 60, &mut |k, a| {
-            events.push((k.to_vec(), a))
-        }); // convert to drag
-        deck.release_all(&mut |_, _| {}); // cancelled mid-drag
+        let mut emit = |_: &[Key], _: bool| panic!("volume route emitted keys");
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_motion(0, 1300.0, 30.0, 2008, 60, &mut emit);
+        deck.release_all(&mut emit);
         assert!(deck.volume.drag.is_none());
-
-        let mut held: Vec<Key> = Vec::new();
-        for (keys, active) in &events {
-            let key = keys[0];
-            if *active {
-                assert!(!held.contains(&key), "{key:?} pressed twice");
-                held.push(key);
-            } else {
-                assert!(held.contains(&key), "{key:?} released unpressed");
-                held.retain(|k| *k != key);
-            }
-        }
-        assert!(held.is_empty());
+        assert!(!deck.volume.active);
+        assert!(deck.touches.is_empty());
+        assert!(deck.current().buttons.iter().all(|(_, b)| !b.active));
     }
 
     #[test]
@@ -3873,9 +3870,9 @@ mod tests {
                 (
                     "media".into(),
                     FunctionLayer::with_config(vec![
-                        keys("Mute", &[Key::Mute]),
-                        keys("V-", &[Key::VolumeDown]),
-                        keys("V+", &[Key::VolumeUp]),
+                        slider_button("Volume"),
+                        slider_button("V-"),
+                        slider_button("V+"),
                     ]),
                 ),
                 (
@@ -3917,7 +3914,7 @@ mod tests {
     }
 
     #[test]
-    fn decks_without_a_home_volume_cluster_never_summon_a_slider() {
+    fn decks_without_a_volume_slider_control_never_summon_a_slider() {
         let mut deck = named_deck();
         deck.touch_down(0, 0, 330.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});

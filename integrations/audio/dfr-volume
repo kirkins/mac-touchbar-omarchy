@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+"""Narrow desktop-session receiver for the Touch Bar output-volume slider."""
+import os
+import re
+import socket
+import struct
+import subprocess
+
+MAX_PERCENT = 130
+
+
+def command(*args):
+    return subprocess.check_output(args, text=True, timeout=2,
+                                   env={**os.environ, "LC_ALL": "C"}).strip()
+
+
+class Mixer:
+    def sink(self):
+        sink = command("omarchy-audio-output-sink")
+        if not sink:
+            raise ValueError("No output sink")
+        return sink
+
+    def state(self, sink):
+        values = re.findall(r"(\d+)%", command("pactl", "get-sink-volume", sink))
+        if not values:
+            raise ValueError("Cannot read output volume")
+        muted = command("pactl", "get-sink-mute", sink)
+        if muted not in ("Mute: yes", "Mute: no"):
+            raise ValueError("Cannot read output mute")
+        return min(MAX_PERCENT, max(map(int, values))), muted == "Mute: yes"
+
+    def dispatch(self, request):
+        # Validate the complete finite protocol before touching the mixer.
+        if request == "get":
+            action, value = "get", None
+        elif re.fullmatch(r"set (0|[1-9][0-9]{0,2})", request):
+            action, value = "set", int(request[4:])
+            if value > MAX_PERCENT:
+                raise ValueError("Volume out of range")
+        else:
+            raise ValueError("Invalid request")
+        sink = self.sink()
+        if action == "set":
+            command("pactl", "set-sink-volume", sink, str(value) + "%")
+            command("pactl", "set-sink-mute", sink, "0")
+        percent, muted = self.state(sink)
+        return f"ok {percent} {int(muted)}"
+
+
+def handle(connection, mixer, allowed_uids):
+    connection.settimeout(3)
+    _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    if uid not in allowed_uids:
+        return
+    data = bytearray()
+    while len(data) <= 32:
+        chunk = connection.recv(33 - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > 32:
+        raise ValueError("Request too long")
+    result = mixer.dispatch(data.decode("ascii"))
+    connection.sendall(result.encode("ascii"))
+
+
+def serve():
+    uid = os.getuid()
+    mixer = Mixer()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind("\0dfr-volume-" + str(uid))
+        listener.listen(8)
+        while True:
+            connection, _ = listener.accept()
+            with connection:
+                try:
+                    handle(connection, mixer, {uid, 65534})
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    print(f"Volume handoff failed: {error}", flush=True)
+                    try:
+                        connection.sendall(b"error")
+                    except OSError:
+                        pass
+
+
+if __name__ == "__main__":
+    serve()

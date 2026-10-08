@@ -1,0 +1,15 @@
+[Unit]
+Description=Touch Bar desktop-session output volume
+PartOf=graphical-session.target
+After=graphical-session.target pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.local/bin/dfr-volume
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/share/omarchy/bin
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target
