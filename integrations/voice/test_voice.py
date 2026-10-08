@@ -217,7 +217,11 @@ client.request('start', os.getuid(), '\\0' + sys.argv[2])
 
     def test_peer_uid_is_enforced(self):
         self.receiver.allowed_uids = {os.getuid() + 1}
-        with self.assertRaisesRegex((ValueError, OSError), "not permitted|reset"):
+        # The receiver rejects on SO_PEERCRED before reading the request, so the
+        # kernel may tear the socket down (EPIPE/ECONNRESET) before the client
+        # reads the JSON error; either observable proves the rejection.
+        with self.assertRaisesRegex(
+                (ValueError, OSError), "not permitted|reset|Broken pipe"):
             self.exchange("start")
         self.assertEqual(self.actions, [])
 
