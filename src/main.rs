@@ -70,15 +70,15 @@ const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 40;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
-// Transient volume slider, macOS Touch Bar style: pressing a volume button on
-// a bar expands a draggable slider over its reserved span, which
+// Transient volume slider, macOS Touch Bar style: pressing the volume-slider
+// control on a bar expands a draggable slider over its reserved span, which
 // collapses again after a moment of inactivity.
 /// Absolute output percentage, including the user's existing 130% ceiling.
 const VOLUME_LEVELS: u8 = volume::MAX_PERCENT;
 const VOLUME_INITIAL_LEVEL: u8 = 0;
 /// How long the slider stays up after the last interaction.
 const VOLUME_SLIDER_LINGER: Duration = Duration::from_millis(2500);
-/// Presses on volume buttons become drags once the finger moves this far,
+/// Presses on the volume control become drags once the finger moves this far,
 /// so a shaky tap still taps while an intentional drag always drags.
 const VOLUME_DRAG_THRESHOLD_PX: f64 = 8.0;
 /// Width of the speaker glyph anchoring the left end of the slider.
@@ -3578,8 +3578,8 @@ mod tests {
     #[test]
     fn a_held_volume_press_keeps_the_slider_up_until_release() {
         let mut deck = volume_deck();
-        // The summoning press stays held: the key is down and the slider
-        // must not collapse under the finger even past the deadline.
+        // The summoning press stays held: the slider must not collapse
+        // under the finger even past the deadline.
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         let deadline = deck.volume.deadline.unwrap();
         assert!(!deck.volume_refresh(deadline + Duration::from_secs(10)));

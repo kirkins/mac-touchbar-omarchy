@@ -34,9 +34,10 @@ clock display is illustrative and they do not prove physical touch or dictation.
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
-presses/releases, battery widget cycling, the transient volume slider (summon
-on volume press, drag position-to-level math, auto-collapse timing, live level
-rendering, mute interplay, and layer isolation), command buttons (parse and
+presses/releases, battery widget cycling, the transient volume slider (opening
+the volume control without stepping, absolute drag position-to-percent math,
+auto-collapse timing, live level rendering, mixer readback and failure
+handling, and layer isolation), command buttons (parse and
 combined layer dispatch, detached execution, and the one-invocation-per-command
 cap), and the virtual pet (pet-layer wiring and button toggle, wander bounds,
 pause and resume across layer switches, nap gating and placement, satiety decay
