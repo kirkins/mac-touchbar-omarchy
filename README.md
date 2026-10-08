@@ -23,22 +23,24 @@ The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
 presses/releases, battery widget cycling, the transient volume slider (summon
 on volume press, drag position-to-level math, auto-collapse timing, live level
-rendering, mute interplay, and layer isolation), and the virtual pet (pet-layer
-wiring and button toggle, wander bounds, pause and resume across layer switches,
-nap gating and placement, satiety decay and feeding, startle, tap consumption,
-and reload transitions). Physical layout, touch accuracy, brightness, media-key
-delivery to the desktop, live battery/clock refresh, the volume slider's
-on-glass drag feel, and the pet's on-glass charm still need a device test;
-battery checks there must include repeated tap-to-cycle, device labels in each
-display mode, hotplug, and timed return.
+rendering, mute interplay, and layer isolation), command buttons (parse and
+combined layer dispatch, detached execution, and the one-invocation-per-command
+cap), and the virtual pet (pet-layer wiring and button toggle, wander bounds,
+pause and resume across layer switches, nap gating and placement, satiety decay
+and feeding, startle, tap consumption, and reload transitions). Physical
+layout, touch accuracy, brightness, media-key delivery to the desktop, live
+battery/clock refresh, the volume slider's on-glass drag feel, command buttons'
+interaction with a real helper, and the pet's on-glass charm still need a device
+test; battery checks there must include repeated tap-to-cycle, device labels in
+each display mode, hotplug, and timed return.
 
 ## Named bars
 
 The daemon merges `/etc/tiny-dfr/config.toml` over
 `/usr/share/tiny-dfr/config.toml`. The optional
 [multibar example](share/tiny-dfr/multibar.toml) defines a home bar with volume,
-brightness, play/pause, battery, and clock controls, plus buttons opening F1-F12
-and media bars.
+brightness, play/pause, battery, and clock controls, buttons opening F1-F12 and
+media bars, and a mic button that starts voice dictation on a recording layer.
 
 ```toml
 DefaultLayer = "home"
@@ -60,8 +62,10 @@ Keys = [
 unique, nonempty `Name` and nonempty `Keys`. Names are case-sensitive. `Layers`
 replaces the legacy key arrays as a whole; global appearance and brightness
 settings still inherit from the base configuration. Add further named bars and
-navigation buttons using `Action = { Layer = "name" }`. Each sub-bar gets a Home
-button automatically if it lacks a visible button targeting `DefaultLayer`.
+navigation buttons using `Action = { Layer = "name" }`, or run a shell command
+on touch-down with `Action = { Command = "..." }` (see below). Each sub-bar gets
+a Home button automatically if it lacks a visible button targeting
+`DefaultLayer`.
 Escape is still inserted on Macs without a physical Escape key.
 
 Navigation buttons switch immediately on touch-down. With `FnLayer`, holding Fn
@@ -113,6 +117,46 @@ re-drives them. Layer navigation, Fn (including the legacy home-swap double
 press), reloads, and input release collapse the slider and restore the bar.
 Only the home bar summons it; volume buttons on other layers behave exactly as
 before.
+
+### Command buttons and voice dictation
+
+Any button can run a shell command on touch-down instead of - or combined
+with - switching layers:
+
+```toml
+{ Text = "Sync", Action = { Command = "my-sync-script" } }
+{ Icon = "mic_off", Action = { Command = "voice-dictate start", Layer = "recording" } }
+```
+
+A `Command` action runs the configured string verbatim through `/bin/sh -c`.
+Nothing observed at runtime is ever interpolated into it, so there is no
+injection surface beyond the string written in the configuration file.
+Commands run detached from the renderer - standard streams go to `/dev/null`
+and each child is reaped on its own thread - so a slow or hung command never
+blocks the bar. Spawn failures and nonzero exits are logged on stderr, which
+under systemd lands in the journal. At most one invocation of a given command
+string runs at a time; since a button's action is fixed, this caps concurrent
+invocations per button, and a second touch while the previous child is still
+alive is dropped with a log line instead of double-firing. Commands run as the
+daemon's unprivileged user inside the service sandbox, so a helper must work
+under those restrictions. An empty `Command` string is rejected, as is a
+combined action naming an unknown layer.
+
+Adding `Layer` to the table combines both effects in one press: the command
+runs first, then the named layer opens. Combined buttons count as visible
+navigation, so a sub-bar whose Stop or Done button returns home through a
+command gets no extra Home button. The [multibar example](share/tiny-dfr/multibar.toml)
+uses this for voice dictation: the home-bar mic button runs
+`voice-dictate start` and opens a `recording` layer, which is the visual
+state for the ongoing recording - no dynamic widget is needed. That layer
+holds a `Stop` button (runs `voice-dictate stop`, which stops recording and
+types the transcript into whatever window has focus) and a `Cancel` button
+(runs `voice-dictate cancel`, discarding a mis-start); both return home. The
+mic button reuses the existing `mic_off` glyph from `share/tiny-dfr/`; a
+dedicated un-slashed `mic.svg` can be dropped into the icon search paths and
+swapped in later with `Icon = "mic"`. The `voice-dictate` helper itself is
+machine-local wiring and does not ship with the daemon; without it these
+presses still switch layers and log the failed command.
 
 ## Touch Bar pet
 
@@ -203,7 +247,11 @@ sudo systemctl status tiny-dfr.service --no-pager
 
 On the device, check Home → Functions → Home and Home → Media → Home, all
 F1-F12/media controls, the battery and clock, and Home → Pet → pet
-wandering, feeding, and startling → Home, plus Fn press/release. Hold a key
+wandering, feeding, and startling → Home, plus Fn press/release. With the
+machine-local `voice-dictate` helper installed, check the mic button opens
+the recording layer while dictation starts, and that Stop types the
+transcript into the focused window while Cancel discards; without the helper
+the layers still switch and the journal logs the failed command. Hold a key
 while switching with another finger and while saving a valid configuration;
 verify its release and that the old finger cannot activate a new button. Test an
 invalid target reload, an atomic save, and returning to the previous configuration.

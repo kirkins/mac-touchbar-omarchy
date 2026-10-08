@@ -68,6 +68,31 @@ struct ConfigProxy {
 pub enum ButtonAction {
     Keys(Vec<Key>),
     SwitchLayer(String),
+    /// Runs a shell command on touch-down.
+    Command(String),
+    /// Runs a shell command on touch-down and switches to the named layer,
+    /// so a single press does both.
+    CommandLayer {
+        command: String,
+        layer: String,
+    },
+}
+
+impl ButtonAction {
+    /// The layer this action switches to on touch-down, if any.
+    pub fn layer_target(&self) -> Option<&str> {
+        match self {
+            Self::SwitchLayer(layer) | Self::CommandLayer { layer, .. } => Some(layer),
+            _ => None,
+        }
+    }
+    /// The shell command this action runs on touch-down, if any.
+    pub fn command(&self) -> Option<&str> {
+        match self {
+            Self::Command(command) | Self::CommandLayer { command, .. } => Some(command),
+            _ => None,
+        }
+    }
 }
 
 impl Default for ButtonAction {
@@ -83,17 +108,27 @@ impl<'de> Deserialize<'de> for ButtonAction {
         enum Action {
             Key(Key),
             Keys(Vec<Key>),
-            Layer(LayerAction),
+            Table(TableAction),
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase", deny_unknown_fields)]
-        struct LayerAction {
-            layer: String,
+        struct TableAction {
+            layer: Option<String>,
+            command: Option<String>,
         }
         Ok(match Action::deserialize(deserializer)? {
             Action::Key(key) => Self::Keys(vec![key]),
             Action::Keys(keys) => Self::Keys(keys),
-            Action::Layer(action) => Self::SwitchLayer(action.layer),
+            Action::Table(action) => match (action.layer, action.command) {
+                (Some(layer), None) => Self::SwitchLayer(layer),
+                (None, Some(command)) => Self::Command(command),
+                (Some(layer), Some(command)) => Self::CommandLayer { command, layer },
+                (None, None) => {
+                    return Err(serde::de::Error::custom(
+                        "an Action table needs Layer or Command",
+                    ))
+                }
+            },
         })
     }
 }
@@ -240,7 +275,7 @@ impl ConfigProxy {
             }
             let home_layer = &mut layers[home];
             let has_pet_button = home_layer.keys.iter().any(|button| {
-                button.action == ButtonAction::SwitchLayer(PET_LAYER.into())
+                button.action.layer_target() == Some(PET_LAYER)
                     && button.text.as_deref().map_or(
                         button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
                         |text| !text.trim().is_empty(),
@@ -250,7 +285,7 @@ impl ConfigProxy {
                 let at = home_layer
                     .keys
                     .iter()
-                    .rposition(|button| matches!(button.action, ButtonAction::SwitchLayer(_)))
+                    .rposition(|button| button.action.layer_target().is_some())
                     .map_or(home_layer.keys.len(), |last| last + 1);
                 home_layer.keys.insert(
                     at,
@@ -264,13 +299,20 @@ impl ConfigProxy {
         }
         for layer in &layers {
             for button in &layer.keys {
-                if let ButtonAction::SwitchLayer(target) = &button.action {
-                    if !names.contains(target.as_str()) {
+                if let Some(target) = button.action.layer_target() {
+                    if !names.contains(target) {
                         bail!(
                             "layer {:?} has an unknown button target {target:?}",
                             layer.name
                         );
                     }
+                }
+                if button
+                    .action
+                    .command()
+                    .is_some_and(|command| command.trim().is_empty())
+                {
+                    bail!("layer {:?} has a button with an empty command", layer.name);
                 }
             }
         }
@@ -280,7 +322,7 @@ impl ConfigProxy {
             if !legacy
                 && index != home
                 && !layer.keys.iter().any(|button| {
-                    button.action == ButtonAction::SwitchLayer(home_name.clone())
+                    button.action.layer_target() == Some(home_name.as_str())
                         && button.text.as_deref().map_or(
                             button.icon.is_some()
                                 || button.time.is_some()
@@ -655,7 +697,7 @@ DoublePressSwitchLayers = 200
             2008,
         )
         .unwrap();
-        assert_eq!(layout.layers.len(), 4);
+        assert_eq!(layout.layers.len(), 5);
         let home = &layout.layers[layout.home];
         assert!(home.keys.iter().any(|key| key.time.is_some()));
         assert!(home.keys.iter().any(|key| key.battery.is_some()));
@@ -678,6 +720,42 @@ DoublePressSwitchLayers = 200
                 1
             );
         }
+        // The voice-dictation flow: the mic button starts recording and
+        // opens the recording layer in one press; its Cancel and Stop
+        // buttons visibly return home, so no extra Home button appears.
+        let recording = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "recording")
+            .unwrap();
+        assert_eq!(recording.keys.len(), 3);
+        assert_eq!(
+            recording.keys[0].action,
+            ButtonAction::CommandLayer {
+                command: "voice-dictate cancel".into(),
+                layer: "home".into()
+            }
+        );
+        assert_eq!(
+            recording.keys[2].action,
+            ButtonAction::CommandLayer {
+                command: "voice-dictate stop".into(),
+                layer: "home".into()
+            }
+        );
+        let mic = home
+            .keys
+            .iter()
+            .position(|key| key.icon.as_deref() == Some("mic_off"))
+            .unwrap();
+        assert_eq!(mic, 6);
+        assert_eq!(
+            home.keys[mic].action,
+            ButtonAction::CommandLayer {
+                command: "voice-dictate start".into(),
+                layer: "recording".into()
+            }
+        );
         // The Pet button joins the navigation cluster after Functions and
         // Media, matching their styling.
         let positions: Vec<usize> = ["function", "media", "pet"]
@@ -689,7 +767,7 @@ DoublePressSwitchLayers = 200
                     .unwrap()
             })
             .collect();
-        assert_eq!(positions, vec![6, 7, 8]);
+        assert_eq!(positions, vec![7, 8, 9]);
         let pet_button = &home.keys[positions[2]];
         assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout
@@ -726,6 +804,71 @@ DoublePressSwitchLayers = 200
     }
 
     #[test]
+    fn command_actions_parse_alone_and_combined_with_layer_switches() {
+        let config = format!(
+            "{NAMED}\n\
+[[Layers]]\n\
+Name = \"recording\"\n\
+Keys = [\n\
+    {{ Text = \"Sync\", Action = {{ Command = \"sync-now\" }} }},\n\
+    {{ Text = \"Mic\", Action = {{ Command = \"voice-dictate start\", Layer = \"recording\" }} }},\n\
+]\n"
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let recording = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "recording")
+            .unwrap();
+        // No button visibly returns home, so the generic Home button is
+        // still synthesized ahead of the configured keys.
+        assert_eq!(recording.keys.len(), 3);
+        assert_eq!(
+            recording.keys[0].action,
+            ButtonAction::SwitchLayer("home".into())
+        );
+        assert_eq!(
+            recording.keys[1].action,
+            ButtonAction::Command("sync-now".into())
+        );
+        assert_eq!(
+            recording.keys[2].action,
+            ButtonAction::CommandLayer {
+                command: "voice-dictate start".into(),
+                layer: "recording".into()
+            }
+        );
+        // The helpers see through both action shapes.
+        assert_eq!(recording.keys[1].action.layer_target(), None);
+        assert_eq!(recording.keys[1].action.command(), Some("sync-now"));
+        assert_eq!(recording.keys[2].action.layer_target(), Some("recording"));
+        assert_eq!(
+            recording.keys[2].action.command(),
+            Some("voice-dictate start")
+        );
+    }
+
+    #[test]
+    fn a_combined_command_button_counts_as_visible_home_navigation() {
+        // A sub-bar whose buttons visibly return home through a command
+        // needs no synthesized Home button, exactly like pure navigation.
+        let config = NAMED.replace(
+            "{ Text = \"F1\", Action = \"F1\" }",
+            "{ Text = \"Stop\", Action = { Command = \"voice-dictate stop\", Layer = \"home\" } }",
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let function = &layout.layers[1];
+        assert_eq!(function.keys.len(), 1);
+        assert_eq!(function.keys[0].text.as_deref(), Some("Stop"));
+        // An invisible combined button still leaves room for the Home button.
+        let config = config.replace("Text = \"Stop\"", "Text = \" \"");
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let function = &layout.layers[1];
+        assert_eq!(function.keys.len(), 2);
+        assert_eq!(function.keys[0].text.as_deref(), Some("Home"));
+    }
+
+    #[test]
     fn invalid_named_layouts_and_actions_are_rejected() {
         for invalid in [
             NAMED.replace("DefaultLayer = \"home\"", "DefaultLayer = \"missing\""),
@@ -739,6 +882,18 @@ DoublePressSwitchLayers = 200
             "DefaultLayer = \"home\"".into(),
             NAMED.replace("Layer = \"function\"", "Layer = \"function\", Key = \"F1\""),
             NAMED.replace("Action = \"F1\"", "Action = \"NotAKey\""),
+            NAMED.replace("Action = \"F1\"", "Action = { Command = \"\" }"),
+            NAMED.replace("Action = \"F1\"", "Action = { Command = \"   \" }"),
+            NAMED.replace("Action = \"F1\"", "Action = {}"),
+            NAMED.replace("Action = \"F1\"", "Action = { Command = 42 }"),
+            NAMED.replace(
+                "Action = \"F1\"",
+                "Action = { Layer = \"home\", Extra = true }",
+            ),
+            NAMED.replace(
+                "Action = \"F1\"",
+                "Action = { Command = \"x\", Layer = \"missing\" }",
+            ),
         ] {
             assert!(
                 parse_config(BASE, Some(&invalid), 2008).is_err(),
@@ -906,7 +1061,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F1], true)]);
 
@@ -919,7 +1074,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         events.clear();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F5], true)]);
 
@@ -934,7 +1089,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         events.clear();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F6], true)]);
     }
@@ -951,7 +1106,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         deck.switch_named("function", &mut |_, _| {});
         let mut keys = Vec::new();
         let mut emit = |codes: &[Key], active| keys.push((codes.to_vec(), active));
-        deck.touch_down(7, 1, 1500.0, 30.0, &mut emit);
+        deck.touch_down(7, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
         fs::write(
             &path,
             NAMED.replace("Layer = \"function\"", "Layer = \"missing\""),
@@ -992,7 +1147,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         deck.replace(replacement, &mut emit);
         assert!(!deck.legacy);
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
 
         fs::remove_file(path).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();
@@ -1024,7 +1179,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         let (cfg, deck) = manager.load_config(2008);
         assert_eq!(cfg.double_press_switch_layers, 0);
         assert!(!deck.legacy);
-        assert_eq!(deck.layers.len(), 4);
+        assert_eq!(deck.layers.len(), 5);
     }
 
     #[test]

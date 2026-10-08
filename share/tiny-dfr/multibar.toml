@@ -14,6 +14,7 @@ Keys = [
     { Icon = "brightness_low", Action = "BrightnessDown" },
     { Icon = "brightness_high", Action = "BrightnessUp" },
     { Icon = "play_pause", Action = "PlayPause" },
+    { Icon = "mic_off", Action = { Command = "voice-dictate start", Layer = "recording" } },
     { Text = "F1-F12", Action = { Layer = "function" } },
     { Text = "Media", Action = { Layer = "media" } },
     { Battery = "both", Stretch = 2 },
@@ -50,10 +51,27 @@ Keys = [
     { Icon = "volume_up", Action = "VolumeUp" },
 ]
 
+# Voice dictation: the home-bar mic button runs `voice-dictate start` and
+# opens this recording layer in one press; the layer itself is the visual
+# state. Stop keeps the recording and types the transcript into the focused
+# window, Cancel discards a mis-start; both run their command and return
+# home. The helper is machine-local wiring and is not shipped with the
+# daemon (see README); without it these presses still switch layers and
+# log the failed command.
+[[Layers]]
+Name = "recording"
+Keys = [
+    { Text = "Cancel", Action = { Command = "voice-dictate cancel", Layer = "home" } },
+    { Text = "Recording", Stretch = 3 },
+    { Text = "Stop", Action = { Command = "voice-dictate stop", Layer = "home" } },
+]
+
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,
 # then add a button with Action = { Layer = "that-name" } to a reachable bar.
 # A Home button is inserted automatically on sub-bars that lack a visible
-# button targeting DefaultLayer. With PetEnabled (see config.toml) the home
-# bar also gains a Pet button opening the daemon's own pet layer, unless a
-# layer named "pet" is defined here. No command execution or external
-# service is used.
+# button targeting DefaultLayer; a button can also run a shell command on
+# touch-down with Action = { Command = "..." }, optionally combined with a
+# Layer switch as in the mic button above. Commands run through /bin/sh as
+# the daemon user; failures are logged to the journal. With PetEnabled (see
+# config.toml) the home bar also gains a Pet button opening the daemon's own
+# pet layer, unless a layer named "pet" is defined here.
