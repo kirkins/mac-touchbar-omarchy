@@ -45,6 +45,7 @@ use std::{
 use udev::MonitorBuilder;
 
 mod backlight;
+mod command;
 mod config;
 mod display;
 mod fonts;
@@ -53,6 +54,7 @@ mod pixel_shift;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
+use command::CommandRunner;
 use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
@@ -1483,6 +1485,7 @@ impl LayerDeck {
         x: f64,
         y: f64,
         emit_keys: &mut impl FnMut(&[Key], bool),
+        run_command: &mut impl FnMut(&str),
     ) -> bool {
         self.touch_up(slot, emit_keys);
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
@@ -1511,6 +1514,19 @@ impl LayerDeck {
             let name = name.clone();
             return self.switch_named(&name, emit_keys);
         }
+        // Command buttons fire exactly once per touch-down, running their
+        // command before any layer switch the same press performs.
+        if let ButtonAction::CommandLayer { command, layer } =
+            &self.current().buttons[button].1.action
+        {
+            let (command, layer) = (command.clone(), layer.clone());
+            run_command(&command);
+            return self.switch_named(&layer, emit_keys);
+        }
+        if let ButtonAction::Command(command) = &self.current().buttons[button].1.action {
+            let command = command.clone();
+            run_command(&command);
+        }
         self.touches.insert(
             slot,
             TouchState {
@@ -1527,6 +1543,7 @@ impl LayerDeck {
 
     /// Route a fresh touch-down: while the slider is drawn its region owns
     /// the touch, otherwise the press goes to the button under it.
+    #[allow(clippy::too_many_arguments)] // a router: geometry plus the two effects
     fn touch_down_at(
         &mut self,
         slot: u32,
@@ -1535,12 +1552,13 @@ impl LayerDeck {
         width: u16,
         height: u16,
         emit_keys: &mut impl FnMut(&[Key], bool),
+        run_command: &mut impl FnMut(&str),
     ) -> bool {
         if self.volume_drag_start(slot, x, y, width, height, emit_keys) {
             return false;
         }
         match self.current().hit(width, height, x, y, None) {
-            Some(button) => self.touch_down(slot, button, x, y, emit_keys),
+            Some(button) => self.touch_down(slot, button, x, y, emit_keys, run_command),
             None => false,
         }
     }
@@ -1934,6 +1952,9 @@ fn real_main(drm: &mut DrmBackend) {
         .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
 
     let mut battery_monitor = BatteryMonitor::new(PathBuf::from("/sys/class/power_supply"));
+    // Command buttons spawn their configured commands through this runner,
+    // detached from the render loop.
+    let commands = CommandRunner::new();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -2191,6 +2212,9 @@ fn real_main(drm: &mut DrmBackend) {
                                     height,
                                     &mut |keys, active| {
                                         toggle_keys(&mut uinput, keys, active as i32)
+                                    },
+                                    &mut |command| {
+                                        commands.launch(command);
                                     },
                                 );
                             }
@@ -2482,15 +2506,15 @@ mod tests {
         );
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 100.0, 30.0, &mut emit);
-        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit));
+        deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {});
+        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
         assert!(deck.touches.is_empty());
         assert_eq!(widget(&deck).source().unwrap().id, "hidpp_mouse");
         deck.touch_motion(1, 1100.0, 30.0, 2008, 60, &mut emit);
         deck.touch_motion(0, 100.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(1, &mut emit);
         assert_eq!(widget(&deck).source().unwrap().id, "hidpp_mouse");
-        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit));
+        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(widget(&deck).source().unwrap().id, "keyboard");
         assert_eq!(
             events,
@@ -2508,11 +2532,11 @@ mod tests {
             let sources = sample_sources();
             let timeout = Duration::from_secs(15);
             deck.refresh_batteries(&sources, true, timeout, Instant::now(), &mut |_, _| {});
-            deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {});
+            deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {});
             let deadline = widget(&deck).return_at.unwrap();
             let mut events = Vec::new();
             let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-            deck.touch_down(1, 0, 100.0, 30.0, &mut emit);
+            deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut |_| {});
             let snapshot = if removal { &sources[..1] } else { &sources[..] };
             let now = if removal {
                 deadline - timeout
@@ -2550,7 +2574,7 @@ mod tests {
             );
             let mut events = Vec::new();
             let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-            assert!(!deck.touch_down(0, 1, 1100.0, 30.0, &mut emit));
+            assert!(!deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
             deck.touch_up(0, &mut emit);
             assert_eq!(widget(&deck).source().unwrap().id, "BAT0");
             assert!(widget(&deck).label().is_none());
@@ -2721,6 +2745,92 @@ mod tests {
         )
     }
 
+    /// A deck shaped like the multibar example's voice-dictation flow: a
+    /// home-bar mic button combining a start command with the layer switch,
+    /// and a recording layer whose Cancel and Stop buttons run their command
+    /// and return home. One plain command button rides the home bar.
+    fn voice_deck() -> LayerDeck {
+        let command_layer = |command: &str, layer: &str| {
+            text(
+                "",
+                ButtonAction::CommandLayer {
+                    command: command.into(),
+                    layer: layer.into(),
+                },
+            )
+        };
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        text(
+                            "Mic",
+                            ButtonAction::CommandLayer {
+                                command: "voice-dictate start".into(),
+                                layer: "recording".into(),
+                            },
+                        ),
+                        text("Sync", ButtonAction::Command("sync-now".into())),
+                    ]),
+                ),
+                (
+                    "recording".into(),
+                    FunctionLayer::with_config(vec![
+                        command_layer("voice-dictate cancel", "home"),
+                        text("Recording", ButtonAction::default()),
+                        command_layer("voice-dictate stop", "home"),
+                    ]),
+                ),
+            ],
+            0,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn command_buttons_fire_on_touch_down_and_combined_presses_switch_layers() {
+        let mut deck = voice_deck();
+        let mut events = Vec::new();
+        let mut commands = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        let mut fired = |command: &str| commands.push(command.to_owned());
+
+        // One mic press starts dictation and opens the recording layer; the
+        // touch is released with the switch, like any navigation button.
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut fired));
+        assert_eq!(deck.active, deck.names["recording"]);
+        assert!(deck.touches.is_empty());
+        // Cancel discards a mis-start and returns home.
+        assert!(deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut fired));
+        assert_eq!(deck.active, deck.home);
+        // Stop keeps the recording and returns home the same way.
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut fired));
+        assert!(deck.touch_down(1, 2, 1900.0, 30.0, &mut emit, &mut fired));
+        assert_eq!(deck.active, deck.home);
+        // A plain command button fires on touch-down and keeps its momentary
+        // highlight while held, without sending any key events.
+        assert!(!deck.touch_down(2, 2, 1900.0, 30.0, &mut emit, &mut fired));
+        assert!(deck.current().buttons[2].1.active);
+        deck.touch_up(2, &mut emit);
+        assert!(!deck.current().buttons[2].1.active);
+        // Each press fired exactly its own command, in order.
+        assert_eq!(
+            commands,
+            vec![
+                "voice-dictate start",
+                "voice-dictate cancel",
+                "voice-dictate start",
+                "voice-dictate stop",
+                "sync-now",
+            ]
+        );
+        assert!(events.is_empty());
+    }
+
     #[test]
     fn the_pet_button_opens_the_pet_layer_and_home_returns_with_input_release() {
         let mut deck = pet_deck();
@@ -2729,15 +2839,15 @@ mod tests {
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         // Hold a key on the home bar, then open the pet layer: the held key
         // is released and the old touch cannot act on the new layer.
-        assert!(!deck.touch_down(0, 0, 100.0, 30.0, &mut emit));
-        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit));
+        assert!(!deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, 1);
         assert!(deck.pet_active());
         assert!(deck.touches.is_empty());
         deck.touch_motion(0, 100.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
         // The pet layer's Home button returns to the home bar.
-        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit));
+        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, deck.home);
         assert!(!deck.pet_active());
         assert!(deck
@@ -2841,7 +2951,7 @@ mod tests {
             .current()
             .hit(width as u16, height as u16, (width / 2) as f64, 30.0, None)
             .unwrap();
-        assert!(deck.touch_down(0, button, 1004.0, 30.0, &mut |_, _| {}));
+        assert!(deck.touch_down(0, button, 1004.0, 30.0, &mut |_, _| {}, &mut |_| {}));
         deck.current_mut()
             .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
         assert_ne!(&*surface.data().unwrap(), home_image.as_slice());
@@ -2851,7 +2961,7 @@ mod tests {
             .current()
             .hit(width as u16, height as u16, 100.0, 30.0, None)
             .unwrap();
-        assert!(deck.touch_down(1, button, 100.0, 30.0, &mut |_, _| {}));
+        assert!(deck.touch_down(1, button, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
         deck.current_mut()
             .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
@@ -2862,19 +2972,19 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        assert!(!deck.touch_down(0, 0, 330.0, 30.0, &mut emit));
-        assert!(deck.touch_down(1, 1, 1004.0, 30.0, &mut emit));
+        assert!(!deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(1, 1, 1004.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, 1);
         assert!(deck.touches.is_empty());
         deck.touch_motion(0, 330.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
         deck.touch_motion(1, 1004.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(1, &mut emit);
-        assert!(deck.touch_down(2, 0, 330.0, 30.0, &mut emit));
+        assert!(deck.touch_down(2, 0, 330.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, deck.home);
-        assert!(deck.touch_down(3, 2, 1679.0, 30.0, &mut emit));
+        assert!(deck.touch_down(3, 2, 1679.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, 2);
-        assert!(deck.touch_down(4, 0, 330.0, 30.0, &mut emit));
+        assert!(deck.touch_down(4, 0, 330.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, deck.home);
         assert!(deck
             .layers
@@ -2895,14 +3005,14 @@ mod tests {
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("media", &mut emit);
-        deck.touch_down(0, 1, 1100.0, 30.0, &mut emit);
+        deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {});
         assert!(deck.fn_event(true, false, &mut emit));
         assert_eq!(deck.active, 1);
-        deck.touch_down(1, 1, 1100.0, 30.0, &mut emit);
+        deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {});
         assert!(deck.fn_event(false, false, &mut emit));
         assert_eq!(deck.active, 2);
         assert!(deck.fn_event(true, false, &mut emit));
-        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit)); // Home while Fn is held
+        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit, &mut |_| {})); // Home while Fn is held
         assert_eq!(deck.active, deck.home);
         assert!(!deck.fn_event(false, false, &mut emit));
         assert_eq!(deck.active, deck.home);
@@ -2938,7 +3048,7 @@ mod tests {
             );
             let mut events = Vec::new();
             let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-            deck.touch_down(0, 0, 100.0, 30.0, &mut emit);
+            deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {});
             assert!(deck.fn_event(true, false, &mut emit));
             assert_eq!(deck.active, 1 - home);
             assert!(deck.fn_event(false, false, &mut emit));
@@ -2962,7 +3072,7 @@ mod tests {
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.fn_event(true, false, &mut emit);
-        deck.touch_down(0, 1, 1004.0, 30.0, &mut emit);
+        deck.touch_down(0, 1, 1004.0, 30.0, &mut emit, &mut |_| {});
         let replacement = LayerDeck::new(
             vec![(
                 "new-home".into(),
@@ -2980,7 +3090,7 @@ mod tests {
         deck.touch_motion(0, 1004.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
         assert!(!deck.fn_event(false, false, &mut emit));
-        deck.touch_down(1, 0, 100.0, 30.0, &mut emit);
+        deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut |_| {});
         deck.touch_up(1, &mut emit);
         assert_eq!(
             events,
@@ -2998,7 +3108,7 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 330.0, 30.0, &mut emit);
+        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {});
         deck.touch_motion(0, 2000.0, 30.0, 2008, 60, &mut emit);
         deck.touch_motion(0, 330.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
@@ -3016,8 +3126,8 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 330.0, 30.0, &mut emit);
-        deck.touch_down(1, 0, 330.0, 30.0, &mut emit);
+        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(1, 0, 330.0, 30.0, &mut emit, &mut |_| {});
         deck.touch_motion(0, 2000.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(1, &mut emit);
         assert!(!deck.current().buttons[0].1.active);
@@ -3036,7 +3146,7 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 330.0, 30.0, &mut emit);
+        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {});
         assert!(!deck.switch_named("missing", &mut emit));
         assert_eq!(deck.active, deck.home);
         assert_eq!(deck.touches.len(), 1);
@@ -3089,9 +3199,15 @@ mod tests {
         let mut deck = volume_deck();
         let mut events = Vec::new();
         assert!(!deck.volume.active);
-        assert!(!deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |k, a| {
-            events.push((k.to_vec(), a))
-        }));
+        assert!(!deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut |k, a| { events.push((k.to_vec(), a)) },
+            &mut |_| {}
+        ));
         assert!(deck.volume.active);
         assert_eq!(deck.volume.level, VOLUME_INITIAL_LEVEL + 1);
         assert_eq!(deck.volume.region, Some((0, 2)));
@@ -3104,9 +3220,15 @@ mod tests {
         // Once drawn, the slider owns the same spot: the press lands on
         // the track and jumps to the touched level (1260px -> 13) instead
         // of stepping, with whole key taps driving the change.
-        assert!(!deck.touch_down_at(1, 1260.0, 30.0, 2008, 60, &mut |k, a| {
-            events.push((k.to_vec(), a))
-        }));
+        assert!(!deck.touch_down_at(
+            1,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut |k, a| { events.push((k.to_vec(), a)) },
+            &mut |_| {}
+        ));
         assert_eq!(deck.volume.level, 13);
         assert!(deck.volume.drag.is_some());
         deck.touch_up(1, &mut |_, _| {});
@@ -3114,9 +3236,15 @@ mod tests {
         assert!(events.iter().all(|(keys, _)| keys == &vec![Key::VolumeUp]));
         events.clear();
         // A press at the other end of the cluster jumps low: 200px -> 2.
-        assert!(!deck.touch_down_at(2, 200.0, 30.0, 2008, 60, &mut |k, a| {
-            events.push((k.to_vec(), a))
-        }));
+        assert!(!deck.touch_down_at(
+            2,
+            200.0,
+            30.0,
+            2008,
+            60,
+            &mut |k, a| { events.push((k.to_vec(), a)) },
+            &mut |_| {}
+        ));
         assert_eq!(deck.volume.level, 2);
         deck.touch_up(2, &mut |_, _| {});
         assert!(events
@@ -3127,7 +3255,7 @@ mod tests {
     #[test]
     fn the_drawn_slider_grabs_touches_on_its_covered_buttons() {
         let mut deck = volume_deck();
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {});
+        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert!(deck.volume.active);
         // 751px is the middle of the covered Mute button, not a gap.
@@ -3135,9 +3263,15 @@ mod tests {
         // The slider owns the touch anyway: it jumps to the touched level
         // without pressing the button or emitting its key.
         let mut events = Vec::new();
-        assert!(!deck.touch_down_at(1, 751.0, 30.0, 2008, 60, &mut |k, a| {
-            events.push((k.to_vec(), a))
-        }));
+        assert!(!deck.touch_down_at(
+            1,
+            751.0,
+            30.0,
+            2008,
+            60,
+            &mut |k, a| { events.push((k.to_vec(), a)) },
+            &mut |_| {}
+        ));
         assert_eq!(deck.volume.level, 8);
         assert!(deck.volume.drag.is_some());
         deck.touch_up(1, &mut |_, _| {});
@@ -3153,7 +3287,7 @@ mod tests {
     #[test]
     fn the_mute_affordance_taps_to_toggle_and_still_drags() {
         let mut deck = volume_deck();
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {});
+        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert!(deck.volume.active);
         assert!(!deck.volume.muted);
@@ -3161,7 +3295,7 @@ mod tests {
         // A tap on the speaker icon toggles mute, emits the key pair, and
         // keeps the slider up without jumping the level.
         let mut events = Vec::new();
-        assert!(!deck.touch_down_at(1, 10.0, 30.0, 2008, 60, &mut |_, _| {}));
+        assert!(!deck.touch_down_at(1, 10.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {}));
         assert!(deck
             .volume
             .drag
@@ -3177,7 +3311,7 @@ mod tests {
         );
 
         // Jitter under the threshold stays a pending mute tap.
-        assert!(!deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut |_, _| {}));
+        assert!(!deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {}));
         assert!(deck.volume_drag_motion(2, 14.0, 31.0, 2008, &mut |_, _| {}));
         assert!(deck
             .volume
@@ -3213,7 +3347,14 @@ mod tests {
     fn slider_touches_drag_right_away_and_emit_step_taps() {
         let mut deck = volume_deck();
         let mut events = Vec::new();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |k, a| events.push((k.to_vec(), a))); // summon at level 9
+        deck.touch_down(
+            0,
+            2,
+            1260.0,
+            30.0,
+            &mut |k, a| events.push((k.to_vec(), a)),
+            &mut |_| {},
+        ); // summon at level 9
         deck.touch_up(0, &mut |_, _| {});
         events.clear();
 
@@ -3257,7 +3398,14 @@ mod tests {
     fn a_volume_press_converts_to_a_drag_and_releases_the_held_key() {
         let mut deck = volume_deck();
         let mut events = Vec::new();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |k, a| events.push((k.to_vec(), a))); // VolumeUp held, level 9
+        deck.touch_down(
+            0,
+            2,
+            1260.0,
+            30.0,
+            &mut |k, a| events.push((k.to_vec(), a)),
+            &mut |_| {},
+        ); // VolumeUp held, level 9
         events.clear();
 
         // A jitter under the threshold stays a press; the key stays held.
@@ -3286,7 +3434,14 @@ mod tests {
     fn mute_toggles_the_displayed_state_and_volume_or_drag_clears_it() {
         let mut deck = volume_deck();
         let mut events = Vec::new();
-        deck.touch_down(0, 1, 750.0, 30.0, &mut |k, a| events.push((k.to_vec(), a)));
+        deck.touch_down(
+            0,
+            1,
+            750.0,
+            30.0,
+            &mut |k, a| events.push((k.to_vec(), a)),
+            &mut |_| {},
+        );
         assert!(deck.volume.active); // tapping mute can summon it too
         assert!(deck.volume.muted);
         deck.touch_up(0, &mut |k, a| events.push((k.to_vec(), a)));
@@ -3299,12 +3454,12 @@ mod tests {
         assert_eq!((shown.first, shown.last), (0, 2));
 
         // A volume press clears the muted display, as the desktop does.
-        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {});
+        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {}, &mut |_| {});
         assert!(!deck.volume.muted);
         deck.touch_up(1, &mut |_, _| {});
 
         // Muting again shows muted; dragging clears it once more.
-        deck.touch_down(2, 1, 750.0, 30.0, &mut |_, _| {});
+        deck.touch_down(2, 1, 750.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(2, &mut |_, _| {});
         assert!(deck.volume.muted);
         assert!(deck.volume_drag_start(3, 751.0, 30.0, 2008, 60, &mut |_, _| {}));
@@ -3314,7 +3469,7 @@ mod tests {
     #[test]
     fn the_slider_collapses_after_a_lull_and_interaction_resets_the_timer() {
         let mut deck = volume_deck();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         let deadline = deck.volume.deadline.unwrap();
 
@@ -3326,7 +3481,7 @@ mod tests {
             .is_some());
 
         // A fresh press restarts the clock.
-        deck.touch_down(1, 2, 1260.0, 30.0, &mut |_, _| {});
+        deck.touch_down(1, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(1, &mut |_, _| {});
         assert!(deck.volume.deadline.unwrap() > deadline);
 
@@ -3347,7 +3502,7 @@ mod tests {
         let mut deck = volume_deck();
         // The summoning press stays held: the key is down and the slider
         // must not collapse under the finger even past the deadline.
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         let deadline = deck.volume.deadline.unwrap();
         assert!(!deck.volume_refresh(deadline + Duration::from_secs(10)));
         assert!(deck.volume.active);
@@ -3357,7 +3512,7 @@ mod tests {
             None
         );
         // A still-held second-finger press on the cluster holds it too.
-        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {});
+        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert!(!deck.volume_refresh(deadline + Duration::from_secs(20)));
         assert!(deck.volume.active);
@@ -3401,7 +3556,7 @@ mod tests {
         let home_image = surface.data().unwrap().to_vec();
 
         // Pressing volume up summons the slider over the whole cluster.
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         let volume = deck.volume_render();
         deck.current_mut().draw(
@@ -3475,7 +3630,7 @@ mod tests {
 
         // The cluster spans the whole bar, so the slider's edges touch the
         // framebuffer borders; its dirty clips must still fit inside them.
-        deck.touch_down(0, 2, 1800.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 2, 1800.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         let volume = deck.volume_render().unwrap();
         assert_eq!((volume.first, volume.last), (0, 2));
@@ -3543,7 +3698,7 @@ mod tests {
         let home_image = surface.data().unwrap().to_vec();
 
         // Summon on the first cluster: its span is drawn over.
-        deck.touch_down(0, 0, 100.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert_eq!(deck.volume.region, Some((0, 2)));
         let volume = deck.volume_render();
@@ -3557,7 +3712,7 @@ mod tests {
         );
 
         // Pressing the second, separated cluster moves the slider there.
-        deck.touch_down(1, 4, 1500.0, 30.0, &mut |_, _| {});
+        deck.touch_down(1, 4, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(1, &mut |_, _| {});
         assert_eq!(deck.volume.region, Some((4, 5)));
         let volume = deck.volume_render();
@@ -3580,30 +3735,30 @@ mod tests {
     #[test]
     fn layer_changes_and_input_release_end_the_slider_and_only_home_summons_it() {
         let mut deck = volume_deck();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert!(deck.volume.active);
 
         // Navigating away collapses it...
-        assert!(deck.touch_down(1, 3, 1750.0, 30.0, &mut |_, _| {}));
+        assert!(deck.touch_down(1, 3, 1750.0, 30.0, &mut |_, _| {}, &mut |_| {}));
         assert_eq!(deck.active, 1);
         assert!(!deck.volume.active);
 
         // ...and volume buttons on other layers never summon it.
-        deck.touch_down(2, 1, 1500.0, 30.0, &mut |_, _| {});
+        deck.touch_down(2, 1, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(2, &mut |_, _| {});
         assert!(!deck.volume.active);
         assert!(!deck.volume_drag_start(3, 700.0, 30.0, 2008, 60, &mut |_, _| {}));
 
         // Back home it summons again; a reload replaces it with a fresh deck.
-        assert!(deck.touch_down(4, 0, 100.0, 30.0, &mut |_, _| {}));
+        assert!(deck.touch_down(4, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
         assert_eq!(deck.active, deck.home);
         deck.replace(volume_deck(), &mut |_, _| {});
         assert!(!deck.volume.active);
 
         // Summoning once more, input release (cancel, display sleep, device
         // removal) collapses it and drops any drag.
-        deck.touch_down(5, 2, 1260.0, 30.0, &mut |_, _| {});
+        deck.touch_down(5, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_motion(5, 1280.0, 30.0, 2008, 60, &mut |_, _| {});
         assert!(deck.volume.drag.is_some());
         deck.release_all(&mut |_, _| {});
@@ -3615,7 +3770,14 @@ mod tests {
     fn a_cancelled_drag_leaves_every_key_released() {
         let mut deck = volume_deck();
         let mut events = Vec::new();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |k, a| events.push((k.to_vec(), a)));
+        deck.touch_down(
+            0,
+            2,
+            1260.0,
+            30.0,
+            &mut |k, a| events.push((k.to_vec(), a)),
+            &mut |_| {},
+        );
         deck.touch_motion(0, 1300.0, 30.0, 2008, 60, &mut |k, a| {
             events.push((k.to_vec(), a))
         }); // convert to drag
@@ -3665,7 +3827,7 @@ mod tests {
         assert_eq!(deck.active, deck.home);
 
         // Summon the slider on the media home bar.
-        assert!(!deck.touch_down_at(0, 1400.0, 30.0, 2008, 60, &mut emit));
+        assert!(!deck.touch_down_at(0, 1400.0, 30.0, 2008, 60, &mut emit, &mut |_| {}));
         deck.touch_up(0, &mut emit);
         assert!(deck.volume.active);
         assert_eq!(deck.volume.region, Some((0, 2)));
@@ -3689,7 +3851,7 @@ mod tests {
     #[test]
     fn decks_without_a_home_volume_cluster_never_summon_a_slider() {
         let mut deck = named_deck();
-        deck.touch_down(0, 0, 330.0, 30.0, &mut |_, _| {});
+        deck.touch_down(0, 0, 330.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         assert!(!deck.volume.active);
         assert!(!deck.volume_drag_start(1, 500.0, 30.0, 2008, 60, &mut |_, _| {}));
