@@ -153,7 +153,7 @@ with - switching layers:
 
 ```toml
 { Text = "Sync", Action = { Command = "my-sync-script" } }
-{ Icon = "mic_off", Action = { Command = "voice-dictate-user start", Layer = "recording" } }
+{ Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } }
 ```
 
 A `Command` action runs the configured string verbatim through `/bin/sh -c`.
