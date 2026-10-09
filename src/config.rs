@@ -161,6 +161,8 @@ pub struct ButtonConfig {
     pub battery: Option<String>,
     pub waveform: Option<bool>,
     pub waveform_style: Option<String>,
+    pub waveform_smoothing: Option<u32>,
+    pub waveform_lag: Option<u32>,
     pub locale: Option<String>,
     #[serde(default)]
     pub action: ButtonAction,

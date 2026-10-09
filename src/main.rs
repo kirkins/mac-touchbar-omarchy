@@ -495,7 +495,13 @@ impl Button {
         } else if let Some(battery_mode) = cfg.battery {
             Button::new_battery(cfg.action, battery_mode, cfg.theme)
         } else if cfg.waveform.unwrap_or(false) {
-            Button::new_waveform(cfg.action, cfg.waveform_style.as_deref(), cfg.accent)
+            Button::new_waveform(
+                cfg.action,
+                cfg.waveform_style.as_deref(),
+                cfg.accent,
+                cfg.waveform_smoothing,
+                cfg.waveform_lag,
+            )
         } else {
             Button::new_spacer()
         };
@@ -611,6 +617,8 @@ impl Button {
         action: ButtonAction,
         style: Option<&str>,
         accent: Option<ButtonAccent>,
+        smoothing: Option<u32>,
+        lag: Option<u32>,
     ) -> Button {
         let style = style.map_or(Style::Line, |value| {
             Style::parse(value)
@@ -620,7 +628,11 @@ impl Button {
             action,
             active: false,
             changed: false,
-            image: ButtonImage::Waveform(WaveformWidget::new(style).with_accent(accent)),
+            image: ButtonImage::Waveform(
+                WaveformWidget::new(style)
+                    .with_accent(accent)
+                    .with_motion(smoothing, lag),
+            ),
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,

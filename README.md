@@ -244,6 +244,17 @@ reported by the receiver; it does not confirm transcription success. Owners
 who prefer the previous look can set `WaveformStyle = "bars"` on the button
 to keep the scrolling bar graph instead of the line.
 
+The line's motion feel is tunable per button with two optional keys. By
+default the drawn level follows the measurement directly, which is accurate
+but can read as twitchy; `WaveformSmoothing = 240` switches on a render-side
+envelope that rises fast (a third of the value) so speech visibly climbs
+without delay and glides back down over the configured milliseconds - the
+calm 150-300 ms class. `WaveformLag = 80` holds each sample out of the graph
+for that many milliseconds (capped at 500) in exchange for steadiness. Both
+keys leave the level feed untouched - freshness is unchanged; the smoothing
+and lag shape only what is drawn, e.g.
+`{ Waveform = true, Stretch = 3, WaveformSmoothing = 240, WaveformLag = 80 }`.
+
 While that layer is displayed, the daemon polls a second abstract socket,
 `dfr-voice-level-1000`, exposed by the same optional voice receiver: the
 receiver passively tails the raw capture file its recorder is already

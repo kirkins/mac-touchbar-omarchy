@@ -54,7 +54,10 @@ Keys = [
 # timer counting from entering the layer, all driven by the optional
 # desktop-session level feed (see README; without it the widget shows a calm
 # idle baseline and the timer). Set WaveformStyle = "bars" on the button to
-# keep the previous scrolling bar graph instead of the line.
+# keep the previous scrolling bar graph instead of the line, and calm the
+# line's motion with WaveformSmoothing (ms decay, attack a third of it) and
+# WaveformLag (ms of visual delay, capped at 500), e.g.
+# { Waveform = true, Stretch = 3, WaveformSmoothing = 240, WaveformLag = 80 }.
 # Stop keeps the recording and types the transcript into the focused
 # window, Cancel discards a mis-start; both run their command and return
 # home. Install the optional integrations/voice client and desktop-session
@@ -64,7 +67,7 @@ Keys = [
 Name = "recording"
 Keys = [
     { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
-    { Waveform = true, Accent = "blue", Stretch = 3 },
+    { Waveform = true, Accent = "blue", Stretch = 3, WaveformSmoothing = 240, WaveformLag = 80 },
     { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
 ]
 

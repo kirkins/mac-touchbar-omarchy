@@ -28,6 +28,7 @@
 use crate::appearance::ButtonAccent;
 use cairo::{Context, LineCap, LineJoin};
 use std::{
+    collections::VecDeque,
     io::{self, Read, Write},
     net::Shutdown,
     os::{
@@ -90,6 +91,70 @@ const BAR_GAP: f64 = 2.0;
 const PULSE_TAU_MS: f32 = 98.0;
 /// Repaint for the pulse alone only when it moved this much.
 const PULSE_EPSILON: f32 = 0.25;
+/// Upper bound for the optional visual lag, in milliseconds: a lag past
+/// half a second would read as broken rather than calm.
+const LAG_MAX_MS: u64 = 500;
+
+/// Render-side motion feel for the waveform's level envelope: an
+/// asymmetric attack/release smoothing time constant plus an optional
+/// visual lag. The level feed itself is untouched - samples land at the
+/// poll cadence with full freshness - and every value here is applied to
+/// what the widget draws, never to what it measures. With both knobs
+/// zero (the default when the config omits them) smoothing passes the
+/// measured level straight through and the lag buffer empties
+/// immediately, which is exactly the pre-existing behavior.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motion {
+    /// Rise time constant, milliseconds: kept a fraction of the release so
+    /// speaking visibly climbs without delay.
+    attack_ms: f64,
+    /// Decay time constant, milliseconds: the glide back down.
+    release_ms: f64,
+    /// How long a measured sample waits before it moves the graph.
+    lag: Duration,
+}
+
+impl Motion {
+    /// A calm envelope: release of `smoothing_ms` (clamped to the
+    /// 150-300 ms class when configured sanely), attack at a third of it,
+    /// and a visual lag of `lag_ms` clamped to [`LAG_MAX_MS`].
+    pub fn new(smoothing_ms: u32, lag_ms: u32) -> Self {
+        let release_ms = f64::from(smoothing_ms);
+        Self {
+            // A real attack needs some slew; floor it at one period.
+            attack_ms: (release_ms / 3.0).max(f64::from(SAMPLE_PERIOD.as_millis() as u32)),
+            release_ms,
+            lag: Duration::from_millis(u64::from(lag_ms).min(LAG_MAX_MS)),
+        }
+    }
+
+    /// No smoothing, no lag: the behavior shipped before the knobs existed.
+    pub fn raw() -> Self {
+        Self {
+            attack_ms: 0.0,
+            release_ms: 0.0,
+            lag: Duration::ZERO,
+        }
+    }
+
+    /// One sampled step of the envelope: move `current` toward `target`
+    /// by the per-period fraction of the relevant time constant - attack
+    /// when rising, release when falling. A zero time constant jumps
+    /// straight to the measurement.
+    fn advance(&self, current: f64, target: f64) -> f64 {
+        let tau = if target > current {
+            self.attack_ms
+        } else {
+            self.release_ms
+        };
+        if tau <= 0.0 {
+            return target;
+        }
+        let period = SAMPLE_PERIOD.as_secs_f64() * 1000.0;
+        let alpha = 1.0 - (-period / tau).exp();
+        current + (target - current) * alpha
+    }
+}
 
 /// Visual style of the live graph: the line is the default; `bars` keeps
 /// the previous scrolling bar graph for owners who prefer it.
@@ -257,12 +322,12 @@ fn catmull_rom(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
 /// the graph flat rather than stepping; right of the newest sample the eased
 /// level holds, so the line's right end rides the measurement exactly where
 /// the previous period's curve ended.
-pub fn envelope_at(history: &LevelHistory, previous_level: u8, phase: f64, s: f64) -> f64 {
+pub fn envelope_at(history: &LevelHistory, previous_level: f64, phase: f64, s: f64) -> f64 {
     let len = history.len();
     if len == 0 || s <= 0.0 {
         return 0.0;
     }
-    let newest = history.newest().unwrap_or(0);
+    let newest = f64::from(history.newest().unwrap_or(0));
     let value = |j: usize| {
         let j = j.min(len - 1);
         if j + 1 == len {
@@ -304,9 +369,9 @@ pub fn wave_offset(layout: &Layout, s: f64, envelope: f64) -> f64 {
 /// period: it rises from the previous sample's level, which is what the
 /// bar showed the instant the previous period ended, so heights stay
 /// continuous across sample boundaries.
-pub fn display_level(previous: u8, current: u8, phase: f64) -> f64 {
+pub fn display_level(previous: f64, current: f64, phase: f64) -> f64 {
     let t = smoothstep(phase);
-    f64::from(previous) + (f64::from(current) - f64::from(previous)) * t
+    previous + (current - previous) * t
 }
 
 /// `m:ss` with unbounded minutes, matching the clock's legibility.
@@ -334,7 +399,13 @@ pub struct WaveformWidget {
     /// When the newest sample landed; drives scroll and height easing.
     last_sample: Option<Instant>,
     /// The level before the newest sample; the newest bar eases from it.
-    previous_level: u8,
+    previous_level: f64,
+    /// The level the motion envelope last displayed.
+    displayed_level: f64,
+    /// Render-side motion feel: smoothing and lag from the button's knobs.
+    motion: Motion,
+    /// Samples waiting out the visual lag, oldest first.
+    pending: VecDeque<(Instant, Sample)>,
     /// When the last frame advanced the animation clock.
     last_frame: Option<Instant>,
 }
@@ -351,9 +422,21 @@ impl WaveformWidget {
             shown_pulse: 0.0,
             shown_second: 0,
             last_sample: None,
-            previous_level: 0,
+            previous_level: 0.0,
+            displayed_level: 0.0,
+            motion: Motion::raw(),
+            pending: VecDeque::new(),
             last_frame: None,
         }
+    }
+
+    /// Take the render-side motion knobs from the button's config.
+    pub fn with_motion(mut self, smoothing_ms: Option<u32>, lag_ms: Option<u32>) -> Self {
+        self.motion = match (smoothing_ms, lag_ms) {
+            (None, None) => Motion::raw(),
+            (smoothing, lag) => Motion::new(smoothing.unwrap_or(0), lag.unwrap_or(0)),
+        };
+        self
     }
 
     /// Begin a fresh session when the widget's layer becomes the displayed
@@ -369,7 +452,9 @@ impl WaveformWidget {
         self.shown_pulse = 0.0;
         self.shown_second = 0;
         self.last_sample = None;
-        self.previous_level = 0;
+        self.previous_level = 0.0;
+        self.displayed_level = 0.0;
+        self.pending.clear();
         self.last_frame = None;
         true
     }
@@ -395,12 +480,39 @@ impl WaveformWidget {
             return false;
         }
         let before = (self.history.newest(), self.live);
-        self.previous_level = self.history.newest().unwrap_or(0);
+        self.pending.push_back((now, sample));
+        self.drain(now);
+        self.history.newest() != before.0 || self.live != before.1
+    }
+
+    /// Release every lagged sample whose wait has elapsed. The lag is
+    /// render-side only: the sample was measured when it arrived; the
+    /// graph simply tells the story a moment later for steadiness.
+    fn drain(&mut self, now: Instant) -> bool {
+        let mut applied = false;
+        while let Some(&(at, sample)) = self.pending.front() {
+            if now.saturating_duration_since(at) < self.motion.lag {
+                break;
+            }
+            self.pending.pop_front();
+            self.apply(sample, at);
+            applied = true;
+        }
+        applied
+    }
+
+    /// Fold one measured sample into the rendered history through the
+    /// motion envelope: the level glides toward the measurement with the
+    /// attack/release time constants before it joins the graph.
+    fn apply(&mut self, sample: Sample, measured_at: Instant) {
+        self.previous_level = self.displayed_level;
         self.live = sample.live;
-        self.history.push(sample.level);
-        self.last_sample = Some(now);
+        self.displayed_level = self
+            .motion
+            .advance(self.displayed_level, f64::from(sample.level));
+        self.history.push(self.displayed_level.round() as u8);
         self.smoothed = f32::from(sample.level).max(self.smoothed);
-        Some(sample.level) != before.0 || sample.live != before.1
+        self.last_sample = Some(measured_at);
     }
 
     /// Advance the animation clock to `now`: decay the dot's pulse with a
@@ -420,9 +532,10 @@ impl WaveformWidget {
         self.last_frame = Some(now);
         self.smoothed *= (-elapsed.as_secs_f32() * 1000.0 / PULSE_TAU_MS).exp();
         let scrolling = self.live && !self.history.is_empty();
+        let lagged = self.drain(now);
         let pulse_settling = (self.smoothed - self.shown_pulse).abs() > PULSE_EPSILON;
         let ticked = self.tick(now);
-        let moved = scrolling || pulse_settling || ticked;
+        let moved = scrolling || lagged || pulse_settling || ticked;
         if moved {
             self.shown_pulse = self.smoothed;
         }
@@ -606,7 +719,7 @@ impl WaveformWidget {
         c.set_source_rgb(1.0, 1.0, 1.0);
         for (i, level) in self.history.oldest_first().enumerate() {
             let level = if i + 1 == len {
-                display_level(self.previous_level, level, phase)
+                display_level(self.previous_level, f64::from(level), phase)
             } else {
                 f64::from(level)
             };
@@ -801,6 +914,77 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn the_motion_envelope_attacks_faster_than_it_releases_and_honors_the_knob() {
+        // Zero knobs pass the measurement straight through, unchanged.
+        let raw = Motion::raw();
+        assert_eq!(raw.advance(20.0, 80.0), 80.0);
+        assert_eq!(raw.advance(80.0, 20.0), 20.0);
+
+        let calm = Motion::new(240, 0);
+        // One 50 ms sample period: rising covers more ground than falling,
+        // because the attack time constant is a third of the release.
+        let rise = calm.advance(20.0, 80.0);
+        let fall = calm.advance(80.0, 20.0);
+        assert!(rise - 20.0 > 80.0 - fall, "attack must outrun release");
+        // The knob is honored: a shorter release closes more of the gap.
+        let brisk = Motion::new(60, 0);
+        assert!(brisk.advance(20.0, 80.0) > rise);
+        // The rise stays fractional for a long time constant, never jumps.
+        assert!(rise < 80.0);
+        // A larger smoothing still moves, just less.
+        assert!(Motion::new(600, 0).advance(20.0, 80.0) < rise);
+    }
+
+    #[test]
+    fn the_lag_buffer_holds_samples_back_and_bounding_arrives_late() {
+        let now = Instant::now();
+        // Absent knobs keep today's behavior: the sample lands immediately.
+        let mut immediate = WaveformWidget::new(Style::Line).with_motion(None, None);
+        immediate.activate(now);
+        assert!(immediate.sample(
+            Sample {
+                level: 70,
+                live: true
+            },
+            now
+        ));
+        assert_eq!(immediate.history().len(), 1);
+
+        // A lag of one sample period holds the sample out of the history
+        // until its wait elapses, then releases it exactly once.
+        let mut wave = WaveformWidget::new(Style::Line).with_motion(Some(0), Some(50));
+        wave.activate(now);
+        assert!(!wave.sample(
+            Sample {
+                level: 70,
+                live: true
+            },
+            now
+        ));
+        assert_eq!(wave.history().len(), 0);
+        assert!(!wave.frame(now + Duration::from_millis(40)));
+        assert_eq!(wave.history().len(), 0);
+        assert!(wave.frame(now + Duration::from_millis(60)));
+        assert_eq!(wave.history().len(), 1);
+
+        // The lag is bounded: past LAG_MAX_MS it can never hold longer,
+        // and a smoothing knob paired with it does not extend the wait.
+        let mut wave = WaveformWidget::new(Style::Line).with_motion(Some(240), Some(u32::MAX));
+        wave.activate(now);
+        assert!(!wave.sample(
+            Sample {
+                level: 70,
+                live: true
+            },
+            now
+        ));
+        // The clamp holds u32::MAX ms of lag to LAG_MAX_MS.
+        let release_at = now + Duration::from_millis(LAG_MAX_MS) + Duration::from_millis(1);
+        assert!(wave.frame(release_at));
+        assert_eq!(wave.history().len(), 1);
+    }
+
     fn address() -> SocketAddr {
         let name = format!(
             "dfr-waveform-level-test-{}-{}",
@@ -903,17 +1087,17 @@ mod tests {
         assert_eq!(smoothstep(0.0), 0.0);
         assert_eq!(smoothstep(1.0), 1.0);
         assert!((smoothstep(0.5) - 0.5).abs() < 1e-9);
-        let mut previous = display_level(20, 80, 0.0);
+        let mut previous = display_level(20.0, 80.0, 0.0);
         for step in 1..=10 {
             let phase = f64::from(step) / 10.0;
-            let level = display_level(20, 80, phase);
+            let level = display_level(20.0, 80.0, phase);
             assert!(level >= previous, "ease must not dip");
             assert!(level <= 80.0);
             previous = level;
         }
-        assert_eq!(display_level(20, 80, 0.0), 20.0);
-        assert_eq!(display_level(20, 80, 1.0), 80.0);
-        assert_eq!(display_level(20, 80, 2.0), 80.0);
+        assert_eq!(display_level(20.0, 80.0, 0.0), 20.0);
+        assert_eq!(display_level(20.0, 80.0, 1.0), 80.0);
+        assert_eq!(display_level(20.0, 80.0, 2.0), 80.0);
 
         // Positions are continuous across a sample boundary: a bar that
         // finished its period at phase 1 sits exactly where its successor
@@ -933,7 +1117,7 @@ mod tests {
 
         // The newest bar's height matches its eased level: it starts at the
         // previous sample's height and ends at its own.
-        let widget_height = |phase| bar_rect(&layout, 0.0, display_level(40, 70, phase)).3;
+        let widget_height = |phase| bar_rect(&layout, 0.0, display_level(40.0, 70.0, phase)).3;
         assert_eq!(widget_height(0.0), bar_rect(&layout, 0.0, 40.0).3);
         assert_eq!(widget_height(1.0), bar_rect(&layout, 0.0, 70.0).3);
         assert!(widget_height(0.5) > widget_height(0.0));
@@ -1007,7 +1191,7 @@ mod tests {
             history.push(0);
         }
         for s in [0.0, 0.5, 12.25, 47.0] {
-            assert_eq!(envelope_at(&history, 0, 0.5, s), 0.0);
+            assert_eq!(envelope_at(&history, 0.0, 0.5, s), 0.0);
         }
         // The curve passes exactly through its samples and stays in range.
         let mut history = LevelHistory::new();
@@ -1016,11 +1200,11 @@ mod tests {
         }
         for (i, level) in [55, 40, 70, 25, 60].into_iter().enumerate() {
             let s = i as f64 + 2.0;
-            assert!((envelope_at(&history, 70, 1.0, s) - f64::from(level)).abs() < 1e-9);
+            assert!((envelope_at(&history, 70.0, 1.0, s) - f64::from(level)).abs() < 1e-9);
         }
         for step in 0..=14 {
             for phase in [0.0, 0.5, 1.0] {
-                let value = envelope_at(&history, 70, phase, f64::from(step) / 2.0);
+                let value = envelope_at(&history, 70.0, phase, f64::from(step) / 2.0);
                 assert!(
                     (0.0..=100.0).contains(&value),
                     "envelope out of range at {}",
@@ -1030,16 +1214,16 @@ mod tests {
         }
         // The data edge fades in over the first slot: no corner where the
         // flat no-data region meets the oldest sample.
-        assert_eq!(envelope_at(&history, 70, 1.0, 0.0), 0.0);
-        assert!(envelope_at(&history, 70, 1.0, 0.5) < 30.0);
+        assert_eq!(envelope_at(&history, 70.0, 1.0, 0.0), 0.0);
+        assert!(envelope_at(&history, 70.0, 1.0, 0.5) < 30.0);
         // Right of the newest sample the eased level holds, so the line's
         // right end rides the measurement: it starts at the previous
         // sample's level and rests at the newest one.
-        assert!((envelope_at(&history, 70, 1.0, 9.0) - 45.0).abs() < 1e-9);
-        assert!((envelope_at(&history, 70, 0.0, 9.0) - 70.0).abs() < 1e-9);
-        assert!((envelope_at(&history, 70, 0.5, 9.0) - 57.5).abs() < 1e-9);
+        assert!((envelope_at(&history, 70.0, 1.0, 9.0) - 45.0).abs() < 1e-9);
+        assert!((envelope_at(&history, 70.0, 0.0, 9.0) - 70.0).abs() < 1e-9);
+        assert!((envelope_at(&history, 70.0, 0.5, 9.0) - 57.5).abs() < 1e-9);
         // An empty history is silence at every index.
-        assert_eq!(envelope_at(&LevelHistory::new(), 80, 0.5, 3.0), 0.0);
+        assert_eq!(envelope_at(&LevelHistory::new(), 80.0, 0.5, 3.0), 0.0);
     }
 
     #[test]

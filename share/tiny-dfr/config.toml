@@ -187,6 +187,9 @@ PrimaryLayerKeys = [
     # rest, rippling into a smooth wave while speaking - with a recording
     # dot and duration timer while dictation runs, on the layer carrying it.
     # Add WaveformStyle = "bars" to keep the previous bar graph instead.
+    # Calm the line's motion with WaveformSmoothing (ms of decay; attack is
+    # a third of it) and WaveformLag (ms of visual delay, capped at 500):
+    # { Waveform = true, Stretch = 3, WaveformSmoothing = 240, WaveformLag = 80 }
     # The daemon polls levels only while that layer is displayed; without
     # the desktop voice receiver it shows a calm idle baseline and the timer.
 
