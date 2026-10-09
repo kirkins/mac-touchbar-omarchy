@@ -29,11 +29,11 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
 ```
 
 Inspect `implemented-home.png`, `implemented-volume-mid.png`,
-`implemented-brightness.png`, and `implemented-recording.png` in that directory,
-plus the per-band frames `implemented-daycycle-morning.png`,
-`implemented-daycycle-day.png`, `implemented-daycycle-evening.png`, and
-`implemented-daycycle-night.png` of the same home bar over each time-of-day
-background.
+`implemented-brightness.png`, `implemented-recording-live.png`, and
+`implemented-recording-idle.png` in that directory, plus the per-band frames
+`implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
+`implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
+the same home bar over each time-of-day background.
 These frames use the configured font and icon search paths; their battery and
 clock display is illustrative and they do not prove physical touch or dictation.
 Running the full test suite with the variable set also exports the pet's
@@ -47,7 +47,11 @@ selection without stepping, combined-region geometry and drag math, safe ranges,
 auto-collapse timing, confirmed readback, failures, stale replies and selection
 isolation), command buttons (parse and
 combined layer dispatch, detached execution, and the one-invocation-per-command
-cap), and the virtual pet (pet-layer wiring and button toggle, wander bounds,
+cap), the recording waveform (level-history ring behavior, bar geometry from
+synthetic levels, incremental button repaints, recording-only fast cadence,
+monotonic duration timer, live/idle rendering, and the level poller's arming,
+reply parsing, and peer-UID boundary against fake receivers), and the virtual
+pet (pet-layer wiring and button toggle, wander bounds,
 pause and resume across layer switches, nap gating and placement, satiety decay
 and feeding, food drops on open ground and walk-to-food bounds, startle, tap
 consumption and hit-test precedence, and reload transitions), and the
@@ -207,20 +211,46 @@ navigation, so a sub-bar whose Stop or Done button returns home through a
 command gets no extra Home button. The [multibar example](share/tiny-dfr/multibar.toml)
 uses this for voice dictation: the home-bar mic button runs
 `voice-dictate-user start` and opens a `recording` layer, which is the visual
-state for the ongoing recording - no dynamic widget is needed. That layer
+state for the ongoing recording. That layer
 holds a `Stop` button (runs `voice-dictate-user stop`, which stops recording and
 types the transcript into whatever window has focus) and a `Cancel` button
 (runs `voice-dictate-user cancel`, discarding a mis-start); both return home. The
-mic button has a bright cyan `Mic` label. A persistent red dot and `Recording`
-label distinguish the recording layer, with a prominent red Stop and quieter
-Cancel. This indicates the selected layer; it does not confirm microphone
-signal, helper startup, or transcription success. The optional private
+mic button has a bright cyan `Mic` label, and the recording layer's middle
+button is the live input waveform described below. The optional private
 [desktop-session integration](integrations/voice/README.md) supplies a client
 and recorder service. It crosses the daemon's unprivileged AF_UNIX boundary
 without changing its privilege drop or network restrictions. Install that
 integration separately; without a receiver these presses still switch layers
 and log the failed command. Check the desktop notification or receiver journal
 to confirm recording started.
+
+### Live recording waveform
+
+A button configured with `{ Waveform = true, Stretch = 3 }` - the middle of
+the multibar example's `recording` layer - replaces the old static
+`● Recording` label with the sound actually coming in: a scrolling bar graph
+of roughly the last two seconds of microphone input levels, a red recording
+dot whose
+pulse follows the live level, and a duration timer counting `m:ss` from
+entering the layer. Re-entering the layer starts the timer and graph fresh.
+This indicates live capture as reported by the receiver; it does not confirm
+transcription success.
+
+While that layer is displayed, the daemon polls a second abstract socket,
+`dfr-voice-level-1000`, exposed by the same optional voice receiver: the
+receiver passively tails the raw capture file its recorder is already
+writing and answers each `get` with the latest 0-100 input peak (`ok <n>`) or
+`idle` when no recording is active. Dictation mechanics, audio routing, and
+the receiver's existing `start`/`stop`/`cancel` behavior are unchanged. The
+daemon verifies the receiver's kernel peer UID like the volume and brightness
+receivers, and a missing, rejecting, or garbling receiver simply shows the
+widget's idle look - a dim dot, flat baseline, and the timer - never a fake
+signal.
+
+The repaint cadence stays bounded: the poller is armed only while the
+recording layer is displayed and repaints just that button's column at the
+20 Hz poll rate; every other layer keeps its existing redraws, and a silent
+feed repaints nothing but the once-a-second timer tick.
 
 ## Time-of-day background
 

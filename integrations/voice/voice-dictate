@@ -2,6 +2,7 @@
 """Desktop-session recorder and narrow Touch Bar Unix-socket receiver."""
 
 import argparse
+import array
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import tomllib
 import wave
 
 ACTIONS = frozenset(("start", "stop", "cancel"))
+LEVEL_GAIN = 160
 
 
 class VoiceError(Exception):
@@ -46,6 +48,68 @@ def audio_source():
     return name
 
 
+class LevelFeed:
+    """Tails the active capture file and publishes its latest input level.
+
+    The recorder already writes plain s16le PCM to one file per recording;
+    this passive reader folds newly captured samples into a 0-100 peak
+    level for the Touch Bar's waveform. It never touches the recorder, its
+    file descriptors, or the dictation flow, and forgets the path as soon
+    as capture finishes.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.path = None
+        self.offset = 0
+        self.level = 0
+        self.grown = None
+
+    def start(self, path):
+        with self.lock:
+            self.path = Path(path)
+            self.offset = 0
+            self.level = 0
+            self.grown = time.monotonic()
+
+    def stop(self):
+        with self.lock:
+            self.path = None
+
+    def level_now(self):
+        """Latest capture level, or None when no recording is active."""
+        with self.lock:
+            path, offset = self.path, self.offset
+        if path is None:
+            return None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        if size > offset:
+            try:
+                with open(path, "rb") as capture:
+                    capture.seek(offset)
+                    data = capture.read(min(size - offset, 1 << 16))
+            except OSError:
+                return None
+            even = len(data) & ~1
+            if even:
+                samples = array.array("h")
+                samples.frombytes(data[:even])
+                peak = max(abs(min(samples)), abs(max(samples)))
+                with self.lock:
+                    self.offset = offset + even
+                    self.level = min(100, peak * LEVEL_GAIN // 32768)
+                    self.grown = time.monotonic()
+        with self.lock:
+            if self.path is None or self.path != path:
+                return None
+            if time.monotonic() - (self.grown or 0) > 2.0:
+                return 0
+            return self.level
+
+
 class Dictation:
     def __init__(self, state_dir=None, credential_path=None):
         self.state_dir = Path(state_dir or Path(os.environ["XDG_RUNTIME_DIR"]) / "voice-dictate")
@@ -54,6 +118,7 @@ class Dictation:
         self.recording = None
         self.recorder = None
         self.output = None
+        self.levels = LevelFeed()
 
     def dispatch(self, action):
         if action not in ACTIONS:
@@ -85,9 +150,11 @@ class Dictation:
         except (OSError, VoiceError):
             self.discard()
             raise
+        self.levels.start(raw)
         notify("Recording… press Stop to transcribe, or Cancel to discard")
 
     def finish_capture(self):
+        self.levels.stop()
         if self.recorder is not None:
             if self.recorder.poll() is None:
                 self.recorder.terminate()
@@ -242,6 +309,45 @@ class Receiver:
                 threading.Thread(target=worker, args=(connection,), daemon=True).start()
 
 
+def handle_level(connection, feed, allowed_uids):
+    with connection:
+        connection.settimeout(2)
+        try:
+            _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid not in allowed_uids:
+                raise VoiceError("Caller UID is not permitted")
+            request = bytearray()
+            while len(request) < 32:
+                chunk = connection.recv(33 - len(request))
+                if not chunk:
+                    break
+                request.extend(chunk)
+            if request.decode("ascii", "replace").strip() != "get":
+                raise VoiceError("Invalid level request")
+            level = feed.level_now()
+            reply = "idle" if level is None else f"ok {level}"
+        except (VoiceError, OSError, ValueError) as error:
+            print(str(error), file=sys.stderr, flush=True)
+            reply = "error"
+        try:
+            connection.sendall(reply.encode("ascii"))
+        except OSError:
+            pass
+
+
+def serve_levels(feed, address=None, allowed_uids=None):
+    """Serve one-shot level `get` requests beside the action receiver."""
+    address = address or "\0dfr-voice-level-" + str(os.getuid())
+    allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(address)
+        listener.listen(4)
+        print("Voice level receiver ready", flush=True)
+        while True:
+            connection, _ = listener.accept()
+            threading.Thread(target=handle_level, args=(connection, feed, allowed_uids), daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("serve", "transcribe-file"))
@@ -259,6 +365,7 @@ def main():
         return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
+        threading.Thread(target=serve_levels, args=(engine.levels,), daemon=True).start()
         Receiver(engine.dispatch).serve()
     finally:
         engine.discard()

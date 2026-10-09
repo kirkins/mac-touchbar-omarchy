@@ -48,7 +48,12 @@ Keys = [
 
 # Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
 # opens this recording layer in one press; the layer itself is the visual
-# state. Stop keeps the recording and types the transcript into the focused
+# state. The middle Waveform button shows the sound actually coming in: a
+# scrolling bar graph of recent microphone input levels, a recording dot
+# that pulses with live level, and a duration timer counting from entering
+# the layer, all driven by the optional desktop-session level feed (see
+# README; without it the widget shows a calm idle baseline and the timer).
+# Stop keeps the recording and types the transcript into the focused
 # window, Cancel discards a mis-start; both run their command and return
 # home. Install the optional integrations/voice client and desktop-session
 # service separately (see README); without the receiver these presses still
@@ -57,7 +62,7 @@ Keys = [
 Name = "recording"
 Keys = [
     { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
-    { Text = "● Recording", Accent = "red", Stretch = 3 },
+    { Waveform = true, Accent = "red", Stretch = 3 },
     { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
 ]
 

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -100,7 +101,10 @@ class DictationTests(unittest.TestCase):
         self.assertEqual(len(self.calls("pw-cat")), 1)
         args = self.calls("pw-cat")[0]
         self.assertEqual(args[args.index("--target") + 1], "effect_output.builtin-mic")
+        # The capture file is also published to the passive level feed.
+        self.assertIsNotNone(self.engine.levels.path)
         self.engine.dispatch("stop")
+        self.assertIsNone(self.engine.levels.path)
         self.assertEqual(self.calls("wtype"), [["--", "Synthetic fixture transcript."]])
         self.assertEqual((self.root / "auth-mode").read_text(), "0o600")
         self.assertEqual(list(self.engine.state_dir.iterdir()), [])
@@ -110,6 +114,7 @@ class DictationTests(unittest.TestCase):
         recorder = self.engine.recorder
         self.engine.dispatch("cancel")
         self.assertIsNotNone(recorder.poll())
+        self.assertIsNone(self.engine.levels.path)
         self.engine.dispatch("stop")
         self.assertEqual(self.calls("curl"), [])
         self.assertEqual(self.calls("wtype"), [])
@@ -258,6 +263,128 @@ client.request('start', os.getuid(), '\\0' + sys.argv[2])
                                  "start;echo unsafe"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid choice", result.stderr)
+
+
+class LevelFeedTests(unittest.TestCase):
+    """The passive capture-level reader: synthetic PCM, no microphone."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.feed = voice.LevelFeed()
+
+    def tearDown(self):
+        self.feed.stop()
+        self.temporary.cleanup()
+
+    def capture(self, chunk):
+        with (self.root / "audio.raw").open("ab") as raw:
+            raw.write(chunk)
+        return self.root / "audio.raw"
+
+    def test_no_active_recording_reports_idle(self):
+        self.assertIsNone(self.feed.level_now())
+        self.feed.start(self.capture(b"\x00\x10" * 10))
+        self.feed.stop()
+        self.assertIsNone(self.feed.level_now())
+        self.feed.start(self.root / "never-created.raw")
+        self.assertIsNone(self.feed.level_now())
+
+    def test_levels_follow_capture_peaks_of_new_samples_only(self):
+        self.feed.start(self.capture(b""))
+        full = struct.pack("<h", 32767) * 4 + struct.pack("<h", -32767) * 4
+        self.capture(full)
+        self.assertEqual(self.feed.level_now(), 100)
+        # The loud chunk is consumed; appended silence reads as silence.
+        self.capture(b"\x00\x00" * 8)
+        self.assertEqual(self.feed.level_now(), 0)
+        quarter = struct.pack("<h", 8192) + struct.pack("<h", -8192)
+        self.capture(quarter)
+        self.assertEqual(self.feed.level_now(), 40)
+        # A lone trailing byte waits for its pair instead of shifting samples.
+        self.capture(b"\x10")
+        self.assertEqual(self.feed.level_now(), 40)
+        self.capture(b"\x00")
+        self.assertEqual(self.feed.level_now(), 0)
+
+    def test_stalled_capture_reports_silence_not_a_frozen_bar(self):
+        self.feed.start(self.capture(b""))
+        self.capture(struct.pack("<h", 20000) * 4)
+        self.assertEqual(self.feed.level_now(), 97)
+        self.feed.grown = time.monotonic() - 3.0
+        self.assertEqual(self.feed.level_now(), 0)
+
+
+class LevelServerTests(unittest.TestCase):
+    """The level endpoint beside the action receiver: real AF_UNIX only."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.address = "\0dfr-voice-level-test-" + str(os.getpid()) + "-" + str(time.monotonic_ns())
+        self.feed = voice.LevelFeed()
+        self.server = threading.Thread(
+            target=voice.serve_levels,
+            args=(self.feed, self.address, {os.getuid(), 65534}),
+            daemon=True,
+        )
+        self.server.start()
+
+    def tearDown(self):
+        self.feed.stop()
+        self.temporary.cleanup()
+
+    def request_level(self, payload=b"get"):
+        for _ in range(100):
+            try:
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(5)
+                connection.connect(self.address)
+                break
+            except OSError:
+                connection.close()
+                time.sleep(0.02)
+        else:
+            raise AssertionError("level receiver never came up")
+        with connection:
+            _, uid, _ = struct.unpack(
+                "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            self.assertEqual(uid, os.getuid())
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            return connection.recv(64).decode("ascii")
+
+    def test_serves_idle_levels_and_rejects_other_requests(self):
+        self.assertEqual(self.request_level(), "idle")
+        path = self.root / "audio.raw"
+        path.write_bytes(struct.pack("<h", 32767) * 8)
+        self.feed.start(path)
+        self.assertEqual(self.request_level(), "ok 100")
+        self.assertEqual(self.request_level(b"set 5"), "error")
+        self.feed.stop()
+        self.assertEqual(self.request_level(), "idle")
+
+    def test_peer_uid_is_enforced(self):
+        address = self.address + "-strict"
+        feed = voice.LevelFeed()
+        threading.Thread(
+            target=voice.serve_levels, args=(feed, address, {os.getuid() + 1}), daemon=True
+        ).start()
+        for _ in range(100):
+            try:
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(5)
+                connection.connect(address)
+                break
+            except OSError:
+                connection.close()
+                time.sleep(0.02)
+        else:
+            raise AssertionError("level receiver never came up")
+        with connection:
+            connection.sendall(b"get")
+            connection.shutdown(socket.SHUT_WR)
+            self.assertEqual(connection.recv(64).decode("ascii"), "error")
 
 
 if __name__ == "__main__":

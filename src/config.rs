@@ -159,6 +159,7 @@ pub struct ButtonConfig {
     pub theme: Option<String>,
     pub time: Option<String>,
     pub battery: Option<String>,
+    pub waveform: Option<bool>,
     pub locale: Option<String>,
     #[serde(default)]
     pub action: ButtonAction,
@@ -655,6 +656,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::time::{Duration, Instant};
 
     const BASE: &str = include_str!("../share/tiny-dfr/config.toml");
     const NAMED: &str = r#"
@@ -892,7 +894,26 @@ Keys = [{ Text = "F1", Action = "F1" }]
         // Mic stays reachable while the brightness overlay is still open.
         tap(&mut deck, "Mic", &mut commands);
         assert_eq!(deck.active, deck.names["recording"]);
-        render(&mut deck, "implemented-recording.png");
+        // The waveform widget shows live levels and its duration timer while
+        // this layer is displayed; entering starts the session.
+        let mut feed_now = Instant::now();
+        let (activated, _) = deck.waveform_tick(None, feed_now);
+        assert!(activated);
+        for level in [
+            8, 24, 12, 40, 66, 88, 35, 19, 57, 74, 28, 90, 46, 61, 33, 15, 52, 70,
+        ] {
+            feed_now += Duration::from_millis(50);
+            deck.waveform_tick(Some(crate::MicSample { level, live: true }), feed_now);
+        }
+        feed_now += Duration::from_secs(73);
+        deck.waveform_tick(None, feed_now);
+        render(&mut deck, "implemented-recording-live.png");
+        // Without the desktop level feed the widget keeps its idle look.
+        for _ in 0..4 {
+            feed_now += Duration::from_millis(50);
+            deck.waveform_tick(Some(crate::MicSample::default()), feed_now);
+        }
+        render(&mut deck, "implemented-recording-idle.png");
         tap(&mut deck, "Stop", &mut commands);
         assert_eq!(deck.active, deck.home);
         tap(&mut deck, "Mic", &mut commands);
@@ -1046,6 +1067,10 @@ DoublePressSwitchLayers = 200
                 layer: "home".into()
             }
         );
+        // The middle button is the live input-level waveform widget.
+        assert_eq!(recording.keys[1].waveform, Some(true));
+        assert!(recording.keys[1].text.is_none());
+        assert_eq!(recording.keys[1].stretch, Some(3));
         assert_eq!(
             recording.keys[2].action,
             ButtonAction::CommandLayer {

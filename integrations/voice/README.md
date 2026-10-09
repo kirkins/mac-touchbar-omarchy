@@ -21,6 +21,18 @@ private mount namespace without making the desktop runtime directory public.
 The daemon keeps its internal privilege drop, `NoNewPrivileges`, and AF_UNIX /
 AF_NETLINK restriction. Neither `runuser` nor a privileged launcher is involved.
 
+The same service also binds a second abstract socket, `dfr-voice-level-<desktop
+UID>`, for the Touch Bar's live recording waveform. Each one-shot `get` request
+returns the latest 0-100 input peak of the ongoing capture (`ok <n>`) or `idle`
+when no recording is active; anything else is rejected with `error`. The level
+reader passively tails the raw capture file the recorder is already writing,
+under the same `SO_PEERCRED` boundary, and never touches the recorder, its file
+descriptors, or the dictation flow; capture finishing forgets the path at once.
+A capture that stops growing for two seconds reports silence so a stalled bar
+cannot freeze loud. The daemon polls this endpoint only while its recording
+layer is displayed. Updating the installed helper and user service is enough
+to enable it; no new unit or permission is involved.
+
 ## Install
 
 Before replacing an existing helper, launcher, or voice-specific drop-in, keep
@@ -69,6 +81,7 @@ mic differs from the session default, add an `Environment=VOICE_DICTATE_SOURCE=<
 override to this user unit and restart only the voice service. Verify actual
 signal before declaring a source working. Start requires capture bytes within
 three seconds; it does not establish audible speech or transcription quality.
+The level feed reports capture peaks, not audibility or transcription quality.
 
 ## Verification
 

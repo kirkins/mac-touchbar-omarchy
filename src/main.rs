@@ -55,6 +55,7 @@ mod level_control;
 mod pet;
 mod pixel_shift;
 mod slider;
+mod waveform;
 
 use crate::config::ConfigManager;
 use appearance::ButtonAccent;
@@ -70,6 +71,7 @@ use level_control::{LevelControl, State as LevelState};
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use slider::{Geometry, Kind, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
+use waveform::{MicLevels, Sample as MicSample, WaveformWidget};
 
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
@@ -278,6 +280,7 @@ enum ButtonImage {
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryWidget, BatteryIconMode, BatteryImages),
+    Waveform(WaveformWidget),
     Spacer,
 }
 
@@ -491,6 +494,8 @@ impl Button {
             Button::new_time(cfg.action, &time, cfg.locale.as_deref())
         } else if let Some(battery_mode) = cfg.battery {
             Button::new_battery(cfg.action, battery_mode, cfg.theme)
+        } else if cfg.waveform.unwrap_or(false) {
+            Button::new_waveform(cfg.action)
         } else {
             Button::new_spacer()
         };
@@ -596,6 +601,18 @@ impl Button {
                     charging,
                 },
             ),
+            icon_width: 0.0,
+            icon_height: 0.0,
+            accent: None,
+        }
+    }
+
+    fn new_waveform(action: ButtonAction) -> Button {
+        Button {
+            action,
+            active: false,
+            changed: false,
+            image: ButtonImage::Waveform(WaveformWidget::new()),
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
@@ -809,6 +826,9 @@ impl Button {
                 }
                 c.restore().unwrap();
             }
+            ButtonImage::Waveform(wave) => {
+                wave.render(c, height, button_left_edge, button_width as f64, y_shift);
+            }
             ButtonImage::Spacer => (),
         }
     }
@@ -861,6 +881,9 @@ pub struct FunctionLayer {
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
+    // The button index of the live microphone waveform widget, if this
+    // layer carries one; it owns the fast repaint cadence while displayed.
+    waveform: Option<usize>,
     // The shared region the last draw covered with the slider, so a
     // later draw without it can erase and repaint the whole region.
     slider_region_drawn: Option<(usize, usize)>,
@@ -888,11 +911,15 @@ impl FunctionLayer {
             })
             .collect::<Vec<_>>();
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
+        let waveform = buttons
+            .iter()
+            .position(|(_, b)| matches!(b.image, ButtonImage::Waveform(_)));
         FunctionLayer {
             displays_time,
             buttons,
             virtual_button_count,
             faster_refresh,
+            waveform,
             slider_region_drawn: None,
         }
     }
@@ -1254,6 +1281,46 @@ impl LayerDeck {
     /// and animates only there.
     fn pet_active(&self) -> bool {
         self.pet_layer == Some(self.active)
+    }
+
+    /// Whether the displayed layer carries the live microphone waveform;
+    /// this is the recording layer, and only it arms the level poller.
+    fn waveform_active(&self) -> bool {
+        self.current().waveform.is_some()
+    }
+
+    /// Feed one microphone level sample, when the poller produced one, and
+    /// the shared clock into the displayed layer's waveform widget.
+    /// Returns whether the bar needs an incremental repaint of that button
+    /// and the epoll timeout until the duration timer's next tick; both are
+    /// idle on every other layer, whose widgets and cadence stay untouched.
+    fn waveform_tick(&mut self, sample: Option<MicSample>, now: Instant) -> (bool, i32) {
+        let Some(index) = self.layers[self.active].waveform else {
+            // Leaving the recording layer ends that widget's session so a
+            // later return restarts the timer and graph from scratch.
+            for layer in &mut self.layers {
+                if let Some(i) = layer.waveform {
+                    if let ButtonImage::Waveform(wave) = &mut layer.buttons[i].1.image {
+                        wave.deactivate();
+                    }
+                }
+            }
+            return (false, i32::MAX - 1);
+        };
+        let button = &mut self.layers[self.active].buttons[index].1;
+        let ButtonImage::Waveform(wave) = &mut button.image else {
+            return (false, i32::MAX - 1);
+        };
+        let mut changed = wave.activate(now);
+        if let Some(sample) = sample {
+            changed |= wave.sample(sample);
+        }
+        changed |= wave.tick(now);
+        let timeout = wave.next_timeout(now);
+        if changed {
+            button.changed = true;
+        }
+        (changed, timeout)
     }
 
     fn refresh_batteries(
@@ -1769,6 +1836,8 @@ fn real_main(drm: &mut DrmBackend) {
     let commands = CommandRunner::new();
     let mut volume_control = LevelControl::volume();
     let mut brightness_control = LevelControl::brightness();
+    // Live microphone levels for the recording layer's waveform widget.
+    let mut mic_levels = MicLevels::levels();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -1814,6 +1883,9 @@ fn real_main(drm: &mut DrmBackend) {
             &brightness_control.wake,
             EpollEvent::new(EpollFlags::EPOLLIN, 6),
         )
+        .unwrap();
+    epoll
+        .add(&mic_levels.wake, EpollEvent::new(EpollFlags::EPOLLIN, 7))
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
@@ -1897,6 +1969,14 @@ fn real_main(drm: &mut DrmBackend) {
         for (revision, result) in brightness_control.update() {
             layers.slider_reply(revision, Kind::Brightness, result);
         }
+
+        // The recording layer's waveform widget polls live microphone input
+        // only while that layer is displayed; everywhere else the poller
+        // sleeps and this stays at the ordinary low-cadence timeouts.
+        let mic_sample = mic_levels.update();
+        mic_levels.set_armed(layers.waveform_active());
+        let (_, waveform_timeout_ms) = layers.waveform_tick(mic_sample, Instant::now());
+        next_timeout_ms = min(next_timeout_ms, waveform_timeout_ms);
 
         // The shared slider collapses on its own after a moment.
         layers.slider_refresh(Instant::now());
@@ -2690,6 +2770,264 @@ mod tests {
             ]
         );
         assert!(events.is_empty());
+    }
+
+    /// A deck shaped like the multibar voice flow, with the recording
+    /// layer's middle button carrying the live waveform widget.
+    fn waveform_deck() -> LayerDeck {
+        let command_layer = |command: &str, layer: &str| {
+            text(
+                "",
+                ButtonAction::CommandLayer {
+                    command: command.into(),
+                    layer: layer.into(),
+                },
+            )
+        };
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        text(
+                            "Mic",
+                            ButtonAction::CommandLayer {
+                                command: "voice-dictate start".into(),
+                                layer: "recording".into(),
+                            },
+                        ),
+                    ]),
+                ),
+                (
+                    "recording".into(),
+                    FunctionLayer::with_config(vec![
+                        command_layer("voice-dictate cancel", "home"),
+                        ButtonConfig {
+                            waveform: Some(true),
+                            stretch: Some(3),
+                            ..ButtonConfig::default()
+                        },
+                        command_layer("voice-dictate stop", "home"),
+                    ]),
+                ),
+            ],
+            0,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn the_waveform_runs_a_fast_cadence_only_on_the_recording_layer() {
+        let mut deck = waveform_deck();
+        let now = Instant::now();
+        // On the home bar nothing runs fast and no button is flagged.
+        assert!(!deck.waveform_active());
+        let (changed, timeout) = deck.waveform_tick(None, now);
+        assert!(!changed);
+        assert_eq!(timeout, i32::MAX - 1);
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
+
+        // The mic press opens the recording layer and its widget session.
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert_eq!(deck.active, deck.names["recording"]);
+        assert!(deck.waveform_active());
+        let (changed, timeout) = deck.waveform_tick(None, now);
+        assert!(changed); // the first activation frame
+        assert!((1..=1000).contains(&timeout)); // the timer's second cadence
+        assert!(deck.current().buttons[1].1.changed);
+
+        // Live samples stream into the graph while the layer is displayed.
+        for level in [10, 45, 80, 22] {
+            let (changed, _) = deck.waveform_tick(Some(MicSample { level, live: true }), now);
+            assert!(changed);
+        }
+        let ButtonImage::Waveform(wave) = &deck.current().buttons[1].1.image else {
+            panic!()
+        };
+        assert_eq!(
+            wave.history().oldest_first().collect::<Vec<_>>(),
+            vec![10, 45, 80, 22]
+        );
+        deck.current_mut().buttons[1].1.changed = false;
+
+        // The duration timer follows the monotonic clock from layer entry.
+        let later = now + Duration::from_millis(61_400);
+        let (changed, timeout) = deck.waveform_tick(None, later);
+        assert!(changed);
+        assert!((1..=1000).contains(&timeout));
+        let ButtonImage::Waveform(wave) = &deck.current().buttons[1].1.image else {
+            panic!()
+        };
+        assert_eq!(wave.elapsed(later), Duration::from_millis(61_400));
+        assert_eq!(waveform::format_duration(wave.elapsed(later)), "1:01");
+        // The repaint consumes the change flag.
+        deck.current_mut().buttons[1].1.changed = false;
+
+        // Leaving the recording layer ends the session and the fast cadence;
+        // a late in-flight sample never repaints any other layer.
+        assert!(deck.touch_down(1, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert_eq!(deck.active, deck.home);
+        let later = later + Duration::from_secs(5);
+        let (changed, timeout) = deck.waveform_tick(
+            Some(MicSample {
+                level: 90,
+                live: true,
+            }),
+            later,
+        );
+        assert!(!changed);
+        assert_eq!(timeout, i32::MAX - 1);
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
+
+        // Re-entering starts the timer and graph fresh.
+        assert!(deck.touch_down(2, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        let (changed, _) = deck.waveform_tick(None, later);
+        assert!(changed);
+        let ButtonImage::Waveform(wave) = &deck.current().buttons[1].1.image else {
+            panic!()
+        };
+        assert!(wave.history().is_empty());
+        assert_eq!(wave.elapsed(later), Duration::ZERO);
+    }
+
+    #[test]
+    fn waveform_layers_mix_freely_with_other_widgets_and_keep_their_behavior() {
+        let mut deck = LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        ButtonConfig {
+                            time: Some("%H:%M:%S".into()),
+                            ..ButtonConfig::default()
+                        },
+                        nav("Rec", "recording"),
+                    ]),
+                ),
+                (
+                    "recording".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        ButtonConfig {
+                            waveform: Some(true),
+                            stretch: Some(2),
+                            ..ButtonConfig::default()
+                        },
+                        keys("F1", &[Key::F1]),
+                    ]),
+                ),
+            ],
+            0,
+            None,
+            None,
+            false,
+        );
+        // The time widget keeps its own refresh cadence flag; the waveform
+        // layer neither inherits nor disturbs it.
+        assert!(deck.layers[0].faster_refresh);
+        assert!(!deck.layers[1].faster_refresh);
+        assert_eq!(deck.layers[0].waveform, None);
+        assert_eq!(deck.layers[1].waveform, Some(1));
+        // Keys and navigation on the recording layer still work around the widget.
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        assert!(deck.switch_named("recording", &mut emit));
+        deck.waveform_tick(
+            Some(MicSample {
+                level: 50,
+                live: true,
+            }),
+            Instant::now(),
+        );
+        deck.touch_down(0, 2, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_up(0, &mut emit);
+        assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
+        // The pet sees the waveform button like any other occupied span.
+        let spans = deck.current().layout_spans(2008, 0);
+        assert_eq!(spans.len(), 3);
+        assert!(!spans.iter().any(|span| span.clock));
+    }
+
+    #[test]
+    fn the_waveform_repaints_incrementally_and_only_within_its_button() {
+        let config = outline_config();
+        let mut layer = FunctionLayer::with_config(vec![
+            nav("Home", "home"),
+            ButtonConfig {
+                waveform: Some(true),
+                stretch: Some(2),
+                ..ButtonConfig::default()
+            },
+        ]);
+        let (width, height) = (2008, 60);
+        // Draw over a time-of-day band, like the strip actually renders.
+        let evening = crate::daycycle::DayCycle::default().background(19);
+        let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
+        layer.draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            evening,
+        );
+        let idle = surface.data().unwrap().to_vec();
+        // One live sample marks only the waveform button changed.
+        let ButtonImage::Waveform(wave) = &mut layer.buttons[1].1.image else {
+            panic!()
+        };
+        let now = Instant::now();
+        wave.activate(now);
+        assert!(wave.sample(MicSample {
+            level: 77,
+            live: true
+        }));
+        // The deck marks the button changed; a direct widget feed does not.
+        layer.buttons[1].1.changed = true;
+        assert!(!layer.buttons[0].1.changed);
+        let spans = layer.layout_spans(width, 0);
+        let clips = layer.draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            evening,
+        );
+        assert_eq!(clips.len(), 1);
+        let clip = clips[0];
+        assert!(f64::from(clip.y1()) >= spans[1].left - 1.0);
+        assert!(f64::from(clip.y2()) <= spans[1].right + 1.0);
+        assert!(i32::from(clip.x2()) <= height);
+        assert_ne!(&*surface.data().unwrap(), idle.as_slice());
+        // The incremental frame matches a complete redraw of the same state,
+        // so the fast cadence never leaves pixels behind.
+        let mut reference = ImageSurface::create(Format::ARgb32, height, width).unwrap();
+        layer.draw(
+            &config,
+            (width, height),
+            &reference,
+            (0.0, 0.0),
+            true,
+            None,
+            evening,
+        );
+        assert_eq!(
+            &*surface.data().unwrap(),
+            reference.data().unwrap().to_vec().as_slice()
+        );
     }
 
     #[test]
