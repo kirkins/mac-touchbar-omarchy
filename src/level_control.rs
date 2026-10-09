@@ -1,4 +1,4 @@
-//! Serialized, absolute desktop mixer control without session access in the daemon.
+//! Serialized finite level protocol; explicit mixer and display endpoints.
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-pub const MAX_PERCENT: u8 = 130;
+pub const MAX_VOLUME_PERCENT: u8 = 130;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -26,7 +26,25 @@ pub struct State {
     pub muted: bool,
 }
 
-fn request(address: &SocketAddr, uid: u32, action: Request) -> io::Result<State> {
+fn request(
+    address: &SocketAddr,
+    uid: u32,
+    action: Request,
+    minimum: u8,
+    maximum: u8,
+) -> io::Result<State> {
+    let command = match action {
+        Request::Get => "get".into(),
+        Request::Set(percent) if percent >= minimum && percent <= maximum => {
+            format!("set {percent}")
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid level request",
+            ))
+        }
+    };
     let mut connection = UnixStream::connect_addr(address)?;
     connection.set_read_timeout(Some(Duration::from_secs(10)))?;
     connection.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -48,19 +66,9 @@ fn request(address: &SocketAddr, uid: u32, action: Request) -> io::Result<State>
     if credentials.uid != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Unexpected audio receiver UID",
+            "Unexpected level receiver UID",
         ));
     }
-    let command = match action {
-        Request::Get => "get".into(),
-        Request::Set(percent) if percent <= MAX_PERCENT => format!("set {percent}"),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid volume request",
-            ))
-        }
-    };
     connection.write_all(command.as_bytes())?;
     connection.shutdown(Shutdown::Write)?;
     let mut response = String::new();
@@ -68,7 +76,7 @@ fn request(address: &SocketAddr, uid: u32, action: Request) -> io::Result<State>
     let fields: Vec<_> = response.split_whitespace().collect();
     if let ["ok", percent, muted] = fields.as_slice() {
         if let (Ok(percent), "0" | "1") = (percent.parse::<u8>(), *muted) {
-            if percent <= MAX_PERCENT {
+            if percent <= maximum {
                 return Ok(State {
                     percent,
                     muted: *muted == "1",
@@ -78,25 +86,30 @@ fn request(address: &SocketAddr, uid: u32, action: Request) -> io::Result<State>
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "Audio receiver rejected request",
+        "Level receiver rejected request",
     ))
 }
 
-pub struct VolumeControl {
+pub struct LevelControl {
     requests: Sender<(u64, Request)>,
     replies: Receiver<(u64, io::Result<State>)>,
     pub wake: UnixStream,
 }
 
-impl VolumeControl {
-    pub fn new() -> Self {
+impl LevelControl {
+    pub fn volume() -> Self {
         // Same desktop UID and abstract-socket boundary as the optional voice
         // integration. No home/runtime file or PipeWire privilege is granted.
         let address = SocketAddr::from_abstract_name(b"dfr-volume-1000").unwrap();
-        Self::connect_to(address, 1000)
+        Self::connect_to(address, 1000, 0, MAX_VOLUME_PERCENT)
     }
 
-    fn connect_to(address: SocketAddr, uid: u32) -> Self {
+    pub fn brightness() -> Self {
+        let address = SocketAddr::from_abstract_name(b"dfr-brightness-1000").unwrap();
+        Self::connect_to(address, 1000, 1, 100)
+    }
+
+    fn connect_to(address: SocketAddr, uid: u32, minimum: u8, maximum: u8) -> Self {
         let (requests, incoming) = mpsc::channel();
         let (outgoing, replies) = mpsc::channel();
         let (wake, mut notify) = UnixStream::pair().unwrap();
@@ -114,7 +127,7 @@ impl VolumeControl {
                         action = next_action;
                     } else {
                         if outgoing
-                            .send((revision, request(&address, uid, action)))
+                            .send((revision, request(&address, uid, action, minimum, maximum)))
                             .is_err()
                         {
                             return;
@@ -125,7 +138,7 @@ impl VolumeControl {
                     }
                 }
                 if outgoing
-                    .send((revision, request(&address, uid, action)))
+                    .send((revision, request(&address, uid, action, minimum, maximum)))
                     .is_err()
                 {
                     break;
@@ -159,11 +172,13 @@ mod tests {
 
     fn address() -> SocketAddr {
         let name = format!(
-            "dfr-volume-test-{}-{}",
+            "dfr-shared-sliders-level-test-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         );
+        assert!(name.starts_with("dfr-shared-sliders-level-test-"));
         assert_ne!(name, "dfr-volume-1000");
+        assert_ne!(name, "dfr-brightness-1000");
         SocketAddr::from_abstract_name(name.as_bytes()).unwrap()
     }
 
@@ -171,6 +186,10 @@ mod tests {
     fn absolute_client_preserves_zero_before_a_following_read_and_reads_back_the_mixer() {
         let address = address();
         let listener = UnixListener::bind_addr(&address).unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().as_abstract_name(),
+            address.as_abstract_name()
+        );
         let actual = Arc::new(Mutex::new(100u8));
         let mixer = Arc::clone(&actual);
         let server = thread::spawn(move || {
@@ -194,8 +213,8 @@ mod tests {
             }
         });
         let uid = unsafe { libc::geteuid() };
-        let mut client = VolumeControl::connect_to(address, uid);
-        let receive = |client: &mut VolumeControl, revision| {
+        let mut client = LevelControl::connect_to(address, uid, 0, MAX_VOLUME_PERCENT);
+        let receive = |client: &mut LevelControl, revision| {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 for (id, state) in client.update() {
@@ -225,12 +244,99 @@ mod tests {
     fn client_rejects_a_receiver_with_the_wrong_uid() {
         let address = address();
         let listener = UnixListener::bind_addr(&address).unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().as_abstract_name(),
+            address.as_abstract_name()
+        );
         let server = thread::spawn(move || {
             let _ = listener.accept().unwrap();
         });
         let uid = unsafe { libc::geteuid() }.wrapping_add(1);
-        let error = request(&address, uid, Request::Set(0)).unwrap_err();
+        let error = request(&address, uid, Request::Set(0), 0, MAX_VOLUME_PERCENT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn brightness_transport_uses_its_own_range_and_confirmed_readback() {
+        let address = address();
+        let listener = UnixListener::bind_addr(&address).unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().as_abstract_name(),
+            address.as_abstract_name()
+        );
+        let server = thread::spawn(move || {
+            for (command, reply) in [
+                ("get", "ok 93 0"),
+                ("set 1", "ok 1 0"),
+                ("set 50", "ok 47 0"),
+                ("set 100", "ok 100 0"),
+            ] {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut message = String::new();
+                (&mut connection)
+                    .take(32)
+                    .read_to_string(&mut message)
+                    .unwrap();
+                assert_eq!(message, command);
+                connection.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let uid = unsafe { libc::geteuid() };
+        for (action, expected) in [
+            (Request::Get, 93),
+            (Request::Set(1), 1),
+            (Request::Set(50), 47),
+            (Request::Set(100), 100),
+        ] {
+            assert_eq!(
+                request(&address, uid, action, 1, 100).unwrap().percent,
+                expected
+            );
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn invalid_or_failed_brightness_readback_is_never_success() {
+        for reply in [
+            "error",
+            "ok 101 0",
+            "ok 47 2",
+            "ok NaN 0",
+            "ok 47 0 extra",
+            "",
+        ] {
+            let address = address();
+            let listener = UnixListener::bind_addr(&address).unwrap();
+            assert_eq!(
+                listener.local_addr().unwrap().as_abstract_name(),
+                address.as_abstract_name()
+            );
+            let server = thread::spawn(move || {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut message = String::new();
+                (&mut connection)
+                    .take(32)
+                    .read_to_string(&mut message)
+                    .unwrap();
+                assert_eq!(message, "get");
+                connection.write_all(reply.as_bytes()).unwrap();
+            });
+            let uid = unsafe { libc::geteuid() };
+            assert_eq!(
+                request(&address, uid, Request::Get, 1, 100)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            server.join().unwrap();
+        }
     }
 }

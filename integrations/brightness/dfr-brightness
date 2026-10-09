@@ -1,0 +1,84 @@
+#!/usr/bin/python3
+"""Finite display-only brightness adapter using the existing desktop interface."""
+import os
+import re
+import socket
+import struct
+import subprocess
+
+DEVICE = "apple-panel-bl"
+MIN_PERCENT = 1
+MAX_PERCENT = 100
+
+
+def command(*args):
+    return subprocess.check_output(args, text=True, timeout=2,
+                                   env={**os.environ, "LC_ALL": "C"}).strip()
+
+
+class Backlight:
+    def __init__(self, run=command):
+        self.run = run
+
+    def state(self):
+        # Set's stdout echoes its target. A separate info command reads sysfs,
+        # matching the working keyboard helper's brightness (not actual_brightness).
+        fields = self.run("brightnessctl", "-c", "backlight", "-d", DEVICE, "-m", "info").split(",")
+        if len(fields) != 5 or fields[:2] != [DEVICE, "backlight"]:
+            raise ValueError("Unexpected display backlight")
+        raw, maximum = int(fields[2]), int(fields[4])
+        if maximum <= 0 or not 0 <= raw <= maximum:
+            raise ValueError("Invalid display readback")
+        return (raw * 100 + maximum // 2) // maximum
+
+    def dispatch(self, request):
+        if request == "get":
+            value = None
+        elif re.fullmatch(r"set ([1-9][0-9]?|100)", request):
+            value = int(request[4:])
+        else:
+            raise ValueError("Invalid brightness request")
+        if value is not None:
+            # Same linear 1..100% range as the keyboard helper, never panel-off.
+            # brightnessctl uses existing logind authorization if sysfs is not writable.
+            self.run("brightnessctl", "-c", "backlight", "-d", DEVICE, "set", f"{value}%")
+        return f"ok {self.state()} 0"
+
+
+def handle(connection, backlight, allowed_uids):
+    connection.settimeout(3)
+    _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    if uid not in allowed_uids:
+        return
+    data = bytearray()
+    while len(data) <= 32:
+        chunk = connection.recv(33 - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > 32:
+        raise ValueError("Request too long")
+    connection.sendall(backlight.dispatch(data.decode("ascii")).encode("ascii"))
+
+
+def serve():
+    uid = os.getuid()
+    backlight = Backlight()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind("\0dfr-brightness-" + str(uid))
+        listener.listen(8)
+        while True:
+            connection, _ = listener.accept()
+            with connection:
+                try:
+                    handle(connection, backlight, {uid, 65534})
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    print(f"Brightness handoff failed: {error}", flush=True)
+                    try:
+                        connection.sendall(b"error")
+                    except OSError:
+                        pass
+
+
+if __name__ == "__main__":
+    serve()

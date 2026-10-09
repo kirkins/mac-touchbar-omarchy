@@ -69,6 +69,8 @@ struct ConfigProxy {
 pub enum ButtonAction {
     /// Opens the absolute output-volume slider without stepping the mixer.
     VolumeSlider,
+    /// Opens the built-in display slider without stepping its backlight.
+    BrightnessSlider,
     Keys(Vec<Key>),
     SwitchLayer(String),
     /// Runs a shell command on touch-down.
@@ -117,6 +119,7 @@ impl<'de> Deserialize<'de> for ButtonAction {
         #[derive(Deserialize)]
         enum SliderAction {
             VolumeSlider,
+            BrightnessSlider,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase", deny_unknown_fields)]
@@ -126,6 +129,7 @@ impl<'de> Deserialize<'de> for ButtonAction {
         }
         Ok(match Action::deserialize(deserializer)? {
             Action::Slider(SliderAction::VolumeSlider) => Self::VolumeSlider,
+            Action::Slider(SliderAction::BrightnessSlider) => Self::BrightnessSlider,
             Action::Key(key) => Self::Keys(vec![key]),
             Action::Keys(keys) => Self::Keys(keys),
             Action::Table(action) => match (action.layer, action.command) {
@@ -649,13 +653,13 @@ Keys = [{ Text = "F1", Action = "F1" }]
         // the daemon without opening DRM, input devices, or the voice helper.
         let render = |deck: &mut LayerDeck, name: &str| {
             let portrait = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
-            deck.volume.pixel_shift_width = if cfg.enable_pixel_shift {
+            deck.slider.pixel_shift_width = if cfg.enable_pixel_shift {
                 crate::PIXEL_SHIFT_WIDTH_PX
             } else {
                 0
             };
-            deck.volume.pixel_shift_x = 0.0;
-            let volume = deck.volume_render();
+            deck.slider.pixel_shift_x = 0.0;
+            let volume = deck.slider_render();
             deck.current_mut()
                 .draw(&cfg, (2008, 60), &portrait, (0.0, 0.0), true, volume);
             if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
@@ -700,6 +704,22 @@ Keys = [{ Text = "F1", Action = "F1" }]
                 matches!(&button.action, ButtonAction::Keys(keys)
                     if keys.iter().any(|key| matches!(key, Key::VolumeUp | Key::VolumeDown | Key::Mute)))));
         }
+        let brightness_index = deck
+            .current()
+            .buttons
+            .iter()
+            .position(|(_, button)| button.action == ButtonAction::BrightnessSlider)
+            .unwrap();
+        assert_eq!(brightness_index, 1);
+        assert_eq!(
+            deck.current()
+                .buttons
+                .iter()
+                .filter(|(_, b)| b.action == ButtonAction::BrightnessSlider)
+                .count(),
+            1
+        );
+        assert!(!deck.current().buttons.iter().any(|(_, b)| matches!(&b.action, ButtonAction::Keys(keys) if keys.iter().any(|k| matches!(k, Key::BrightnessDown | Key::BrightnessUp)))));
         render(&mut deck, "implemented-home.png");
         deck.switch_to(deck.names["media"], &mut |_, _| {});
         render(&mut deck, "implemented-media.png");
@@ -708,28 +728,85 @@ Keys = [{ Text = "F1", Action = "F1" }]
         let x = (spans[0].left + spans[0].right) / 2.0;
         let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
         deck.touch_down_at(0, x, 30.0, 2008, 60, &mut emit, &mut |_| {});
-        let (left, right) = deck.volume_track(2008).unwrap();
+        assert_eq!(deck.slider.region, Some((0, 1)));
+        assert_eq!(
+            deck.slider.requests.last().unwrap().2,
+            crate::level_control::Request::Get
+        );
+        deck.slider_reply(
+            deck.slider.revision,
+            crate::slider::Kind::Volume,
+            Ok(crate::LevelState {
+                percent: 65,
+                muted: false,
+            }),
+        );
+        render(&mut deck, "implemented-volume-mid.png");
+        let (left, right) = deck.slider_track(2008).unwrap();
         deck.touch_motion(0, left, 30.0, 2008, 60, &mut emit);
-        deck.volume_reply(
-            deck.volume.revision,
-            Ok(crate::VolumeState {
+        deck.slider_reply(
+            deck.slider.revision,
+            crate::slider::Kind::Volume,
+            Ok(crate::LevelState {
                 percent: 0,
                 muted: false,
             }),
         );
         render(&mut deck, "implemented-volume-zero.png");
-        deck.volume_drag_motion(0, right, 30.0, 2008, &mut emit);
-        deck.volume_reply(
-            deck.volume.revision,
-            Ok(crate::VolumeState {
+        deck.slider_drag_motion(0, right, 30.0, 2008, &mut emit);
+        deck.slider_reply(
+            deck.slider.revision,
+            crate::slider::Kind::Volume,
+            Ok(crate::LevelState {
                 percent: 130,
                 muted: false,
             }),
         );
-        assert_eq!(deck.volume.level, 130);
+        assert_eq!(deck.slider.level, 130);
         render(&mut deck, "implemented-volume-max.png");
         deck.touch_up(0, &mut emit);
-        deck.volume_collapse();
+        deck.slider_collapse();
+        let spans = deck.current().layout_spans(2008, 0);
+        let brightness_x = (spans[brightness_index].left + spans[brightness_index].right) / 2.0;
+        deck.touch_down_at(0, brightness_x, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        assert_eq!(deck.slider.region, Some((0, 1)));
+        assert_eq!(deck.slider.kind, crate::slider::Kind::Brightness);
+        assert!(!deck.slider.confirmed);
+        assert_eq!(
+            deck.slider.requests.last().unwrap().2,
+            crate::level_control::Request::Get
+        );
+        deck.slider_reply(
+            deck.slider.revision,
+            crate::slider::Kind::Brightness,
+            Ok(crate::LevelState {
+                percent: 93,
+                muted: false,
+            }),
+        );
+        render(&mut deck, "implemented-brightness.png");
+        deck.touch_motion(0, left, 30.0, 2008, 60, &mut emit);
+        deck.slider_reply(
+            deck.slider.revision,
+            crate::slider::Kind::Brightness,
+            Ok(crate::LevelState {
+                percent: 1,
+                muted: false,
+            }),
+        );
+        render(&mut deck, "implemented-brightness-min.png");
+        deck.slider_drag_motion(0, right, 30.0, 2008, &mut emit);
+        deck.slider_reply(
+            deck.slider.revision,
+            crate::slider::Kind::Brightness,
+            Ok(crate::LevelState {
+                percent: 100,
+                muted: false,
+            }),
+        );
+        render(&mut deck, "implemented-brightness-max.png");
+        deck.touch_up(0, &mut emit);
+        // Mic stays reachable while the brightness overlay is still open.
         tap(&mut deck, "Mic", &mut commands);
         assert_eq!(deck.active, deck.names["recording"]);
         render(&mut deck, "implemented-recording.png");
@@ -918,7 +995,7 @@ DoublePressSwitchLayers = 200
                     .unwrap()
             })
             .collect();
-        assert_eq!(positions, vec![4, 5, 6]);
+        assert_eq!(positions, vec![3, 4, 5]);
         let pet_button = &home.keys[positions[2]];
         assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout

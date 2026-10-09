@@ -50,9 +50,10 @@ mod command;
 mod config;
 mod display;
 mod fonts;
+mod level_control;
 mod pet;
 mod pixel_shift;
-mod volume;
+mod slider;
 
 use crate::config::ConfigManager;
 use appearance::ButtonAccent;
@@ -60,29 +61,18 @@ use backlight::BacklightManager;
 use command::CommandRunner;
 use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
+#[cfg(test)]
+use level_control::Request as LevelRequest;
+use level_control::{LevelControl, State as LevelState};
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
-use volume::{Request as VolumeRequest, State as VolumeState, VolumeControl};
+use slider::{Geometry, Kind, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
 
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
 const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 40;
 const TIMEOUT_MS: i32 = 10 * 1000;
-
-// Transient volume slider, macOS Touch Bar style: pressing the volume-slider
-// control on a bar expands a draggable slider over its reserved span, which
-// collapses again after a moment of inactivity.
-/// Absolute output percentage, including the user's existing 130% ceiling.
-const VOLUME_LEVELS: u8 = volume::MAX_PERCENT;
-const VOLUME_INITIAL_LEVEL: u8 = 0;
-/// How long the slider stays up after the last interaction.
-const VOLUME_SLIDER_LINGER: Duration = Duration::from_millis(2500);
-/// Presses on the volume control become drags once the finger moves this far,
-/// so a shaky tap still taps while an intentional drag always drags.
-const VOLUME_DRAG_THRESHOLD_PX: f64 = 8.0;
-/// Width of the speaker glyph anchoring the left end of the slider.
-const VOLUME_SPEAKER_ZONE_PX: f64 = 28.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatteryState {
@@ -868,7 +858,7 @@ pub struct FunctionLayer {
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
-    // The volume-cluster span the last draw covered with the slider, so a
+    // The shared region the last draw covered with the slider, so a
     // later draw without it can erase and repaint the whole region.
     slider_region_drawn: Option<(usize, usize)>,
 }
@@ -910,7 +900,7 @@ impl FunctionLayer {
         surface: &Surface,
         pixel_shift: (f64, f64),
         complete_redraw: bool,
-        volume: Option<VolumeRender>,
+        slider: Option<Render>,
     ) -> Vec<ClipRect> {
         let c = Context::new(surface).unwrap();
         let mut modified_regions = if complete_redraw {
@@ -941,7 +931,7 @@ impl FunctionLayer {
         // The slider no longer covers a span it was drawn over: either it
         // collapsed, or it moved to another cluster. Erase that whole column
         // and make its buttons repaint over it, gaps included.
-        let uncovered = match (self.slider_region_drawn.take(), volume) {
+        let uncovered = match (self.slider_region_drawn.take(), slider) {
             (Some((first, last)), None) => Some((first, last)),
             (Some((first, last)), Some(v)) if (first, last) != (v.first, v.last) => {
                 Some((first, last))
@@ -949,20 +939,10 @@ impl FunctionLayer {
             _ => None,
         };
         if let Some((first, last)) = uncovered {
-            let first_start = self.buttons[first].0;
-            let last_end = if last + 1 < self.buttons.len() {
-                self.buttons[last + 1].0
-            } else {
-                self.virtual_button_count
-            };
-            let left_edge =
-                (first_start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor()
-                    + pixel_shift_x
-                    + (pixel_shift_width / 2) as f64;
-            let region_width = virtual_button_width
-                + ((last_end - first_start - 1) as f64
-                    * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                    .floor();
+            let geometry =
+                self.slider_geometry(width, first, last, pixel_shift_width, pixel_shift_x);
+            let left_edge = geometry.left;
+            let region_width = geometry.right - geometry.left;
             c.set_source_rgb(0.0, 0.0, 0.0);
             c.rectangle(
                 (left_edge - 2.0).max(0.0),
@@ -993,7 +973,7 @@ impl FunctionLayer {
             let (start, button) = &mut self.buttons[i];
             let start = *start;
 
-            if volume.is_some_and(|v| i >= v.first && i <= v.last) {
+            if slider.is_some_and(|v| i >= v.first && i <= v.last) {
                 // The summoned slider covers the cluster; the buttons
                 // beneath stay hidden until it collapses or moves to
                 // another cluster.
@@ -1065,23 +1045,18 @@ impl FunctionLayer {
             }
         }
 
-        if let Some(volume) = volume {
-            self.slider_region_drawn = Some((volume.first, volume.last));
-            let first_start = self.buttons[volume.first].0;
-            let last_end = if volume.last + 1 < self.buttons.len() {
-                self.buttons[volume.last + 1].0
-            } else {
-                self.virtual_button_count
-            };
-            let left_edge =
-                (first_start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor()
-                    + pixel_shift_x
-                    + (pixel_shift_width / 2) as f64;
-            let region_width = virtual_button_width
-                + ((last_end - first_start - 1) as f64
-                    * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                    .floor();
-            let right_edge = left_edge + region_width;
+        if let Some(slider) = slider {
+            self.slider_region_drawn = Some((slider.first, slider.last));
+            let geometry = self.slider_geometry(
+                width,
+                slider.first,
+                slider.last,
+                pixel_shift_width,
+                pixel_shift_x,
+            );
+            let left_edge = geometry.left;
+            let right_edge = geometry.right;
+            let region_width = right_edge - left_edge;
 
             if !complete_redraw {
                 // Clear the whole cluster column, icons and outlines included.
@@ -1095,78 +1070,7 @@ impl FunctionLayer {
                 c.fill().unwrap();
             }
 
-            // The track and fill replace the cluster, macOS-style: a slim
-            // rounded bar across the region with a fill up to the level,
-            // anchored left by the speaker glyph.
-            let track_left = left_edge + VOLUME_SPEAKER_ZONE_PX + 2.0;
-            let track_right = right_edge - 2.0;
-            let track_height = 14.0;
-            let track_top = (height as f64 - track_height) / 2.0 + pixel_shift_y;
-            c.set_source_rgb(
-                BUTTON_COLOR_INACTIVE,
-                BUTTON_COLOR_INACTIVE,
-                BUTTON_COLOR_INACTIVE,
-            );
-            rounded_rect(
-                &c,
-                track_left,
-                track_top,
-                track_right - track_left,
-                track_height,
-                track_height / 2.0,
-            );
-            c.fill().unwrap();
-
-            let frac = volume.level as f64 / VOLUME_LEVELS as f64;
-            let fill_width = (track_right - track_left - 2.0) * frac;
-            if fill_width > 0.0 {
-                let fill_height = track_height - 2.0;
-                if volume.muted {
-                    c.set_source_rgb(
-                        BUTTON_COLOR_ACTIVE,
-                        BUTTON_COLOR_ACTIVE,
-                        BUTTON_COLOR_ACTIVE,
-                    );
-                } else {
-                    ButtonAccent::Cyan.foreground(&c);
-                }
-                rounded_rect(
-                    &c,
-                    track_left + 1.0,
-                    track_top + 1.0,
-                    fill_width,
-                    fill_height,
-                    fill_height / 2.0,
-                );
-                c.fill().unwrap();
-            }
-
-            // The speaker glyph sits on the bare segment left
-            // of the track; muted adds a slash.
-            let mid = track_top + track_height / 2.0;
-            let glyph_x = left_edge + 8.0;
-            c.set_source_rgb(1.0, 1.0, 1.0);
-            c.rectangle(glyph_x, mid - 3.0, 4.0, 6.0);
-            c.fill().unwrap();
-            c.new_sub_path();
-            c.move_to(glyph_x + 4.0, mid - 3.0);
-            c.line_to(glyph_x + 12.0, mid - 7.0);
-            c.line_to(glyph_x + 12.0, mid + 7.0);
-            c.line_to(glyph_x + 4.0, mid + 3.0);
-            c.close_path();
-            c.fill().unwrap();
-            if volume.muted {
-                c.set_line_width(5.0);
-                c.set_source_rgb(0.0, 0.0, 0.0);
-                c.move_to(glyph_x - 2.0, mid + 9.0);
-                c.line_to(glyph_x + 14.0, mid - 9.0);
-                c.stroke().unwrap();
-                c.set_line_width(2.0);
-                c.set_source_rgb(1.0, 1.0, 1.0);
-                c.move_to(glyph_x - 2.0, mid + 9.0);
-                c.line_to(glyph_x + 14.0, mid - 9.0);
-                c.stroke().unwrap();
-            }
+            geometry.draw(&c, height as f64, pixel_shift_y, slider);
 
             if !complete_redraw {
                 modified_regions.push(ClipRect::new(
@@ -1179,6 +1083,28 @@ impl FunctionLayer {
         }
 
         modified_regions
+    }
+
+    fn slider_geometry(
+        &self,
+        width: i32,
+        first: usize,
+        last: usize,
+        shift_width: u64,
+        shift_x: f64,
+    ) -> Geometry {
+        let end = self
+            .buttons
+            .get(last + 1)
+            .map_or(self.virtual_button_count, |b| b.0);
+        Geometry::new(
+            width,
+            self.virtual_button_count,
+            self.buttons[first].0,
+            end,
+            shift_width,
+            shift_x,
+        )
     }
 
     /// Occupied widget spans of this layer in layout coordinates, mirroring
@@ -1262,76 +1188,9 @@ struct TouchState {
     inside: bool,
     // Set for presses on a slider control; crossing the drag
     // threshold converts the press into a slider drag.
-    volume: bool,
+    slider: Option<u64>,
     start_x: f64,
     start_y: f64,
-}
-
-/// A finger currently dragging the volume slider.
-struct VolumeDrag {
-    slot: u32,
-}
-
-/// State of the transient volume slider on its owning bar.
-struct VolumeOverlay {
-    active: bool,
-    level: u8,
-    muted: bool,
-    /// Contiguous owner-layer button indices (first, last) the slider covers.
-    region: Option<(usize, usize)>,
-    deadline: Option<Instant>,
-    drag: Option<VolumeDrag>,
-    layer: usize,
-    confirmed: bool,
-    revision: u64,
-    opened_revision: u64,
-    applied_revision: Option<u64>,
-    pixel_shift_width: u64,
-    pixel_shift_x: f64,
-    requests: Vec<(u64, VolumeRequest)>,
-}
-
-impl Default for VolumeOverlay {
-    fn default() -> Self {
-        Self {
-            active: false,
-            level: VOLUME_INITIAL_LEVEL,
-            muted: false,
-            region: None,
-            deadline: None,
-            drag: None,
-            layer: 0,
-            confirmed: false,
-            revision: rand::random(),
-            opened_revision: 0,
-            applied_revision: None,
-            pixel_shift_width: 0,
-            pixel_shift_x: 0.0,
-            requests: Vec::new(),
-        }
-    }
-}
-
-/// What `FunctionLayer::draw` needs to render the summoned slider.
-#[derive(Clone, Copy)]
-struct VolumeRender {
-    first: usize,
-    last: usize,
-    level: u8,
-    muted: bool,
-}
-
-/// Only the explicit control opens the absolute slider. Ordinary legacy
-/// volume key bindings continue to emit their configured key events.
-fn volume_request(action: &ButtonAction) -> Option<VolumeRequest> {
-    (*action == ButtonAction::VolumeSlider).then_some(VolumeRequest::Get)
-}
-
-/// Map the drawn track's touch position to an absolute output percentage.
-fn volume_level_at(x: f64, left: f64, right: f64) -> u8 {
-    let width = (right - left).max(1.0);
-    let frac = ((x - left) / width).clamp(0.0, 1.0);
-    (frac * VOLUME_LEVELS as f64).round() as u8
 }
 
 // Input state belongs to the deck, so transitions always release the old layer
@@ -1347,7 +1206,7 @@ pub struct LayerDeck {
     fn_pressed: bool,
     fn_return: Option<usize>,
     touches: HashMap<u32, TouchState>,
-    volume: VolumeOverlay,
+    slider: Overlay,
 }
 
 impl LayerDeck {
@@ -1374,7 +1233,7 @@ impl LayerDeck {
             fn_pressed: false,
             fn_return: None,
             touches: HashMap::new(),
-            volume: VolumeOverlay::default(),
+            slider: Overlay::default(),
         }
     }
 
@@ -1431,7 +1290,7 @@ impl LayerDeck {
             }
         }
         self.touches.clear();
-        self.volume_collapse();
+        self.slider_collapse();
     }
 
     fn switch_to(&mut self, target: usize, emit_keys: &mut impl FnMut(&[Key], bool)) -> bool {
@@ -1464,7 +1323,7 @@ impl LayerDeck {
         self.fn_pressed = pressed;
         if pressed {
             if self.legacy && double_press && self.fn_layer.is_some() {
-                self.volume_collapse();
+                self.slider_collapse();
                 if let Some(alternate) = &mut self.fn_layer {
                     std::mem::swap(&mut self.home, alternate);
                 }
@@ -1502,9 +1361,9 @@ impl LayerDeck {
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
             return false;
         }
-        let volume = volume_request(&self.current().buttons[button].1.action);
-        if let Some(request) = volume {
-            self.volume_press(button, request);
+        let selected = Kind::for_action(&self.current().buttons[button].1.action);
+        if let Some(kind) = selected {
+            self.slider_press(button, kind);
         }
         if let ButtonImage::Battery(battery, _, _) = &mut self.current_mut().buttons[button].1.image
         {
@@ -1536,7 +1395,7 @@ impl LayerDeck {
             TouchState {
                 button,
                 inside: true,
-                volume: volume.is_some(),
+                slider: selected.map(|_| self.slider.opened_revision),
                 start_x: x,
                 start_y: y,
             },
@@ -1558,7 +1417,16 @@ impl LayerDeck {
         emit_keys: &mut impl FnMut(&[Key], bool),
         run_command: &mut impl FnMut(&str),
     ) -> bool {
-        if self.volume_drag_start(slot, x, y, width, height, emit_keys) {
+        if self.slider_drag_start(slot, x, y, width, height, emit_keys) {
+            return false;
+        }
+        if self.slider.active
+            && self.slider.confirmed
+            && self.slider.layer == self.active
+            && self
+                .slider_geometry(width)
+                .is_some_and(|g| g.contains(x, y, height as f64))
+        {
             return false;
         }
         match self.current().hit(width, height, x, y, None) {
@@ -1579,23 +1447,21 @@ impl LayerDeck {
         let Some((button, volume, start_x, start_y)) = self
             .touches
             .get(&slot)
-            .map(|touch| (touch.button, touch.volume, touch.start_x, touch.start_y))
+            .map(|touch| (touch.button, touch.slider, touch.start_x, touch.start_y))
         else {
             return;
         };
-        if volume
-            && self.volume.active
-            && (x - start_x).hypot(y - start_y) > VOLUME_DRAG_THRESHOLD_PX
+        if volume == Some(self.slider.opened_revision)
+            && self.slider.active
+            && (x - start_x).hypot(y - start_y) > DRAG_THRESHOLD_PX
         {
             // An intentional drag: release the button highlight, then set
             // the absolute level directly from the finger position.
             self.touch_up(slot, emit_keys);
-            if self.volume.drag.is_none() {
-                self.volume.drag = Some(VolumeDrag { slot });
-                if let Some((left, right)) = self.volume_track(width) {
-                    self.volume_set_level(volume_level_at(x, left, right), emit_keys);
+            if let Some(geometry) = self.slider_geometry(width) {
+                if self.slider.begin_drag(slot, x, &geometry) {
+                    self.mark_slider_changed();
                 }
-                self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
             }
             return;
         }
@@ -1610,19 +1476,12 @@ impl LayerDeck {
     }
 
     fn touch_up(&mut self, slot: u32, emit_keys: &mut impl FnMut(&[Key], bool)) {
-        if self
-            .volume
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.slot == slot)
-        {
-            self.volume.drag = None;
-            self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
+        if self.slider.release_drag(slot) {
             return;
         }
         if let Some(touch) = self.touches.remove(&slot) {
-            if touch.volume && self.volume.active {
-                self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
+            if touch.slider == Some(self.slider.opened_revision) && self.slider.active {
+                self.slider.deadline = Some(Instant::now() + LINGER);
             }
             self.update_button(touch.button, emit_keys);
         }
@@ -1633,221 +1492,168 @@ impl LayerDeck {
         *self = new;
     }
 
-    /// Expand the existing slider over the volume control's reserved span.
-    fn volume_press(&mut self, button: usize, request: VolumeRequest) {
+    /// Adjacent level controls share their complete region, including the gap.
+    fn slider_press(&mut self, button: usize, kind: Kind) {
         let layer = self.current();
         let mut first = button;
-        while first > 0 && volume_request(&layer.buttons[first - 1].1.action).is_some() {
+        while first > 0 && Kind::for_action(&layer.buttons[first - 1].1.action).is_some() {
             first -= 1;
         }
         let mut last = button;
         while last + 1 < layer.buttons.len()
-            && volume_request(&layer.buttons[last + 1].1.action).is_some()
+            && Kind::for_action(&layer.buttons[last + 1].1.action).is_some()
         {
             last += 1;
         }
-        if !self.volume.active {
-            self.volume.confirmed = false;
-            self.volume.opened_revision = self.volume.revision.wrapping_add(1);
-            self.volume.applied_revision = None;
-        }
-        self.volume.active = true;
-        self.volume.layer = self.active;
-        self.volume.region = Some((first, last));
-        self.volume_queue(request);
-        self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
-        self.mark_volume_changed();
+        self.mark_slider_changed();
+        self.slider.open(kind, self.active, (first, last));
+        self.mark_slider_changed();
     }
 
-    fn volume_queue(&mut self, request: VolumeRequest) {
-        self.volume.revision = self.volume.revision.wrapping_add(1);
-        self.volume.requests.push((self.volume.revision, request));
-    }
-
-    fn volume_reply(&mut self, revision: u64, result: std::io::Result<VolumeState>) {
-        // Show confirmed progress during a fast drag, even when a newer target
-        // is queued. Duplicate/out-of-order replies and earlier openings cannot
-        // overwrite a newer confirmed state or repaint a collapsed overlay.
-        if !self.volume.active
-            || revision < self.volume.opened_revision
-            || revision > self.volume.revision
-            || self
-                .volume
-                .applied_revision
-                .is_some_and(|last| revision <= last)
-        {
-            return;
-        }
-        match result {
-            Ok(state) => {
-                self.volume.applied_revision = Some(revision);
-                self.volume.confirmed = true;
-                self.volume.level = state.percent;
-                self.volume.muted = state.muted;
-                self.mark_volume_changed();
-            }
-            Err(error) if revision == self.volume.revision => {
-                eprintln!("Volume handoff failed: {error}");
-                self.volume_collapse();
-            }
-            Err(_) => {} // a newer queued operation still supplies its readback
+    fn slider_reply(&mut self, revision: u64, kind: Kind, result: std::io::Result<LevelState>) {
+        if self.slider.reply(revision, kind, result) {
+            self.mark_slider_changed();
         }
     }
 
-    fn volume_collapse(&mut self) {
-        if !self.volume.active {
-            self.volume.drag = None;
-            return;
+    fn slider_collapse(&mut self) {
+        if self.slider.collapse() {
+            self.mark_slider_changed();
         }
-        self.volume.active = false;
-        self.volume.drag = None;
-        self.volume.deadline = None;
-        self.mark_volume_changed();
     }
 
-    fn mark_volume_changed(&mut self) {
-        if let Some((first, last)) = self.volume.region {
-            for (_, button) in &mut self.layers[self.volume.layer].buttons[first..=last] {
+    fn mark_slider_changed(&mut self) {
+        if let Some((first, last)) = self.slider.region {
+            for (_, button) in &mut self.layers[self.slider.layer].buttons[first..=last] {
                 button.changed = true;
             }
         }
     }
 
-    /// Left/right pixel bounds of the slider region in hit-test coordinates.
-    fn volume_region(&self, width: u16) -> Option<(f64, f64)> {
-        let (first, last) = self.volume.region?;
-        let layer = &self.layers[self.volume.layer];
-        let virtual_button_width = ((width as i32 - self.volume.pixel_shift_width as i32)
-            - (BUTTON_SPACING_PX * (layer.virtual_button_count - 1) as i32))
-            as f64
-            / layer.virtual_button_count as f64;
-        let left = (layer.buttons[first].0 as f64
-            * (virtual_button_width + BUTTON_SPACING_PX as f64))
-            .floor()
-            + self.volume.pixel_shift_x
-            + (self.volume.pixel_shift_width / 2) as f64;
-        let end = if last + 1 < layer.buttons.len() {
-            layer.buttons[last + 1].0
-        } else {
-            layer.virtual_button_count
-        };
-        let region_width = virtual_button_width
-            + ((end - layer.buttons[first].0 - 1) as f64
-                * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                .floor();
-        Some((left, left + region_width))
+    fn slider_geometry(&self, width: u16) -> Option<Geometry> {
+        let (first, last) = self.slider.region?;
+        Some(self.layers[self.slider.layer].slider_geometry(
+            width as i32,
+            first,
+            last,
+            self.slider.pixel_shift_width,
+            self.slider.pixel_shift_x,
+        ))
     }
 
-    /// Pixel bounds of the draggable track drawn inside the slider region,
-    /// after the speaker glyph that anchors its left end.
-    fn volume_track(&self, width: u16) -> Option<(f64, f64)> {
-        let (left, right) = self.volume_region(width)?;
-        Some((left + VOLUME_SPEAKER_ZONE_PX + 2.0, right - 2.0))
+    fn slider_region(&self, width: u16) -> Option<(f64, f64)> {
+        self.slider_geometry(width).map(|g| (g.left, g.right))
     }
 
-    fn volume_set_level(&mut self, target: u8, _emit_keys: &mut impl FnMut(&[Key], bool)) {
-        let target = target.min(VOLUME_LEVELS);
-        // Absolute writes also reassert zero if another desktop control has
-        // moved the output while this slider still displays its left endpoint.
-        self.volume_queue(VolumeRequest::Set(target));
-        // Keep rendering the last confirmed mixer state until its readback
-        // arrives. In particular, a failed zero write must not look silent.
-        self.mark_volume_changed();
+    #[cfg(test)]
+    fn slider_track(&self, width: u16) -> Option<(f64, f64)> {
+        self.slider_geometry(width)
+            .map(|g| (g.track_left(), g.track_right()))
+    }
+
+    #[cfg(test)]
+    fn slider_set_level(&mut self, target: u8, _emit_keys: &mut impl FnMut(&[Key], bool)) {
+        self.slider.set_level(target);
+        self.mark_slider_changed();
     }
 
     /// A touch-down on the drawn slider grabs it right away at the touched
     /// level; touching its left speaker glyph selects zero too.
-    fn volume_drag_start(
+    fn slider_drag_start(
         &mut self,
         slot: u32,
         x: f64,
         y: f64,
         width: u16,
         height: u16,
-        emit_keys: &mut impl FnMut(&[Key], bool),
+        _emit_keys: &mut impl FnMut(&[Key], bool),
     ) -> bool {
-        if !self.volume.active
-            || !self.volume.confirmed
-            || self.active != self.volume.layer
-            || self.volume.drag.is_some()
+        if !self.slider.active
+            || !self.slider.confirmed
+            || self.active != self.slider.layer
+            || self.slider.drag.is_some()
             || self.touches.contains_key(&slot)
         {
             return false;
         }
-        let Some((left, right)) = self.volume_region(width) else {
+        let Some((left, right)) = self.slider_region(width) else {
             return false;
         };
         if x < left || x > right || y < 0.1 * height as f64 || y > 0.9 * height as f64 {
             return false;
         }
-        self.volume.drag = Some(VolumeDrag { slot });
-        self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
-        if let Some((left, right)) = self.volume_track(width) {
-            self.volume_set_level(volume_level_at(x, left, right), emit_keys);
+        let geometry = self.slider_geometry(width).unwrap();
+        let changed = self.slider.begin_drag(slot, x, &geometry);
+        if changed {
+            self.mark_slider_changed();
         }
-        true
+        changed
     }
 
-    /// Drag motion sets the level directly; returns whether this slot owns
-    /// the drag so the caller can skip normal button motion handling.
-    fn volume_drag_motion(
+    /// Forward motion only for the finger that owns this overlay's drag.
+    fn slider_drag_motion(
         &mut self,
         slot: u32,
         x: f64,
         _y: f64,
         width: u16,
-        emit_keys: &mut impl FnMut(&[Key], bool),
+        _emit_keys: &mut impl FnMut(&[Key], bool),
     ) -> bool {
-        if !self.volume.active || !self.volume.drag.as_ref().is_some_and(|d| d.slot == slot) {
+        let Some(geometry) = self.slider_geometry(width) else {
             return false;
+        };
+        let changed = self.slider.drag_motion(slot, x, &geometry);
+        if changed {
+            self.mark_slider_changed();
         }
-        if let Some((left, right)) = self.volume_track(width) {
-            self.volume_set_level(volume_level_at(x, left, right), emit_keys);
-        }
-        self.volume.deadline = Some(Instant::now() + VOLUME_SLIDER_LINGER);
-        true
+        changed
     }
 
-    /// A drag or a still-held volume touch is ongoing interaction: the
+    /// A drag or a still-held activation is ongoing interaction: the
     /// slider stays up under the finger regardless of the deadline.
-    fn volume_interaction_held(&self) -> bool {
-        self.volume.drag.is_some() || self.touches.values().any(|touch| touch.volume)
+    fn slider_interaction_held(&self) -> bool {
+        self.slider.drag.is_some()
+            || self
+                .touches
+                .values()
+                .any(|touch| touch.slider == Some(self.slider.opened_revision))
     }
 
     /// Collapse the slider once its linger deadline passes with no
     /// interaction held.
-    fn volume_refresh(&mut self, now: Instant) -> bool {
-        if !self.volume.active
-            || self.volume_interaction_held()
-            || !self.volume.deadline.is_some_and(|deadline| now >= deadline)
+    fn slider_refresh(&mut self, now: Instant) -> bool {
+        if !self.slider.active
+            || self.slider_interaction_held()
+            || !self.slider.deadline.is_some_and(|deadline| now >= deadline)
         {
             return false;
         }
-        self.volume_collapse();
+        self.slider_collapse();
         true
     }
 
     /// Time remaining until the slider collapses, for the epoll timeout.
-    fn volume_timeout(&self, now: Instant) -> Option<Duration> {
-        if !self.volume.active || self.volume_interaction_held() {
+    fn slider_timeout(&self, now: Instant) -> Option<Duration> {
+        if !self.slider.active || self.slider_interaction_held() {
             return None;
         }
-        self.volume
+        self.slider
             .deadline
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 
     /// Slider rendering info, only while its owning bar is displayed.
-    fn volume_render(&self) -> Option<VolumeRender> {
-        if !self.volume.active || !self.volume.confirmed || self.active != self.volume.layer {
+    fn slider_render(&self) -> Option<Render> {
+        if !self.slider.active || !self.slider.confirmed || self.active != self.slider.layer {
             return None;
         }
-        let (first, last) = self.volume.region?;
-        Some(VolumeRender {
+        let (first, last) = self.slider.region?;
+        Some(Render {
             first,
             last,
-            level: self.volume.level,
-            muted: self.volume.muted,
+            level: self.slider.level,
+            muted: self.slider.muted,
+            kind: self.slider.kind,
         })
     }
 }
@@ -1956,7 +1762,8 @@ fn real_main(drm: &mut DrmBackend) {
     // Command buttons spawn their configured commands through this runner,
     // detached from the render loop.
     let commands = CommandRunner::new();
-    let mut volume_control = VolumeControl::new();
+    let mut volume_control = LevelControl::volume();
+    let mut brightness_control = LevelControl::brightness();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -1995,6 +1802,12 @@ fn real_main(drm: &mut DrmBackend) {
         .add(
             &volume_control.wake,
             EpollEvent::new(EpollFlags::EPOLLIN, 5),
+        )
+        .unwrap();
+    epoll
+        .add(
+            &brightness_control.wake,
+            EpollEvent::new(EpollFlags::EPOLLIN, 6),
         )
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
@@ -2055,16 +1868,22 @@ fn real_main(drm: &mut DrmBackend) {
             );
         }
 
-        for (revision, request) in std::mem::take(&mut layers.volume.requests) {
-            volume_control.send(revision, request);
+        for (revision, kind, request) in std::mem::take(&mut layers.slider.requests) {
+            match kind {
+                Kind::Volume => volume_control.send(revision, request),
+                Kind::Brightness => brightness_control.send(revision, request),
+            }
         }
         for (revision, result) in volume_control.update() {
-            layers.volume_reply(revision, result);
+            layers.slider_reply(revision, Kind::Volume, result);
+        }
+        for (revision, result) in brightness_control.update() {
+            layers.slider_reply(revision, Kind::Brightness, result);
         }
 
-        // The transient volume slider collapses on its own after a moment.
-        layers.volume_refresh(Instant::now());
-        if let Some(remaining) = layers.volume_timeout(Instant::now()) {
+        // The shared slider collapses on its own after a moment.
+        layers.slider_refresh(Instant::now());
+        if let Some(remaining) = layers.slider_timeout(Instant::now()) {
             next_timeout_ms = min(
                 next_timeout_ms,
                 remaining.as_millis().max(1).min(TIMEOUT_MS as u128) as i32,
@@ -2123,20 +1942,20 @@ fn real_main(drm: &mut DrmBackend) {
             };
             // Input uses the exact geometry of the last rendered frame, not
             // an unshifted estimate of where the visible endpoints lie.
-            layers.volume.pixel_shift_width = if cfg.enable_pixel_shift {
+            layers.slider.pixel_shift_width = if cfg.enable_pixel_shift {
                 PIXEL_SHIFT_WIDTH_PX
             } else {
                 0
             };
-            layers.volume.pixel_shift_x = shift.0;
-            let volume_render = layers.volume_render();
+            layers.slider.pixel_shift_x = shift.0;
+            let slider_render = layers.slider_render();
             let clips = layers.current_mut().draw(
                 &cfg,
                 (width as i32, height as i32),
                 &surface,
                 shift,
                 needs_complete_redraw,
-                volume_render,
+                slider_render,
             );
             if pet.is_visible() {
                 let pixel_shift_width = if cfg.enable_pixel_shift {
@@ -2245,7 +2064,7 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Motion(mtn) => {
                             let x = mtn.x_transformed(width as u32);
                             let y = mtn.y_transformed(height as u32);
-                            if layers.volume_drag_motion(
+                            if layers.slider_drag_motion(
                                 mtn.seat_slot(),
                                 x,
                                 y,
@@ -3247,7 +3066,7 @@ mod tests {
         }
     }
 
-    fn volume_deck() -> LayerDeck {
+    fn slider_deck() -> LayerDeck {
         LayerDeck::new(
             vec![
                 (
@@ -3275,18 +3094,261 @@ mod tests {
     }
 
     fn apply_mixer_requests(deck: &mut LayerDeck, actual: &mut u8) {
-        for (revision, request) in std::mem::take(&mut deck.volume.requests) {
+        for (revision, kind, request) in std::mem::take(&mut deck.slider.requests) {
+            assert_eq!(kind, Kind::Volume);
             match request {
-                VolumeRequest::Get => {}
-                VolumeRequest::Set(percent) => *actual = percent,
+                LevelRequest::Get => {}
+                LevelRequest::Set(percent) => *actual = percent,
             }
-            deck.volume_reply(
+            deck.slider_reply(
                 revision,
-                Ok(VolumeState {
+                Kind::Volume,
+                Ok(LevelState {
                     percent: *actual,
                     muted: false,
                 }),
             );
+        }
+    }
+
+    fn shared_slider_deck() -> LayerDeck {
+        let mut volume = slider_button("Volume");
+        volume.stretch = Some(3);
+        let brightness = ButtonConfig {
+            text: Some("Brightness".into()),
+            stretch: Some(2),
+            action: ButtonAction::BrightnessSlider,
+            ..ButtonConfig::default()
+        };
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        volume,
+                        brightness,
+                        keys("Play", &[Key::PlayPause]),
+                        nav("Functions", "function"),
+                    ]),
+                ),
+                (
+                    "function".into(),
+                    FunctionLayer::with_config(vec![nav("Home", "home")]),
+                ),
+            ],
+            0,
+            Some(1),
+            None,
+            false,
+        )
+    }
+
+    fn apply_level_requests(deck: &mut LayerDeck, volume: &mut u8, brightness: &mut u8) {
+        for (revision, kind, request) in std::mem::take(&mut deck.slider.requests) {
+            let actual = match kind {
+                Kind::Volume => &mut *volume,
+                Kind::Brightness => &mut *brightness,
+            };
+            if let LevelRequest::Set(value) = request {
+                *actual = value;
+            }
+            deck.slider_reply(
+                revision,
+                kind,
+                Ok(LevelState {
+                    percent: *actual,
+                    muted: false,
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn either_selection_uses_the_combined_region_without_jumping_or_cross_writes() {
+        for width in [2008, 2170] {
+            for shift in [-11.0, 0.0, 11.0] {
+                let mut deck = shared_slider_deck();
+                deck.slider.pixel_shift_width = PIXEL_SHIFT_WIDTH_PX;
+                deck.slider.pixel_shift_x = shift;
+                let spans = deck.current().layout_spans(width, PIXEL_SHIFT_WIDTH_PX);
+                let expected_region = (spans[0].left + shift, spans[1].right + shift);
+                let (mut volume, mut brightness) = (100, 93);
+                let mut emit = |_: &[Key], _: bool| panic!("level control emitted keys");
+                for (button, kind, other) in [
+                    (0, Kind::Volume, 93),
+                    (1, Kind::Brightness, 130),
+                    (0, Kind::Volume, 100),
+                ] {
+                    let x = (spans[button].left + spans[button].right) / 2.0 + shift;
+                    deck.touch_down_at(0, x, 30.0, width as u16, 60, &mut emit, &mut |_| {});
+                    assert_eq!(deck.slider.kind, kind);
+                    assert_eq!(deck.slider.region, Some((0, 1)));
+                    assert_eq!(deck.slider_region(width as u16).unwrap(), expected_region);
+                    assert!(deck.slider_render().is_none());
+                    assert_eq!(deck.slider.requests.len(), 1);
+                    assert_eq!(deck.slider.requests[0].1, kind);
+                    assert_eq!(deck.slider.requests[0].2, LevelRequest::Get);
+                    apply_level_requests(&mut deck, &mut volume, &mut brightness);
+                    assert_eq!(
+                        deck.slider.level,
+                        if kind == Kind::Volume {
+                            volume
+                        } else {
+                            brightness
+                        }
+                    );
+                    // Small motion while opening never becomes an absolute write.
+                    deck.touch_motion(0, x + 2.0, 30.0, width as u16, 60, &mut emit);
+                    assert!(deck.slider.requests.is_empty());
+                    let (left, right) = deck.slider_track(width as u16).unwrap();
+                    deck.touch_motion(0, left, 30.0, width as u16, 60, &mut emit);
+                    apply_level_requests(&mut deck, &mut volume, &mut brightness);
+                    assert_eq!(deck.slider.level, kind.range().0);
+                    assert_eq!(
+                        if kind == Kind::Volume {
+                            brightness
+                        } else {
+                            volume
+                        },
+                        other
+                    );
+                    for target in [kind.range().0, 25, 65, kind.range().1] {
+                        let (min, max) = kind.range();
+                        let x = left + (right - left) * (target - min) as f64 / (max - min) as f64;
+                        let previous = deck.slider.level;
+                        assert!(deck.slider_drag_motion(0, x, 30.0, width as u16, &mut emit));
+                        assert_eq!(deck.slider_render().unwrap().level, previous);
+                        apply_level_requests(&mut deck, &mut volume, &mut brightness);
+                        assert_eq!(deck.slider.level, target);
+                        assert_eq!(
+                            if kind == Kind::Volume {
+                                brightness
+                            } else {
+                                volume
+                            },
+                            other
+                        );
+                    }
+                    deck.touch_up(0, &mut emit);
+                    let deadline = deck.slider.deadline.unwrap();
+                    assert!(deck.slider_refresh(deadline));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changing_selection_discards_old_replies_and_old_held_finger() {
+        let mut deck = shared_slider_deck();
+        let spans = deck.current().layout_spans(2008, 0);
+        let center = |index: usize| (spans[index].left + spans[index].right) / 2.0;
+        // Both buttons are still visible while the first read is pending.
+        deck.touch_down_at(0, center(0), 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        let old = deck.slider.revision;
+        deck.touch_down_at(1, center(1), 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        let selected = deck.slider.revision;
+        assert_eq!(deck.slider.kind, Kind::Brightness);
+        deck.slider_reply(
+            old,
+            Kind::Volume,
+            Ok(LevelState {
+                percent: 130,
+                muted: true,
+            }),
+        );
+        deck.slider_reply(
+            old,
+            Kind::Volume,
+            Err(std::io::Error::other("old volume failed")),
+        );
+        assert!(deck.slider.active);
+        assert!(deck.slider_render().is_none());
+        deck.touch_motion(0, 0.0, 30.0, 2008, 60, &mut |_, _| {});
+        assert!(deck
+            .slider
+            .requests
+            .iter()
+            .all(|(_, _, r)| *r == LevelRequest::Get));
+        deck.slider_reply(
+            selected,
+            Kind::Brightness,
+            Ok(LevelState {
+                percent: 47,
+                muted: false,
+            }),
+        );
+        assert_eq!(deck.slider_render().unwrap().level, 47);
+        deck.touch_motion(1, 0.0, 30.0, 2008, 60, &mut |_, _| {});
+        let pending = deck.slider.revision;
+        assert_eq!(deck.slider_render().unwrap().level, 47);
+        deck.slider_reply(
+            pending,
+            Kind::Brightness,
+            Err(std::io::Error::other("permission denied")),
+        );
+        assert!(!deck.slider.active);
+        assert_eq!(deck.slider.level, 47);
+        deck.slider_reply(
+            pending,
+            Kind::Brightness,
+            Ok(LevelState {
+                percent: 1,
+                muted: false,
+            }),
+        );
+        assert!(deck.slider_render().is_none());
+        deck.release_all(&mut |_, _| {});
+        deck.touch_down_at(2, center(0), 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.slider_reply(
+            selected,
+            Kind::Brightness,
+            Ok(LevelState {
+                percent: 47,
+                muted: false,
+            }),
+        );
+        assert!(deck.slider_render().is_none());
+        assert_eq!(deck.slider.kind, Kind::Volume);
+    }
+
+    #[test]
+    fn open_slider_consumes_the_gap_and_second_finger_but_leaves_other_controls_accessible() {
+        for kind in [Kind::Volume, Kind::Brightness] {
+            let mut deck = shared_slider_deck();
+            let spans = deck.current().layout_spans(2008, 0);
+            let button = usize::from(kind == Kind::Brightness);
+            let x = (spans[button].left + spans[button].right) / 2.0;
+            deck.touch_down_at(0, x, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+            let (mut volume, mut brightness) = (65, 93);
+            apply_level_requests(&mut deck, &mut volume, &mut brightness);
+            deck.touch_up(0, &mut |_, _| {});
+            let gap = (spans[0].right + spans[1].left) / 2.0;
+            assert!(deck.current().hit(2008, 60, gap, 30.0, None).is_none());
+            deck.touch_down_at(1, gap, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+            let queued = deck.slider.requests.len();
+            deck.touch_down_at(2, x, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+            assert_eq!(deck.slider.requests.len(), queued);
+            assert_eq!(deck.slider.kind, kind);
+            assert_eq!(deck.slider.drag.as_ref().unwrap().slot, 1);
+            let mut events = Vec::new();
+            let play = (spans[2].left + spans[2].right) / 2.0;
+            deck.touch_down_at(
+                3,
+                play,
+                30.0,
+                2008,
+                60,
+                &mut |keys, state| events.push((keys.to_vec(), state)),
+                &mut |_| {},
+            );
+            deck.touch_up(3, &mut |keys, state| events.push((keys.to_vec(), state)));
+            assert_eq!(
+                events,
+                vec![(vec![Key::PlayPause], true), (vec![Key::PlayPause], false)]
+            );
+            assert!(deck.slider.active);
+            assert!(deck.fn_event(true, false, &mut |_, _| {}));
+            assert!(!deck.slider.active);
         }
     }
 
@@ -3296,7 +3358,7 @@ mod tests {
         // pre-fix run is retained in the task proof; the 100% case also failed
         // when the helper ceiling was100%, independently of the130% setting.
         for initial in [40, 100, 130] {
-            let mut deck = volume_deck();
+            let mut deck = slider_deck();
             let mut actual = initial;
             let mut emit = |_: &[Key], _: bool| panic!("slider emitted relative keys");
             deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
@@ -3304,7 +3366,7 @@ mod tests {
             deck.touch_motion(0, 0.0, 30.0, 2008, 60, &mut emit);
             apply_mixer_requests(&mut deck, &mut actual);
             deck.touch_up(0, &mut emit);
-            assert_eq!(deck.volume.level, 0);
+            assert_eq!(deck.slider.level, 0);
             assert_eq!(actual, 0, "left endpoint left audible volume");
             // A mixer change outside the bar must not defeat a repeated zero.
             actual = 100;
@@ -3316,7 +3378,7 @@ mod tests {
     }
 
     #[test]
-    fn single_volume_control_opens_without_stepping_and_drags_the_full_range() {
+    fn single_slider_control_opens_without_stepping_and_drags_the_full_range() {
         for (width, layer) in [(2008, 0), (2170, 0), (2008, 1)] {
             let slider = || ButtonConfig {
                 text: Some("Volume".into()),
@@ -3347,30 +3409,30 @@ mod tests {
             let mut actual = 100;
             let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
             deck.touch_down_at(0, x, 30.0, width as u16, 60, &mut emit, &mut |_| {});
-            assert_eq!(deck.volume.requests.last().unwrap().1, VolumeRequest::Get);
+            assert_eq!(deck.slider.requests.last().unwrap().2, LevelRequest::Get);
             apply_mixer_requests(&mut deck, &mut actual);
             assert_eq!(actual, 100);
-            assert_eq!(deck.volume.level, 100);
-            let (left, right) = deck.volume_track(width as u16).unwrap();
+            assert_eq!(deck.slider.level, 100);
+            let (left, right) = deck.slider_track(width as u16).unwrap();
             deck.touch_motion(0, left, 30.0, width as u16, 60, &mut emit);
             apply_mixer_requests(&mut deck, &mut actual);
             assert_eq!(actual, 0);
             for expected in [1, 25, 65, 100, 129, 130] {
                 let x = left + (right - left) * expected as f64 / 130.0;
-                assert!(deck.volume_drag_motion(0, x, 30.0, width as u16, &mut emit));
+                assert!(deck.slider_drag_motion(0, x, 30.0, width as u16, &mut emit));
                 apply_mixer_requests(&mut deck, &mut actual);
                 assert_eq!(actual, expected);
-                assert_eq!(deck.volume.level, expected);
+                assert_eq!(deck.slider.level, expected);
             }
-            assert!(!deck.volume_drag_start(1, x, 30.0, width as u16, 60, &mut emit));
+            assert!(!deck.slider_drag_start(1, x, 30.0, width as u16, 60, &mut emit));
             deck.touch_up(0, &mut emit);
-            assert!(deck.volume.drag.is_none());
+            assert!(deck.slider.drag.is_none());
         }
     }
 
     #[test]
     fn drawn_slider_owns_covered_buttons_and_the_speaker_selects_zero() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         let mut actual = 100;
         let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
         deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
@@ -3379,107 +3441,119 @@ mod tests {
         assert_eq!(deck.current().hit(2008, 60, 751.0, 30.0, None), Some(1));
         deck.touch_down_at(1, 751.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
         apply_mixer_requests(&mut deck, &mut actual);
-        assert_eq!(actual, volume_level_at(751.0, 30.0, 1500.0));
+        assert_eq!(actual, Kind::Volume.level_at(751.0, 30.0, 1500.0));
         deck.touch_up(1, &mut emit);
         deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
         apply_mixer_requests(&mut deck, &mut actual);
         deck.touch_up(2, &mut emit);
         assert_eq!(actual, 0);
-        assert!(!deck.volume.muted);
+        assert!(!deck.slider.muted);
     }
 
     #[test]
     fn old_readbacks_and_failed_writes_cannot_display_a_false_success() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
-        assert!(deck.volume_render().is_none()); // no guessed zero while reading
-        let old = deck.volume.revision;
-        deck.volume_reply(
+        assert!(deck.slider_render().is_none()); // no guessed zero while reading
+        let old = deck.slider.revision;
+        deck.slider_reply(
             old,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 100,
                 muted: false,
             }),
         );
         deck.touch_motion(0, 0.0, 30.0, 2008, 60, &mut |_, _| {});
-        deck.volume_reply(
+        deck.slider_reply(
             old,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 130,
                 muted: false,
             }),
         );
-        assert_eq!(deck.volume_render().unwrap().level, 100); // stale reply ignored
-        let current = deck.volume.revision;
-        deck.volume_reply(current, Err(std::io::Error::other("receiver unavailable")));
-        assert!(!deck.volume.active);
-        assert!(deck.volume_render().is_none());
-        assert_eq!(deck.volume.level, 100); // failed zero was never displayed
-        deck.volume_reply(
+        assert_eq!(deck.slider_render().unwrap().level, 100); // stale reply ignored
+        let current = deck.slider.revision;
+        deck.slider_reply(
             current,
-            Ok(VolumeState {
+            Kind::Volume,
+            Err(std::io::Error::other("receiver unavailable")),
+        );
+        assert!(!deck.slider.active);
+        assert!(deck.slider_render().is_none());
+        assert_eq!(deck.slider.level, 100); // failed zero was never displayed
+        deck.slider_reply(
+            current,
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 0,
                 muted: false,
             }),
         );
-        assert!(!deck.volume.active);
+        assert!(!deck.slider.active);
     }
 
     #[test]
     fn confirmed_drag_progress_renders_while_a_newer_target_is_pending() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
-        let opening = deck.volume.revision;
-        deck.volume_set_level(10, &mut |_, _| {});
-        let first = deck.volume.revision;
-        deck.volume_set_level(20, &mut |_, _| {});
-        let latest = deck.volume.revision;
-        deck.volume_reply(
+        let opening = deck.slider.revision;
+        deck.slider_set_level(10, &mut |_, _| {});
+        let first = deck.slider.revision;
+        deck.slider_set_level(20, &mut |_, _| {});
+        let latest = deck.slider.revision;
+        deck.slider_reply(
             first,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 10,
                 muted: false,
             }),
         );
-        assert_eq!(deck.volume_render().unwrap().level, 10);
-        deck.volume_reply(
+        assert_eq!(deck.slider_render().unwrap().level, 10);
+        deck.slider_reply(
             opening,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 100,
                 muted: false,
             }),
         );
-        assert_eq!(deck.volume_render().unwrap().level, 10);
-        deck.volume_reply(
+        assert_eq!(deck.slider_render().unwrap().level, 10);
+        deck.slider_reply(
             latest,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 20,
                 muted: false,
             }),
         );
-        deck.volume_reply(
+        deck.slider_reply(
             first,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 10,
                 muted: false,
             }),
         );
-        assert_eq!(deck.volume_render().unwrap().level, 20);
-        deck.volume_collapse();
+        assert_eq!(deck.slider_render().unwrap().level, 20);
+        deck.slider_collapse();
         deck.touch_down_at(1, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
-        deck.volume_reply(
+        deck.slider_reply(
             latest,
-            Ok(VolumeState {
+            Kind::Volume,
+            Ok(LevelState {
                 percent: 20,
                 muted: false,
             }),
         );
-        assert!(deck.volume_render().is_none());
+        assert!(deck.slider_render().is_none());
     }
 
     #[test]
     fn repeated_open_before_readback_does_not_change_volume() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         for slot in 0..2 {
             deck.touch_down_at(
                 slot,
@@ -3493,10 +3567,10 @@ mod tests {
             deck.touch_up(slot, &mut |_, _| {});
         }
         assert!(deck
-            .volume
+            .slider
             .requests
             .iter()
-            .all(|(_, request)| *request == VolumeRequest::Get));
+            .all(|(_, kind, request)| *kind == Kind::Volume && *request == LevelRequest::Get));
         let mut actual = 100;
         apply_mixer_requests(&mut deck, &mut actual);
         assert_eq!(actual, 100);
@@ -3506,9 +3580,9 @@ mod tests {
     fn pixel_shifted_drawn_endpoints_still_set_zero_and_130() {
         for width in [2008, 2170] {
             for shift in [-11.0, 0.0, 11.0] {
-                let mut deck = volume_deck();
-                deck.volume.pixel_shift_width = PIXEL_SHIFT_WIDTH_PX;
-                deck.volume.pixel_shift_x = shift;
+                let mut deck = slider_deck();
+                deck.slider.pixel_shift_width = PIXEL_SHIFT_WIDTH_PX;
+                deck.slider.pixel_shift_x = shift;
                 let spans = deck.current().layout_spans(width, PIXEL_SHIFT_WIDTH_PX);
                 // layout_spans is the actual widget geometry consumer. The
                 // drawn speaker zone and track insets remain30px /2px.
@@ -3528,7 +3602,7 @@ mod tests {
                 deck.touch_motion(0, left, 30.0, width as u16, 60, &mut |_, _| {});
                 apply_mixer_requests(&mut deck, &mut actual);
                 assert_eq!(actual, 0, "visible left endpoint at shift{shift}");
-                deck.volume_drag_motion(0, right, 30.0, width as u16, &mut |_, _| {});
+                deck.slider_drag_motion(0, right, 30.0, width as u16, &mut |_, _| {});
                 apply_mixer_requests(&mut deck, &mut actual);
                 assert_eq!(actual, 130, "visible right endpoint at shift{shift}");
             }
@@ -3536,39 +3610,39 @@ mod tests {
     }
 
     #[test]
-    fn volume_level_math_rounds_and_clamps() {
-        assert_eq!(volume_level_at(-50.0, 0.0, 1502.0), 0);
-        assert_eq!(volume_level_at(0.0, 0.0, 1502.0), 0);
-        assert_eq!(volume_level_at(751.0, 0.0, 1502.0), 65);
-        assert_eq!(volume_level_at(1502.0, 0.0, 1502.0), 130);
-        assert_eq!(volume_level_at(5000.0, 0.0, 1502.0), 130);
+    fn slider_level_math_rounds_and_clamps() {
+        assert_eq!(Kind::Volume.level_at(-50.0, 0.0, 1502.0), 0);
+        assert_eq!(Kind::Volume.level_at(0.0, 0.0, 1502.0), 0);
+        assert_eq!(Kind::Volume.level_at(751.0, 0.0, 1502.0), 65);
+        assert_eq!(Kind::Volume.level_at(1502.0, 0.0, 1502.0), 130);
+        assert_eq!(Kind::Volume.level_at(5000.0, 0.0, 1502.0), 130);
     }
 
     #[test]
     fn the_slider_collapses_after_a_lull_and_interaction_resets_the_timer() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
-        let deadline = deck.volume.deadline.unwrap();
+        let deadline = deck.slider.deadline.unwrap();
 
         // Just short of the deadline it is still up and still counting down.
-        assert!(!deck.volume_refresh(deadline - Duration::from_millis(1)));
-        assert!(deck.volume.active);
+        assert!(!deck.slider_refresh(deadline - Duration::from_millis(1)));
+        assert!(deck.slider.active);
         assert!(deck
-            .volume_timeout(deadline - Duration::from_secs(1))
+            .slider_timeout(deadline - Duration::from_secs(1))
             .is_some());
 
         // A fresh press restarts the clock.
         deck.touch_down(1, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(1, &mut |_, _| {});
-        assert!(deck.volume.deadline.unwrap() > deadline);
+        assert!(deck.slider.deadline.unwrap() > deadline);
 
         // Past the deadline with no interaction it collapses and stops timing.
-        let deadline = deck.volume.deadline.unwrap();
-        assert!(deck.volume_refresh(deadline + Duration::from_millis(1)));
-        assert!(!deck.volume.active);
-        assert!(deck.volume_render().is_none());
-        assert_eq!(deck.volume_timeout(deadline), None);
+        let deadline = deck.slider.deadline.unwrap();
+        assert!(deck.slider_refresh(deadline + Duration::from_millis(1)));
+        assert!(!deck.slider.active);
+        assert!(deck.slider_render().is_none());
+        assert_eq!(deck.slider_timeout(deadline), None);
         // The collapse flags the cluster so the bar repaints it.
         assert!(deck.layers[deck.home].buttons[..3]
             .iter()
@@ -3576,30 +3650,30 @@ mod tests {
     }
 
     #[test]
-    fn a_held_volume_press_keeps_the_slider_up_until_release() {
-        let mut deck = volume_deck();
+    fn a_held_slider_press_keeps_the_slider_up_until_release() {
+        let mut deck = slider_deck();
         // The summoning press stays held: the slider must not collapse
         // under the finger even past the deadline.
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
-        let deadline = deck.volume.deadline.unwrap();
-        assert!(!deck.volume_refresh(deadline + Duration::from_secs(10)));
-        assert!(deck.volume.active);
+        let deadline = deck.slider.deadline.unwrap();
+        assert!(!deck.slider_refresh(deadline + Duration::from_secs(10)));
+        assert!(deck.slider.active);
         // The wait hint reports no pending collapse, not a passed one.
         assert_eq!(
-            deck.volume_timeout(deadline + Duration::from_secs(10)),
+            deck.slider_timeout(deadline + Duration::from_secs(10)),
             None
         );
         // A still-held second-finger press on the cluster holds it too.
         deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
-        assert!(!deck.volume_refresh(deadline + Duration::from_secs(20)));
-        assert!(deck.volume.active);
+        assert!(!deck.slider_refresh(deadline + Duration::from_secs(20)));
+        assert!(deck.slider.active);
         // Once every finger lifts, the release restarts the clock and the
         // quiet period collapses it.
         deck.touch_up(1, &mut |_, _| {});
-        let deadline = deck.volume.deadline.unwrap();
-        assert!(deck.volume_refresh(deadline + Duration::from_millis(1)));
-        assert!(!deck.volume.active);
+        let deadline = deck.slider.deadline.unwrap();
+        assert!(deck.slider_refresh(deadline + Duration::from_millis(1)));
+        assert!(!deck.slider.active);
     }
 
     fn outline_config() -> Config {
@@ -3625,7 +3699,7 @@ mod tests {
 
     #[test]
     fn the_slider_covers_the_cluster_renders_its_level_and_restores_the_bar() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         let config = outline_config();
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
@@ -3637,7 +3711,7 @@ mod tests {
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         apply_mixer_requests(&mut deck, &mut 65);
-        let volume = deck.volume_render();
+        let volume = deck.slider_render();
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -3650,10 +3724,10 @@ mod tests {
         assert_ne!(&*low_level, home_image.as_slice());
 
         // A higher level fills more of the track.
-        deck.volume.level = VOLUME_LEVELS;
-        deck.mark_volume_changed();
+        deck.slider.level = level_control::MAX_VOLUME_PERCENT;
+        deck.mark_slider_changed();
         apply_mixer_requests(&mut deck, &mut 65);
-        let volume = deck.volume_render();
+        let volume = deck.slider_render();
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -3666,10 +3740,10 @@ mod tests {
 
         // The muted state renders differently at the same level.
         let full_level = surface.data().unwrap().to_vec();
-        deck.volume.muted = true;
-        deck.mark_volume_changed();
+        deck.slider.muted = true;
+        deck.mark_slider_changed();
         apply_mixer_requests(&mut deck, &mut 65);
-        let volume = deck.volume_render();
+        let volume = deck.slider_render();
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -3681,7 +3755,7 @@ mod tests {
         assert_ne!(&*surface.data().unwrap(), full_level.as_slice());
 
         // Collapsing restores exactly the original home bar.
-        deck.volume_collapse();
+        deck.slider_collapse();
         deck.current_mut()
             .draw(&config, (width, height), &surface, (0.0, 0.0), false, None);
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
@@ -3714,7 +3788,7 @@ mod tests {
         deck.touch_down(0, 2, 1800.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
         apply_mixer_requests(&mut deck, &mut 65);
-        let volume = deck.volume_render().unwrap();
+        let volume = deck.slider_render().unwrap();
         assert_eq!((volume.first, volume.last), (0, 2));
         let clips = deck.current_mut().draw(
             &config,
@@ -3737,7 +3811,7 @@ mod tests {
         }
 
         // The recovery clips after collapse obey the same bound.
-        deck.volume_collapse();
+        deck.slider_collapse();
         let clips =
             deck.current_mut()
                 .draw(&config, (width, height), &surface, (0.0, 0.0), false, None);
@@ -3782,9 +3856,9 @@ mod tests {
         // Summon on the first cluster: its span is drawn over.
         deck.touch_down(0, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
-        assert_eq!(deck.volume.region, Some((0, 2)));
+        assert_eq!(deck.slider.region, Some((0, 2)));
         apply_mixer_requests(&mut deck, &mut 65);
-        let volume = deck.volume_render();
+        let volume = deck.slider_render();
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -3797,9 +3871,9 @@ mod tests {
         // Pressing the second, separated cluster moves the slider there.
         deck.touch_down(1, 4, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(1, &mut |_, _| {});
-        assert_eq!(deck.volume.region, Some((4, 5)));
+        assert_eq!(deck.slider.region, Some((4, 5)));
         apply_mixer_requests(&mut deck, &mut 65);
-        let volume = deck.volume_render();
+        let volume = deck.slider_render();
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -3810,7 +3884,7 @@ mod tests {
         );
 
         // Collapsing restores the whole bar, first cluster included.
-        deck.volume_collapse();
+        deck.slider_collapse();
         deck.current_mut()
             .draw(&config, (width, height), &surface, (0.0, 0.0), false, None);
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
@@ -3818,47 +3892,47 @@ mod tests {
 
     #[test]
     fn layer_changes_end_the_slider_and_legacy_keys_still_emit_keys() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
-        assert!(deck.volume.active);
+        assert!(deck.slider.active);
 
         // Navigating away collapses it...
         assert!(deck.touch_down(1, 3, 1750.0, 30.0, &mut |_, _| {}, &mut |_| {}));
         assert_eq!(deck.active, 1);
-        assert!(!deck.volume.active);
+        assert!(!deck.slider.active);
 
         // ...and volume buttons on other layers never summon it.
         deck.touch_down(2, 1, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(2, &mut |_, _| {});
-        assert!(!deck.volume.active);
-        assert!(!deck.volume_drag_start(3, 700.0, 30.0, 2008, 60, &mut |_, _| {}));
+        assert!(!deck.slider.active);
+        assert!(!deck.slider_drag_start(3, 700.0, 30.0, 2008, 60, &mut |_, _| {}));
 
         // Back home it summons again; a reload replaces it with a fresh deck.
         assert!(deck.touch_down(4, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
         assert_eq!(deck.active, deck.home);
-        deck.replace(volume_deck(), &mut |_, _| {});
-        assert!(!deck.volume.active);
+        deck.replace(slider_deck(), &mut |_, _| {});
+        assert!(!deck.slider.active);
 
         // Summoning once more, input release (cancel, display sleep, device
         // removal) collapses it and drops any drag.
         deck.touch_down(5, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_motion(5, 1280.0, 30.0, 2008, 60, &mut |_, _| {});
-        assert!(deck.volume.drag.is_some());
+        assert!(deck.slider.drag.is_some());
         deck.release_all(&mut |_, _| {});
-        assert!(!deck.volume.active);
-        assert!(deck.volume.drag.is_none());
+        assert!(!deck.slider.active);
+        assert!(deck.slider.drag.is_none());
     }
 
     #[test]
     fn a_cancelled_drag_leaves_every_key_released() {
-        let mut deck = volume_deck();
+        let mut deck = slider_deck();
         let mut emit = |_: &[Key], _: bool| panic!("volume route emitted keys");
         deck.touch_down(0, 2, 1260.0, 30.0, &mut emit, &mut |_| {});
         deck.touch_motion(0, 1300.0, 30.0, 2008, 60, &mut emit);
         deck.release_all(&mut emit);
-        assert!(deck.volume.drag.is_none());
-        assert!(!deck.volume.active);
+        assert!(deck.slider.drag.is_none());
+        assert!(!deck.slider.active);
         assert!(deck.touches.is_empty());
         assert!(deck.current().buttons.iter().all(|(_, b)| !b.active));
     }
@@ -3894,8 +3968,8 @@ mod tests {
         // Summon the slider on the media home bar.
         assert!(!deck.touch_down_at(0, 1400.0, 30.0, 2008, 60, &mut emit, &mut |_| {}));
         deck.touch_up(0, &mut emit);
-        assert!(deck.volume.active);
-        assert_eq!(deck.volume.region, Some((0, 2)));
+        assert!(deck.slider.active);
+        assert_eq!(deck.slider.region, Some((0, 2)));
 
         // The legacy double press swaps the home to the one-button primary;
         // the slider collapses while its region still matches the old home,
@@ -3904,21 +3978,21 @@ mod tests {
         assert!(deck.fn_event(false, false, &mut emit));
         assert_eq!(deck.home, 1);
         assert_eq!(deck.active, 1);
-        assert!(!deck.volume.active);
+        assert!(!deck.slider.active);
         assert!(deck.layers[0]
             .buttons
             .iter()
             .all(|(_, button)| button.changed));
-        assert_eq!(deck.volume.deadline, None);
-        assert!(!deck.volume_refresh(Instant::now() + Duration::from_secs(60)));
+        assert_eq!(deck.slider.deadline, None);
+        assert!(!deck.slider_refresh(Instant::now() + Duration::from_secs(60)));
     }
 
     #[test]
-    fn decks_without_a_volume_slider_control_never_summon_a_slider() {
+    fn decks_without_a_slider_control_never_summon_a_slider() {
         let mut deck = named_deck();
         deck.touch_down(0, 0, 330.0, 30.0, &mut |_, _| {}, &mut |_| {});
         deck.touch_up(0, &mut |_, _| {});
-        assert!(!deck.volume.active);
-        assert!(!deck.volume_drag_start(1, 500.0, 30.0, 2008, 60, &mut |_, _| {}));
+        assert!(!deck.slider.active);
+        assert!(!deck.slider_drag_start(1, 500.0, 30.0, 2008, 60, &mut |_, _| {}));
     }
 }

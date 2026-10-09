@@ -9,8 +9,7 @@ FnLayer = "function"
 Name = "home"
 Keys = [
     { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
-    { Icon = "brightness_low", Action = "BrightnessDown" },
-    { Icon = "brightness_high", Action = "BrightnessUp" },
+    { Icon = "brightness_high", Stretch = 2, Action = "BrightnessSlider" },
     { Icon = "play_pause", Action = "PlayPause" },
     { Text = "F1-F12", Action = { Layer = "function" } },
     { Text = "Media", Action = { Layer = "media" } },

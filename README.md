@@ -28,22 +28,23 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
     cargo test --locked approved_multibar_preserves_voice_dispatch_and_renders_offline -- --test-threads=1
 ```
 
-Inspect `implemented-home.png` and `implemented-recording.png` in that directory.
+Inspect `implemented-home.png`, `implemented-volume-mid.png`,
+`implemented-brightness.png`, and `implemented-recording.png` in that directory.
 These frames use the configured font and icon search paths; their battery and
 clock display is illustrative and they do not prove physical touch or dictation.
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
-presses/releases, battery widget cycling, the transient volume slider (opening
-the volume control without stepping, absolute drag position-to-percent math,
-auto-collapse timing, live level rendering, mixer readback and failure
-handling, and layer isolation), command buttons (parse and
+presses/releases, battery widget cycling, the shared volume/brightness slider (either
+selection without stepping, combined-region geometry and drag math, safe ranges,
+auto-collapse timing, confirmed readback, failures, stale replies and selection
+isolation), command buttons (parse and
 combined layer dispatch, detached execution, and the one-invocation-per-command
 cap), and the virtual pet (pet-layer wiring and button toggle, wander bounds,
 pause and resume across layer switches, nap gating and placement, satiety decay
 and feeding, startle, tap consumption, and reload transitions). Physical
 layout, touch accuracy, brightness, media-key delivery to the desktop, live
-battery/clock refresh, the volume slider's on-glass drag feel, command buttons'
+battery/clock refresh, the shared slider's on-glass drag feel, command buttons'
 interaction with a real helper, and the pet's on-glass charm still need a device
 test; battery checks there must include repeated tap-to-cycle, device labels in
 each display mode, hotplug, and timed return.
@@ -104,7 +105,8 @@ An optional per-button `Accent` overrides the automatic color: `"neutral"`,
 `"cyan"`, `"amber"`, `"violet"`, `"red"`, or `"green"`. For example,
 `{ Text = "Home", Accent = "violet", Action = { Layer = "home" } }`.
 Battery charging and low-charge colors take precedence over this override.
-The transient volume slider uses the same cyan, with a subdued muted fill.
+The shared slider uses cyan for volume (with a subdued muted fill) and amber
+for brightness, with a speaker or sun identifying the selected control.
 
 Tap a battery widget to cycle from the system battery through connected device
 batteries (including `scope=Device` power supplies such as hidpp mice), then back
@@ -121,39 +123,45 @@ settings have these defaults when absent from older configurations. Cycling,
 automatic return, and removal of a selected source release held virtual keys and
 discard existing touches; fingers already down must lift before pressing again.
 
-### Transient volume slider
+### Shared volume and brightness slider
 
-The named-bar example has one cyan volume button (`Action = "VolumeSlider"`)
-that opens the existing slider without changing the output. Its three-slot
-span retains room for dragging, and the home bar ends with the labeled Mic.
-The separate up/down and mute buttons are omitted on home and media.
+The named-bar home has one cyan `VolumeSlider` button and one amber
+`BrightnessSlider` button. Pressing either reads its current hardware level and
+replaces their entire combined region, including the gap, with one slider for
+that control. Other controls stay accessible, with Mic at the far right.
+Adjacent slider actions share their span on any bar; a standalone action uses
+its own span. The media bar retains its single volume control.
 
-Touching or dragging the slider selects an absolute output percentage: its
-far-left endpoint (including the speaker glyph) sets all output channels to
-zero; its far-right endpoint retains the 130% ceiling. Intermediate percentages
-are reachable across the track. The first finger can drag immediately after
-opening the slider, and a later touch grabs the drawn track directly. Moving
-volume above zero unmutes the selected output. The slider collapses about two
-and a half seconds after the last interaction; navigation, Fn, reload and input
-release also restore the bar.
+Opening never changes the level or jumps to the activation position. The first
+finger can drag after moving past the tap threshold; a later touch grabs the
+drawn track directly. The speaker or sun zone selects the minimum. The slider
+collapses about two and a half seconds after the last interaction; navigation,
+Fn, reload and input release also restore the bar. To select the other control,
+let the slider close and press its button. A second finger inside an open slider
+cannot activate the hidden buttons.
 
-The [desktop audio receiver](integrations/audio/README.md) is required for the
-slider. It resolves the current output through the same Omarchy sink resolver
-as the keyboard helper, sets volume absolutely, and returns the mixer value.
-Requests execute in order outside the render loop, with fast drag updates
-coalesced to the latest target. Opening reads the current output, so changes
-made in the desktop mixer or keyboard are reflected when it reopens. Receiver
-failures are logged and collapse the overlay instead of reporting success.
-The thumb follows confirmed mixer readback; a pending or failed write never
-substitutes a guessed zero. No change to the user's existing 130% keyboard helper
-is needed.
+Volume remains absolute: the far left sets all output channels to true zero,
+the far right reaches 130%, and intermediate percentages remain reachable.
+Absolute writes clear mute. The [desktop audio receiver](integrations/audio/README.md)
+resolves the current output using the existing Omarchy sink resolver and returns
+mixer readback.
 
-The daemon stays `nobody` with its existing home/tmp and AF_UNIX restrictions;
-a separate user-session receiver owns access to the mixer. The client checks
-the receiver's peer UID, and the receiver accepts only the desktop user or
-`nobody`. This does not use or alter the dictation receiver. Ordinary
-legacy volume-key controls continue to emit their configured keys on all layers.
-The explicit `VolumeSlider` action works on any named bar.
+Brightness uses the [display receiver](integrations/brightness/README.md) and
+the working desktop `brightnessctl` interface for `apple-panel-bl`, with the
+keyboard helper's linear 1–100% range. The minimum leaves the display on;
+the Touch Bar and keyboard backlights are never selected. A separate read after
+every write supplies confirmed brightness, rather than echoing the target.
+Opening either slider reflects external changes without writing the other
+control.
+
+Both adapters run outside the render loop. Fast drag updates coalesce to the
+latest target, and the fill follows confirmed readback while writes are pending.
+Failures are logged and collapse the overlay; stale replies from an earlier
+selection or opening cannot repaint it or overwrite a newer confirmed level.
+The daemon keeps its existing `nobody`, home/tmp and AF_UNIX restrictions; the
+narrow user receivers own session access and verify kernel peer UIDs. No host
+permission changes or voice integration replacements are needed. Legacy volume
+and brightness key actions continue to emit their configured keys.
 
 ### Command buttons and voice dictation
 
