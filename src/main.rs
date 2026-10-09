@@ -48,6 +48,7 @@ mod appearance;
 mod backlight;
 mod command;
 mod config;
+mod daycycle;
 mod display;
 mod fonts;
 mod level_control;
@@ -60,6 +61,8 @@ use appearance::ButtonAccent;
 use backlight::BacklightManager;
 use command::CommandRunner;
 use config::{ButtonAction, ButtonConfig, Config};
+#[cfg(test)]
+use daycycle::DayCycle;
 use display::DrmBackend;
 #[cfg(test)]
 use level_control::Request as LevelRequest;
@@ -893,6 +896,7 @@ impl FunctionLayer {
             slider_region_drawn: None,
         }
     }
+    #[allow(clippy::too_many_arguments)] // a full frame: layout, shift, overlay, and strip background
     fn draw(
         &mut self,
         config: &Config,
@@ -901,6 +905,7 @@ impl FunctionLayer {
         pixel_shift: (f64, f64),
         complete_redraw: bool,
         slider: Option<Render>,
+        background: (f64, f64, f64),
     ) -> Vec<ClipRect> {
         let c = Context::new(surface).unwrap();
         let mut modified_regions = if complete_redraw {
@@ -922,7 +927,7 @@ impl FunctionLayer {
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
 
         if complete_redraw {
-            c.set_source_rgb(0.0, 0.0, 0.0);
+            c.set_source_rgb(background.0, background.1, background.2);
             c.paint().unwrap();
         }
         c.set_font_face(&config.font_face);
@@ -943,7 +948,7 @@ impl FunctionLayer {
                 self.slider_geometry(width, first, last, pixel_shift_width, pixel_shift_x);
             let left_edge = geometry.left;
             let region_width = geometry.right - geometry.left;
-            c.set_source_rgb(0.0, 0.0, 0.0);
+            c.set_source_rgb(background.0, background.1, background.2);
             c.rectangle(
                 (left_edge - 2.0).max(0.0),
                 0.0,
@@ -997,7 +1002,7 @@ impl FunctionLayer {
             if !complete_redraw {
                 // Erase the entire column so fitted labels and pressed borders
                 // cannot leave pixels behind after an incremental redraw.
-                c.set_source_rgb(0.0, 0.0, 0.0);
+                c.set_source_rgb(background.0, background.1, background.2);
                 c.rectangle(left_edge, 0.0, button_width.ceil(), height as f64);
                 c.fill().unwrap();
             }
@@ -1060,7 +1065,7 @@ impl FunctionLayer {
 
             if !complete_redraw {
                 // Clear the whole cluster column, icons and outlines included.
-                c.set_source_rgb(0.0, 0.0, 0.0);
+                c.set_source_rgb(background.0, background.1, background.2);
                 c.rectangle(
                     (left_edge - 2.0).max(0.0),
                     0.0,
@@ -1839,6 +1844,9 @@ fn real_main(drm: &mut DrmBackend) {
     } else {
         Local::now().minute()
     };
+    // The time-of-day background repaints once when its band changes, on
+    // the same wake cadence as the clock and battery widgets.
+    let mut last_day_band = cfg.day_cycle.band_at(Local::now().hour()).cloned();
     loop {
         if let Some((new_cfg, new_layers)) = cfg_mgr.update_config(width) {
             layers.replace(new_layers, &mut |keys, active| {
@@ -1853,6 +1861,15 @@ fn real_main(drm: &mut DrmBackend) {
         let now = Local::now();
         let ms_left = ((60 - now.second()) * 1000) as i32;
         let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
+
+        // A new time-of-day band repaints the whole strip once; an
+        // unchanged band adds no redraw churn, and the disabled cycle
+        // stays `None` without ever waking the bar.
+        let day_band = cfg.day_cycle.band_at(now.hour());
+        if day_band != last_day_band.as_ref() {
+            last_day_band = day_band.cloned();
+            needs_complete_redraw = true;
+        }
 
         battery_monitor.update();
         if let Some(remaining) = layers.refresh_batteries(
@@ -1949,6 +1966,7 @@ fn real_main(drm: &mut DrmBackend) {
             };
             layers.slider.pixel_shift_x = shift.0;
             let slider_render = layers.slider_render();
+            let background = cfg.day_cycle.background(now.hour());
             let clips = layers.current_mut().draw(
                 &cfg,
                 (width as i32, height as i32),
@@ -1956,6 +1974,7 @@ fn real_main(drm: &mut DrmBackend) {
                 shift,
                 needs_complete_redraw,
                 slider_render,
+                background,
             );
             if pet.is_visible() {
                 let pixel_shift_width = if cfg.enable_pixel_shift {
@@ -2781,11 +2800,19 @@ mod tests {
             pet_enabled: false,
             pet_variant: Default::default(),
             pet_energy: Default::default(),
+            day_cycle: DayCycle::default(),
         };
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            crate::daycycle::BLACK,
+        );
         let home_image = surface.data().unwrap().to_vec();
 
         // The center navigation button on home opens the function bar.
@@ -2794,8 +2821,15 @@ mod tests {
             .hit(width as u16, height as u16, (width / 2) as f64, 30.0, None)
             .unwrap();
         assert!(deck.touch_down(0, button, 1004.0, 30.0, &mut |_, _| {}, &mut |_| {}));
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            crate::daycycle::BLACK,
+        );
         assert_ne!(&*surface.data().unwrap(), home_image.as_slice());
 
         // The first button on the function bar returns to the same home image.
@@ -2804,8 +2838,15 @@ mod tests {
             .hit(width as u16, height as u16, 100.0, 30.0, None)
             .unwrap();
         assert!(deck.touch_down(1, button, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            crate::daycycle::BLACK,
+        );
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
     }
 
@@ -2825,7 +2866,15 @@ mod tests {
                 ]);
                 let mut surface = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
                 let mut reference = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
-                layer.draw(&config, (width, 60), &surface, (0.0, 0.0), true, None);
+                layer.draw(
+                    &config,
+                    (width, 60),
+                    &surface,
+                    (0.0, 0.0),
+                    true,
+                    None,
+                    crate::daycycle::BLACK,
+                );
                 let idle = surface.data().unwrap().to_vec();
                 let spans = layer.layout_spans(width, 0);
                 for (i, span) in spans.iter().enumerate() {
@@ -2835,16 +2884,40 @@ mod tests {
                     }
                     assert_eq!(layer.hit(width as u16, 60, x, 5.0, None), None);
                     layer.buttons[i].1.set_active(true, &mut |_, _| {});
-                    let clips = layer.draw(&config, (width, 60), &surface, (0.0, 0.0), false, None);
+                    let clips = layer.draw(
+                        &config,
+                        (width, 60),
+                        &surface,
+                        (0.0, 0.0),
+                        false,
+                        None,
+                        crate::daycycle::BLACK,
+                    );
                     assert!(clips
                         .iter()
                         .all(|clip| clip.x2() <= 60 && i32::from(clip.y2()) <= width));
                     assert_ne!(&*surface.data().unwrap(), idle.as_slice());
-                    layer.draw(&config, (width, 60), &reference, (0.0, 0.0), true, None);
+                    layer.draw(
+                        &config,
+                        (width, 60),
+                        &reference,
+                        (0.0, 0.0),
+                        true,
+                        None,
+                        crate::daycycle::BLACK,
+                    );
                     let pressed = surface.data().unwrap().to_vec();
                     assert_eq!(pressed, reference.data().unwrap().to_vec());
                     layer.buttons[i].1.set_active(false, &mut |_, _| {});
-                    layer.draw(&config, (width, 60), &surface, (0.0, 0.0), false, None);
+                    layer.draw(
+                        &config,
+                        (width, 60),
+                        &surface,
+                        (0.0, 0.0),
+                        false,
+                        None,
+                        crate::daycycle::BLACK,
+                    );
                     assert_eq!(&*surface.data().unwrap(), idle.as_slice());
                 }
                 // Long text must not leak into the gaps or neighboring controls.
@@ -2858,6 +2931,121 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_day_cycle_background_paints_the_strip_behind_widgets_on_every_layer() {
+        let day_cycle = DayCycle::default();
+        let evening = day_cycle.background(19);
+        assert_eq!(evening, (23.0 / 255.0, 13.0 / 255.0, 7.0 / 255.0));
+        let config = outline_config();
+        let mut layer = FunctionLayer::with_config(vec![
+            keys(
+                "A deliberately long label that must fit its control",
+                &[Key::F1],
+            ),
+            keys("Brightness", &[Key::BrightnessUp]),
+            nav("Home", "home"),
+        ]);
+        let width = 2008;
+        let mut surface = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
+        let mut plain = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
+        layer.draw(
+            &config,
+            (width, 60),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            evening,
+        );
+        // The same widgets over the plain static background, to prove the
+        // band only changes the strip behind them.
+        layer.draw(
+            &config,
+            (width, 60),
+            &plain,
+            (0.0, 0.0),
+            true,
+            None,
+            crate::daycycle::BLACK,
+        );
+        let spans = layer.layout_spans(width, 0);
+        let stride = surface.stride() as usize;
+        let pixels = surface.data().unwrap().to_vec();
+        let static_pixels = plain.data().unwrap().to_vec();
+        // The gap between widgets shows the evening band color at every
+        // height, not the plain black strip.
+        let gap = ((spans[0].right + spans[1].left) / 2.0) as usize;
+        for y in [0, 30, 59] {
+            let i = gap * stride + (59 - y) * 4;
+            assert_eq!((pixels[i + 2], pixels[i + 1], pixels[i]), (23, 13, 7));
+            assert_eq!(
+                (static_pixels[i + 2], static_pixels[i + 1], static_pixels[i]),
+                (0, 0, 0)
+            );
+        }
+        // The widget's own pixels - fill, border, and label - render exactly
+        // the same over either background. The scanned area stays inside the
+        // inset rounded fill so no plain strip rows above and below it sneak
+        // into the comparison.
+        for x in ((spans[1].left + 12.0) as usize)..((spans[1].right - 12.0) as usize) {
+            for y in (8..52).step_by(3) {
+                let i = x * stride + (59 - y) * 4;
+                assert_eq!(pixels[i..i + 4], static_pixels[i..i + 4]);
+            }
+        }
+        // An incremental redraw over the band color leaves no plain-black
+        // residue and matches a complete redraw with the same background.
+        let mut reference = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
+        layer.buttons[1].1.set_active(true, &mut |_, _| {});
+        layer.draw(
+            &config,
+            (width, 60),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            evening,
+        );
+        let pressed = surface.data().unwrap().to_vec();
+        layer.draw(
+            &config,
+            (width, 60),
+            &reference,
+            (0.0, 0.0),
+            true,
+            None,
+            evening,
+        );
+        assert_eq!(pressed, reference.data().unwrap().to_vec());
+
+        // The band covers the pet layer's open ground too, behind the scene
+        // the pet paints on top of it.
+        let mut deck = pet_deck();
+        let mut pet_surface = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
+        deck.switch_to(1, &mut |_, _| {});
+        let pet_layer = deck.current_mut();
+        pet_layer.draw(
+            &config,
+            (width, 60),
+            &pet_surface,
+            (0.0, 0.0),
+            true,
+            None,
+            evening,
+        );
+        let spans = pet_layer.layout_spans(width, 0);
+        let ground_x = ((spans[0].right + width as f64) / 2.0) as usize;
+        let i = ground_x * stride + 30 * 4;
+        let pixels = pet_surface.data().unwrap();
+        assert_eq!((pixels[i + 2], pixels[i + 1], pixels[i]), (23, 13, 7));
+
+        // The disabled cycle keeps today's plain static background.
+        let disabled = DayCycle::disabled();
+        for hour in [0, 9, 14, 19, 23] {
+            assert_eq!(disabled.background(hour), crate::daycycle::BLACK);
         }
     }
 
@@ -3694,6 +3882,7 @@ mod tests {
             pet_enabled: false,
             pet_variant: Default::default(),
             pet_energy: Default::default(),
+            day_cycle: DayCycle::default(),
         }
     }
 
@@ -3701,10 +3890,20 @@ mod tests {
     fn the_slider_covers_the_cluster_renders_its_level_and_restores_the_bar() {
         let mut deck = slider_deck();
         let config = outline_config();
+        // The slider overlay and its collapse run over a time-of-day band,
+        // proving the cluster erases repaint with the band color, not black.
+        let evening = DayCycle::default().background(19);
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            evening,
+        );
         let home_image = surface.data().unwrap().to_vec();
 
         // Pressing a volume control summons the slider over the whole cluster.
@@ -3719,6 +3918,7 @@ mod tests {
             (0.0, 0.0),
             false,
             volume,
+            evening,
         );
         let low_level = surface.data().unwrap().to_vec();
         assert_ne!(&*low_level, home_image.as_slice());
@@ -3735,6 +3935,7 @@ mod tests {
             (0.0, 0.0),
             false,
             volume,
+            evening,
         );
         assert_ne!(&*surface.data().unwrap(), low_level.as_slice());
 
@@ -3751,13 +3952,21 @@ mod tests {
             (0.0, 0.0),
             false,
             volume,
+            evening,
         );
         assert_ne!(&*surface.data().unwrap(), full_level.as_slice());
 
         // Collapsing restores exactly the original home bar.
         deck.slider_collapse();
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), false, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            evening,
+        );
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
     }
 
@@ -3780,8 +3989,15 @@ mod tests {
         let config = outline_config();
         let (width, height) = (2008, 60);
         let surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            crate::daycycle::BLACK,
+        );
 
         // The cluster spans the whole bar, so the slider's edges touch the
         // framebuffer borders; its dirty clips must still fit inside them.
@@ -3797,6 +4013,7 @@ mod tests {
             (0.0, 0.0),
             false,
             Some(volume),
+            crate::daycycle::BLACK,
         );
         assert!(!clips.is_empty());
         for clip in clips {
@@ -3812,9 +4029,15 @@ mod tests {
 
         // The recovery clips after collapse obey the same bound.
         deck.slider_collapse();
-        let clips =
-            deck.current_mut()
-                .draw(&config, (width, height), &surface, (0.0, 0.0), false, None);
+        let clips = deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            crate::daycycle::BLACK,
+        );
         for clip in clips {
             assert!(
                 i32::from(clip.x2()) <= height,
@@ -3849,8 +4072,15 @@ mod tests {
         let config = outline_config();
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), true, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            crate::daycycle::BLACK,
+        );
         let home_image = surface.data().unwrap().to_vec();
 
         // Summon on the first cluster: its span is drawn over.
@@ -3866,6 +4096,7 @@ mod tests {
             (0.0, 0.0),
             false,
             volume,
+            crate::daycycle::BLACK,
         );
 
         // Pressing the second, separated cluster moves the slider there.
@@ -3881,12 +4112,20 @@ mod tests {
             (0.0, 0.0),
             false,
             volume,
+            crate::daycycle::BLACK,
         );
 
         // Collapsing restores the whole bar, first cluster included.
         deck.slider_collapse();
-        deck.current_mut()
-            .draw(&config, (width, height), &surface, (0.0, 0.0), false, None);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            crate::daycycle::BLACK,
+        );
         assert_eq!(&*surface.data().unwrap(), home_image.as_slice());
     }
 

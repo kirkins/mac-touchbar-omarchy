@@ -29,7 +29,11 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
 ```
 
 Inspect `implemented-home.png`, `implemented-volume-mid.png`,
-`implemented-brightness.png`, and `implemented-recording.png` in that directory.
+`implemented-brightness.png`, and `implemented-recording.png` in that directory,
+plus the per-band frames `implemented-daycycle-morning.png`,
+`implemented-daycycle-day.png`, `implemented-daycycle-evening.png`, and
+`implemented-daycycle-night.png` of the same home bar over each time-of-day
+background.
 These frames use the configured font and icon search paths; their battery and
 clock display is illustrative and they do not prove physical touch or dictation.
 Running the full test suite with the variable set also exports the pet's
@@ -46,10 +50,16 @@ combined layer dispatch, detached execution, and the one-invocation-per-command
 cap), and the virtual pet (pet-layer wiring and button toggle, wander bounds,
 pause and resume across layer switches, nap gating and placement, satiety decay
 and feeding, food drops on open ground and walk-to-food bounds, startle, tap
-consumption and hit-test precedence, and reload transitions). Physical
+consumption and hit-test precedence, and reload transitions), and the
+time-of-day background (band selection across the hours with boundaries and
+the midnight wrap, unit-RGB conversion, configuration defaults, overrides, and
+rejections, the disabled static background, the strip behind widgets and the
+pet layer's open ground, and incremental redraws leaving no plain-black
+residue). Physical
 layout, touch accuracy, brightness, media-key delivery to the desktop, live
 battery/clock refresh, the shared slider's on-glass drag feel, command buttons'
-interaction with a real helper, and the pet's on-glass charm still need a device
+interaction with a real helper, the pet's on-glass charm, and the background's
+one-shot repaint at a real band change still need a device
 test; battery checks there must include repeated tap-to-cycle, device labels in
 each display mode, hotplug, and timed return.
 
@@ -211,6 +221,42 @@ without changing its privilege drop or network restrictions. Install that
 integration separately; without a receiver these presses still switch layers
 and log the failed command. Check the desktop notification or receiver journal
 to confirm recording started.
+
+## Time-of-day background
+
+The strip behind every bar follows the local time of day: a warm dawn gray in
+the morning, a brighter neutral slate at midday, warm amber toward evening,
+and a dark cool blue overnight. The band color shows through the 16-pixel gaps
+and behind every widget on every named layer, including the pet layer's open
+ground beneath its painted sky and grass scene. Key fills, accents, the shared
+slider, and the pet itself keep their existing design on top of the band
+color, and nothing about touch behavior changes. The daemon repaints once
+when the band changes, on the same wake cadence it already keeps for the
+clock and battery widgets; there is no per-frame animation and no extra
+wakeups.
+
+```toml
+DayCycleEnabled = true  # set false for the plain static black background
+
+# Optional: replace the default bands entirely. Each band runs from its
+# StartHour (local time) until the next begins; the last wraps past midnight.
+[[DayCycleBands]]
+Name = "day"
+StartHour = 9
+Color = "#1A1B1E"
+[[DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#04060D"
+```
+
+Bands need a unique nonempty `Name`, a `StartHour` between 0 and 23 unique
+across bands, and a six-hex-digit `Color` like `"#1A1B1E"` (with or without
+the leading `#`). The array replaces the shipped morning/day/evening/night
+defaults as a whole, so a single band paints one color all day. Invalid bands
+reject the candidate configuration like the other knobs, keeping the current
+configuration on reload, and `DayCycleEnabled = false` preserves the previous
+static background at every hour.
 
 ## Touch Bar pet
 

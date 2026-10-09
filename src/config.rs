@@ -1,4 +1,5 @@
 use crate::appearance::ButtonAccent;
+use crate::daycycle::{self, DayCycle, TimeBand};
 use crate::fonts::{FontConfig, Pattern};
 use crate::pet::{PetEnergy, PetVariant};
 use crate::{FunctionLayer, LayerDeck};
@@ -41,6 +42,7 @@ pub struct Config {
     pub pet_enabled: bool,
     pub pet_variant: PetVariant,
     pub pet_energy: PetEnergy,
+    pub day_cycle: DayCycle,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +60,8 @@ struct ConfigProxy {
     pet_enabled: Option<bool>,
     pet_variant: Option<String>,
     pet_energy: Option<String>,
+    day_cycle_enabled: Option<bool>,
+    day_cycle_bands: Option<Vec<BandConfig>>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     layers: Option<Vec<LayerConfig>>,
@@ -171,6 +175,16 @@ pub struct LayerConfig {
     pub keys: Vec<ButtonConfig>,
 }
 
+/// One `[[DayCycleBands]]` entry: the background color for the local
+/// hours from `StartHour` until the next band begins.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct BandConfig {
+    pub name: String,
+    pub start_hour: u8,
+    pub color: String,
+}
+
 pub struct LayerLayout {
     pub layers: Vec<LayerConfig>,
     pub home: usize,
@@ -196,12 +210,53 @@ impl ConfigProxy {
             pet_enabled,
             pet_variant,
             pet_energy,
+            day_cycle_enabled,
+            day_cycle_bands,
             primary_layer_keys,
             media_layer_keys,
             layers,
             default_layer,
             fn_layer,
         );
+    }
+
+    /// The day cycle resolves the enabled flag over the configured or
+    /// default bands, validating band names, hours, and colors together.
+    fn day_cycle(&self) -> Result<DayCycle> {
+        let enabled = self.day_cycle_enabled.unwrap_or(true);
+        let bands = match &self.day_cycle_bands {
+            None => DayCycle::default_bands(),
+            Some(bands) if bands.is_empty() => {
+                bail!("DayCycleBands must define at least one band")
+            }
+            Some(bands) => {
+                let mut names = HashSet::new();
+                let mut hours = HashSet::new();
+                let mut parsed = Vec::with_capacity(bands.len());
+                for band in bands {
+                    if band.name.trim().is_empty() || !names.insert(band.name.clone()) {
+                        bail!("band names must be nonempty and unique: {:?}", band.name);
+                    }
+                    if band.start_hour > 23 {
+                        bail!("band {:?} StartHour must be 0-23", band.name);
+                    }
+                    if !hours.insert(band.start_hour) {
+                        bail!(
+                            "band {:?} repeats the StartHour of an earlier band",
+                            band.name
+                        );
+                    }
+                    parsed.push(TimeBand {
+                        name: band.name.clone(),
+                        start_hour: band.start_hour,
+                        color: daycycle::parse_hex_color(&band.color)
+                            .with_context(|| format!("band {:?} Color", band.name))?,
+                    });
+                }
+                parsed
+            }
+        };
+        Ok(DayCycle::new(enabled, bands))
     }
 
     fn layer_layout(&mut self, width: u16) -> Result<LayerLayout> {
@@ -392,6 +447,7 @@ fn parse_config(base: &str, user: Option<&str>, width: u16) -> Result<(ConfigPro
         .map(PetEnergy::parse)
         .transpose()
         .map_err(|err| anyhow!(err))?;
+    base.day_cycle()?;
     let layers = base.layer_layout(width)?;
     Ok((base, layers))
 }
@@ -423,6 +479,7 @@ fn load_config(
         Err(err) => return Err(err.into()),
     };
     let (base, layout) = parse_config(&read_to_string(base_path)?, user.as_deref(), width)?;
+    let day_cycle = base.day_cycle()?;
     let pet_enabled = base.pet_enabled.unwrap_or(true);
     let pet_layer = pet_enabled
         .then(|| {
@@ -463,6 +520,7 @@ fn load_config(
             .as_deref()
             .and_then(|value| PetEnergy::parse(value).ok())
             .unwrap_or_default(),
+        day_cycle,
     };
     Ok((cfg, layers))
 }
@@ -637,6 +695,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
 
     #[test]
     fn approved_multibar_preserves_voice_dispatch_and_renders_offline() {
+        use chrono::Timelike;
         let tmp = TempDir::new();
         let base_path = tmp.0.join("base.toml");
         let user_path = tmp.0.join("config.toml");
@@ -649,32 +708,45 @@ Keys = [{ Text = "F1", Action = "F1" }]
         fs::write(&user_path, named).unwrap();
         let (cfg, mut deck) = load_config(2008, &base_path, Some(&user_path)).unwrap();
 
-        // Optional development artifact: this executes the same Cairo draw as
-        // the daemon without opening DRM, input devices, or the voice helper.
-        let render = |deck: &mut LayerDeck, name: &str| {
-            let portrait = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
-            deck.slider.pixel_shift_width = if cfg.enable_pixel_shift {
-                crate::PIXEL_SHIFT_WIDTH_PX
-            } else {
-                0
+        // Renders one frame with an explicit background color, used for the
+        // time-of-day band review frames below.
+        let render_with_background =
+            |deck: &mut LayerDeck, name: &str, cfg: &Config, background: (f64, f64, f64)| {
+                let portrait =
+                    cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
+                deck.slider.pixel_shift_width = if cfg.enable_pixel_shift {
+                    crate::PIXEL_SHIFT_WIDTH_PX
+                } else {
+                    0
+                };
+                deck.slider.pixel_shift_x = 0.0;
+                let volume = deck.slider_render();
+                deck.current_mut().draw(
+                    cfg,
+                    (2008, 60),
+                    &portrait,
+                    (0.0, 0.0),
+                    true,
+                    volume,
+                    background,
+                );
+                if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
+                    fs::create_dir_all(&dir).unwrap();
+                    let horizontal =
+                        cairo::ImageSurface::create(cairo::Format::ARgb32, 2008, 60).unwrap();
+                    let c = cairo::Context::new(&horizontal).unwrap();
+                    c.translate(0.0, 60.0);
+                    c.rotate((-90.0_f64).to_radians());
+                    c.set_source_surface(&portrait, 0.0, 0.0).unwrap();
+                    c.paint().unwrap();
+                    horizontal
+                        .write_to_png(&mut fs::File::create(Path::new(&dir).join(name)).unwrap())
+                        .unwrap();
+                }
             };
-            deck.slider.pixel_shift_x = 0.0;
-            let volume = deck.slider_render();
-            deck.current_mut()
-                .draw(&cfg, (2008, 60), &portrait, (0.0, 0.0), true, volume);
-            if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
-                fs::create_dir_all(&dir).unwrap();
-                let horizontal =
-                    cairo::ImageSurface::create(cairo::Format::ARgb32, 2008, 60).unwrap();
-                let c = cairo::Context::new(&horizontal).unwrap();
-                c.translate(0.0, 60.0);
-                c.rotate((-90.0_f64).to_radians());
-                c.set_source_surface(&portrait, 0.0, 0.0).unwrap();
-                c.paint().unwrap();
-                horizontal
-                    .write_to_png(&mut fs::File::create(Path::new(&dir).join(name)).unwrap())
-                    .unwrap();
-            }
+        let render = |deck: &mut LayerDeck, name: &str| {
+            let background = cfg.day_cycle.background(chrono::Local::now().hour());
+            render_with_background(deck, name, &cfg, background);
         };
         let tap = |deck: &mut LayerDeck, label: &str, commands: &mut Vec<String>| {
             let index = deck.current().buttons.iter().position(|(_, button)| {
@@ -721,6 +793,17 @@ Keys = [{ Text = "F1", Action = "F1" }]
         );
         assert!(!deck.current().buttons.iter().any(|(_, b)| matches!(&b.action, ButtonAction::Keys(keys) if keys.iter().any(|k| matches!(k, Key::BrightnessDown | Key::BrightnessUp)))));
         render(&mut deck, "implemented-home.png");
+        // One review frame per time-of-day band, at an hour inside each
+        // default band, showing the strip background behind the same home bar.
+        for (hour, name) in [(7, "morning"), (14, "day"), (19, "evening"), (23, "night")] {
+            let background = cfg.day_cycle.background(hour);
+            render_with_background(
+                &mut deck,
+                &format!("implemented-daycycle-{name}.png"),
+                &cfg,
+                background,
+            );
+        }
         deck.switch_to(deck.names["media"], &mut |_, _| {});
         render(&mut deck, "implemented-media.png");
         deck.switch_to(deck.home, &mut |_, _| {});
@@ -1239,6 +1322,89 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         assert!(config.pet_enabled.is_some());
         assert_eq!(config.pet_variant.as_deref(), Some("cat"));
         assert_eq!(config.pet_energy.as_deref(), Some("calm"));
+    }
+
+    #[test]
+    fn day_cycle_settings_merge_with_defaults_overrides_and_reject_invalid_values() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        let user_path = tmp.0.join("config.toml");
+        // A base config predating the day cycle keeps working with defaults.
+        let mut legacy: toml::Value = toml::from_str(&text_only_base()).unwrap();
+        legacy.as_table_mut().unwrap().remove("DayCycleEnabled");
+        legacy.as_table_mut().unwrap().remove("DayCycleBands");
+        fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
+        let (config, _) = load_config(2008, &base_path, None).unwrap();
+        assert!(config.day_cycle.enabled);
+        assert_eq!(config.day_cycle.band_at(14).unwrap().name, "day");
+        assert_eq!(
+            config.day_cycle.background(2),
+            (4.0 / 255.0, 6.0 / 255.0, 13.0 / 255.0),
+            "the small hours wrap around midnight to the night band"
+        );
+        // Disabling keeps the plain static black background at every hour.
+        fs::write(&user_path, "DayCycleEnabled = false").unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        for hour in 0..=23 {
+            assert_eq!(config.day_cycle.band_at(hour), None);
+            assert_eq!(config.day_cycle.background(hour), (0.0, 0.0, 0.0));
+        }
+        // Custom bands replace the defaults as a whole and override the color
+        // literals case-insensitively, with or without the leading hash.
+        fs::write(
+            &user_path,
+            r##"
+[[DayCycleBands]]
+Name = "work"
+StartHour = 9
+Color = "#102030"
+[[DayCycleBands]]
+Name = "off"
+StartHour = 19
+Color = "301020"
+"##,
+        )
+        .unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let off = config.day_cycle.band_at(2).unwrap();
+        assert_eq!((off.name.as_str(), off.start_hour), ("off", 19));
+        assert_eq!(off.rgb(), (48.0 / 255.0, 16.0 / 255.0, 32.0 / 255.0));
+        let work = config.day_cycle.band_at(18).unwrap();
+        assert_eq!(work.name, "work");
+        assert_eq!(work.rgb(), (16.0 / 255.0, 32.0 / 255.0, 48.0 / 255.0));
+        // Invalid values reject the candidate configuration like the other knobs.
+        let band = |name: &str, hour: &str, color: &str| {
+            format!(
+                "DayCycleEnabled = true\n[[DayCycleBands]]\nName = {name}\nStartHour = {hour}\nColor = {color}\n"
+            )
+        };
+        for invalid in [
+            "DayCycleBands = []".to_owned(),
+            "DayCycleEnabled = 'true'".to_owned(),
+            "DayCycleEnabled = 1".to_owned(),
+            band("", "5", "\"#101010\""),
+            band("  ", "5", "\"#101010\""),
+            band("same", "5", "\"#101010\"") + &band("same", "7", "\"#202020\""),
+            band("early", "5", "\"#101010\"") + &band("late", "5", "\"#202020\""),
+            band("night", "24", "\"#101010\""),
+            band("night", "-1", "\"#101010\""),
+            band("night", "5", "\"10101\""),
+            band("night", "5", "\"#10g010\""),
+            band("night", "5", "1010103"),
+            band("night", "5", ""),
+            // A missing Color, and an unknown field inside the band table.
+            "DayCycleEnabled = true\n[[DayCycleBands]]\nName = \"night\"\nStartHour = 5\n"
+                .to_owned(),
+            band("night", "5", "\"#101010\"") + "Extra = 1\n",
+        ] {
+            assert!(
+                parse_config(BASE, Some(&invalid), 2008).is_err(),
+                "accepted invalid day-cycle configuration: {invalid}"
+            );
+        }
+        // The shipped base config carries the shipped default enablement.
+        let (base_cfg, _) = parse_config(BASE, None, 2008).unwrap();
+        assert!(base_cfg.day_cycle_enabled.unwrap());
     }
 
     #[test]
