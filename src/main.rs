@@ -1290,10 +1290,12 @@ impl LayerDeck {
     }
 
     /// Feed one microphone level sample, when the poller produced one, and
-    /// the shared clock into the displayed layer's waveform widget.
-    /// Returns whether the bar needs an incremental repaint of that button
-    /// and the epoll timeout until the duration timer's next tick; both are
-    /// idle on every other layer, whose widgets and cadence stay untouched.
+    /// the shared clock into the displayed layer's waveform widget. The
+    /// widget's frame clock interpolates motion between samples (roughly
+    /// 30 fps) and returns whether the bar needs an incremental repaint of
+    /// that button, plus the epoll timeout until its next frame or the
+    /// duration timer's next tick; both are idle on every other layer,
+    /// whose widgets and cadence stay untouched.
     fn waveform_tick(&mut self, sample: Option<MicSample>, now: Instant) -> (bool, i32) {
         let Some(index) = self.layers[self.active].waveform else {
             // Leaving the recording layer ends that widget's session so a
@@ -1313,9 +1315,9 @@ impl LayerDeck {
         };
         let mut changed = wave.activate(now);
         if let Some(sample) = sample {
-            changed |= wave.sample(sample);
+            changed |= wave.sample(sample, now);
         }
-        changed |= wave.tick(now);
+        changed |= wave.frame(now);
         let timeout = wave.next_timeout(now);
         if changed {
             button.changed = true;
@@ -1971,8 +1973,10 @@ fn real_main(drm: &mut DrmBackend) {
         }
 
         // The recording layer's waveform widget polls live microphone input
-        // only while that layer is displayed; everywhere else the poller
-        // sleeps and this stays at the ordinary low-cadence timeouts.
+        // only while that layer is displayed, and its frame clock repaints
+        // the interpolated graph at roughly 30 fps while it moves; elsewhere
+        // the poller sleeps and this stays at the ordinary low-cadence
+        // timeouts.
         let mic_sample = mic_levels.update();
         mic_levels.set_armed(layers.waveform_active());
         let (_, waveform_timeout_ms) = layers.waveform_tick(mic_sample, Instant::now());
@@ -2989,10 +2993,16 @@ mod tests {
         };
         let now = Instant::now();
         wave.activate(now);
-        assert!(wave.sample(MicSample {
-            level: 77,
-            live: true
-        }));
+        // The sample is stamped a full period old, so the interpolation
+        // rests at phase 1 and the two draws below compare identical
+        // pixels instead of a frame that glides between them.
+        assert!(wave.sample(
+            MicSample {
+                level: 77,
+                live: true
+            },
+            now - Duration::from_millis(60)
+        ));
         // The deck marks the button changed; a direct widget feed does not.
         layer.buttons[1].1.changed = true;
         assert!(!layer.buttons[0].1.changed);

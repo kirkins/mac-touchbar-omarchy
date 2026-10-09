@@ -905,6 +905,28 @@ Keys = [{ Text = "F1", Action = "F1" }]
             feed_now += Duration::from_millis(50);
             deck.waveform_tick(Some(crate::MicSample { level, live: true }), feed_now);
         }
+        // Mid-period frame: the graph is caught halfway between two samples,
+        // with the newest bar eased to half its measured level and every
+        // bar glided half a slot left of its sample position.
+        let mid = Instant::now() - Duration::from_millis(25);
+        deck.waveform_tick(
+            Some(crate::MicSample {
+                level: 88,
+                live: true,
+            }),
+            mid,
+        );
+        render(&mut deck, "implemented-recording-mid.png");
+        // Settled frame: a sample one full period old rests the interpolation,
+        // so the exported graph shows its sample positions and full heights.
+        let settled = Instant::now() - Duration::from_millis(60);
+        deck.waveform_tick(
+            Some(crate::MicSample {
+                level: 70,
+                live: true,
+            }),
+            settled,
+        );
         feed_now += Duration::from_secs(73);
         deck.waveform_tick(None, feed_now);
         render(&mut deck, "implemented-recording-live.png");

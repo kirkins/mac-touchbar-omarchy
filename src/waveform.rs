@@ -10,6 +10,17 @@
 //! and the shared epoll keeps its existing low-cadence timeouts. The widget
 //! also has a visually distinct idle state (dim dot, flat baseline) for a
 //! missing helper, so a layer switch alone never fakes live input.
+//!
+//! Samples land at the poll cadence (one level every [`POLL_INTERVAL`]),
+//! but motion does not step at that cadence: between two samples the
+//! widget's frame clock ([`FRAME_INTERVAL_MS`], roughly 30 fps) scrolls
+//! the graph fractionally leftward and eases the newest bar from the
+//! previous level toward its measured one, so bars flow instead of
+//! snapping a full slot every 50 ms. Frames render only while the
+//! recording layer is displayed and only while something is in motion;
+//! an idle, settled widget still wakes at most once per second for the
+//! timer. The level feed itself stays as fresh as the desktop helper's
+//! capture tail - see `integrations/voice/README.md`.
 
 use cairo::Context;
 use std::{
@@ -28,11 +39,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Input-level samples kept for the bar graph; at the poll cadence below
+/// Input-level samples kept for the bar graph; at the sample period below
 /// this is a bit over two seconds of recent audio.
 pub const HISTORY: usize = 48;
-/// How often the armed poller dials the level endpoint.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How far apart two level samples are: exactly the poll cadence, since one
+/// poll produces one sample. The interpolation math assumes this spacing.
+pub const SAMPLE_PERIOD: Duration = Duration::from_millis(50);
+/// How often the armed poller dials the level endpoint (one sample each).
+pub const POLL_INTERVAL: Duration = SAMPLE_PERIOD;
+/// Frame cadence while the widget animates, about 30 fps: smooth scrolling
+/// without repainting more than the display can usefully show.
+pub const FRAME_INTERVAL_MS: i32 = 33;
 /// Level replies must arrive within this window or count as not live.
 const LEVEL_TIMEOUT: Duration = Duration::from_millis(300);
 /// Inner padding of the widget inside its button.
@@ -51,9 +68,11 @@ const BARS_MARGIN: f64 = 10.0;
 const MIN_BAR: f64 = 1.0;
 /// Gap between adjacent bars.
 const BAR_GAP: f64 = 2.0;
-/// Per-sample decay of the dot's pulse driver.
-const PULSE_DECAY: f32 = 0.6;
-/// Repaint only when the smoothed pulse moved this much.
+/// Decay time constant of the dot's peak-following pulse, in milliseconds.
+/// Chosen so one sample period multiplies the pulse by roughly 0.6, the
+/// release rate of the original per-sample decay.
+const PULSE_TAU_MS: f32 = 98.0;
+/// Repaint for the pulse alone only when it moved this much.
 const PULSE_EPSILON: f32 = 0.25;
 
 /// One live microphone observation from the desktop receiver: `level` is
@@ -93,7 +112,6 @@ impl LevelHistory {
         self.len
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -156,13 +174,32 @@ pub fn layout(width: f64, height: f64) -> Layout {
     }
 }
 
-/// The mirrored bar one history sample draws: `(x, y, width, height)`,
-/// fully inside the layout's bar area.
-pub fn bar_rect(layout: &Layout, index: usize, level: u8) -> (f64, f64, f64, f64) {
-    let x = layout.bars.0 + index as f64 * layout.slot_w;
+/// The mirrored bar one history sample draws: `(x, y, width, height)`.
+/// `slot` is the bar's logical position and may be fractional - the
+/// interpolation shifts every bar leftward by fractions of a slot between
+/// samples - and `level` is eased, so it may be fractional too. Bars whose
+/// slot dips below zero are simply exiting the graph on the left.
+pub fn bar_rect(layout: &Layout, slot: f64, level: f64) -> (f64, f64, f64, f64) {
+    let x = layout.bars.0 + slot * layout.slot_w;
     let width = (layout.slot_w - BAR_GAP).max(1.0);
-    let half = MIN_BAR + (layout.bar_max_half - MIN_BAR) * f64::from(level) / 100.0;
+    let level = level.clamp(0.0, 100.0);
+    let half = MIN_BAR + (layout.bar_max_half - MIN_BAR) * level / 100.0;
     (x, layout.mid_y - half, width, half * 2.0)
+}
+
+/// Smooth ease-in-out over `0..=1`, used for the newest bar's height.
+pub fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The level the newest bar displays at `phase` into the current sample
+/// period: it rises from the previous sample's level, which is what the
+/// bar showed the instant the previous period ended, so heights stay
+/// continuous across sample boundaries.
+pub fn display_level(previous: u8, current: u8, phase: f64) -> f64 {
+    let t = smoothstep(phase);
+    f64::from(previous) + (f64::from(current) - f64::from(previous)) * t
 }
 
 /// `m:ss` with unbounded minutes, matching the clock's legibility.
@@ -172,15 +209,24 @@ pub fn format_duration(duration: Duration) -> String {
 }
 
 /// State of one recording-page widget. The timer counts from entering the
-/// layer carrying the widget; the history and pulse follow the live feed.
+/// layer carrying the widget; the history and pulse follow the live feed,
+/// and the frame clock interpolates motion between samples.
 pub struct WaveformWidget {
     history: LevelHistory,
     started: Option<Instant>,
     live: bool,
     /// Peak-following pulse driver for the recording dot.
     smoothed: f32,
+    /// The pulse as it was last painted, to gate decay-only repaints.
+    shown_pulse: f32,
     /// Second currently shown on the timer.
     shown_second: u64,
+    /// When the newest sample landed; drives scroll and height easing.
+    last_sample: Option<Instant>,
+    /// The level before the newest sample; the newest bar eases from it.
+    previous_level: u8,
+    /// When the last frame advanced the animation clock.
+    last_frame: Option<Instant>,
 }
 
 impl WaveformWidget {
@@ -190,7 +236,11 @@ impl WaveformWidget {
             started: None,
             live: false,
             smoothed: 0.0,
+            shown_pulse: 0.0,
             shown_second: 0,
+            last_sample: None,
+            previous_level: 0,
+            last_frame: None,
         }
     }
 
@@ -204,7 +254,11 @@ impl WaveformWidget {
         self.history.clear();
         self.live = false;
         self.smoothed = 0.0;
+        self.shown_pulse = 0.0;
         self.shown_second = 0;
+        self.last_sample = None;
+        self.previous_level = 0;
+        self.last_frame = None;
         true
     }
 
@@ -220,18 +274,47 @@ impl WaveformWidget {
         self.started.is_some()
     }
 
-    /// Fold one poll result in. Returns whether the visible widget changed.
-    pub fn sample(&mut self, sample: Sample) -> bool {
+    /// Fold one poll result in. Returns whether the sample itself changed
+    /// what is on glass - a new level or a live flip; the interpolated frames
+    /// own motion and pulse repaints through [`Self::frame`], so a feed of
+    /// identical levels or idle replies reports no change of its own.
+    pub fn sample(&mut self, sample: Sample, now: Instant) -> bool {
         if self.started.is_none() {
             return false;
         }
-        let before = (self.history.newest(), self.live, self.smoothed);
+        let before = (self.history.newest(), self.live);
+        self.previous_level = self.history.newest().unwrap_or(0);
         self.live = sample.live;
         self.history.push(sample.level);
-        self.smoothed = f32::from(sample.level).max(self.smoothed * PULSE_DECAY);
-        Some(sample.level) != before.0
-            || sample.live != before.1
-            || (self.smoothed - before.2).abs() > PULSE_EPSILON
+        self.last_sample = Some(now);
+        self.smoothed = f32::from(sample.level).max(self.smoothed);
+        Some(sample.level) != before.0 || sample.live != before.1
+    }
+
+    /// Advance the animation clock to `now`: decay the dot's pulse with a
+    /// time constant and fold the timer's second boundary. Returns whether
+    /// the widget is in motion - the graph is scrolling while live, the
+    /// pulse is still settling, or the displayed second changed - and so
+    /// must be repainted; a settled, idle widget stays quiet between
+    /// second boundaries.
+    pub fn frame(&mut self, now: Instant) -> bool {
+        let Some(_) = self.started else {
+            self.last_frame = Some(now);
+            return false;
+        };
+        let elapsed = self
+            .last_frame
+            .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
+        self.last_frame = Some(now);
+        self.smoothed *= (-elapsed.as_secs_f32() * 1000.0 / PULSE_TAU_MS).exp();
+        let scrolling = self.live && !self.history.is_empty();
+        let pulse_settling = (self.smoothed - self.shown_pulse).abs() > PULSE_EPSILON;
+        let ticked = self.tick(now);
+        let moved = scrolling || pulse_settling || ticked;
+        if moved {
+            self.shown_pulse = self.smoothed;
+        }
+        moved
     }
 
     /// Advance the duration timer to `now`. Returns whether the displayed
@@ -250,12 +333,29 @@ impl WaveformWidget {
         true
     }
 
-    /// Milliseconds until the displayed second changes, for the shared
-    /// epoll timeout; `i32::MAX - 1` while inactive.
+    /// How far into the current sample period the render is, `0..=1`: the
+    /// fraction of [`SAMPLE_PERIOD`] elapsed since the newest sample. With
+    /// no sample yet there is nothing to interpolate and the phase sits at
+    /// rest (`1.0`), matching where the previous period's easing ended.
+    pub fn phase(&self, now: Instant) -> f64 {
+        self.last_sample
+            .map_or(1.0, |last| {
+                now.saturating_duration_since(last).as_secs_f64() / SAMPLE_PERIOD.as_secs_f64()
+            })
+            .min(1.0)
+    }
+
+    /// Milliseconds until the next frame for the shared epoll timeout.
+    /// While the widget animates that is the frame cadence; a settled,
+    /// idle widget wakes only for the timer's second boundary; an inactive
+    /// one (`i32::MAX - 1`) never runs fast.
     pub fn next_timeout(&self, now: Instant) -> i32 {
         let Some(start) = self.started else {
             return i32::MAX - 1;
         };
+        if (self.live && !self.history.is_empty()) || self.smoothed > PULSE_EPSILON {
+            return FRAME_INTERVAL_MS;
+        }
         let elapsed = now.saturating_duration_since(start).as_millis() as i64;
         (1000 - elapsed % 1000).clamp(1, i32::MAX as i64 - 1) as i32
     }
@@ -273,6 +373,20 @@ impl WaveformWidget {
     /// Draw the widget. `c` carries the layer's rotation; the caller clips
     /// to the button's rect, so the layout never exceeds `width`/`height`.
     pub fn render(&self, c: &Context, height: i32, left: f64, width: f64, y_shift: f64) {
+        self.render_at(c, height, left, width, y_shift, Instant::now());
+    }
+
+    /// [`Self::render`] with an explicit clock, so offline review frames can
+    /// capture the animation mid-period.
+    pub fn render_at(
+        &self,
+        c: &Context,
+        height: i32,
+        left: f64,
+        width: f64,
+        y_shift: f64,
+        now: Instant,
+    ) {
         let layout = layout(width, height as f64);
         let cy = y_shift + layout.mid_y;
         // The recording dot pulses with live level; idle it stays small and dim.
@@ -292,7 +406,7 @@ impl WaveformWidget {
         );
         c.fill().unwrap();
         // Duration label beside the dot.
-        let label = format_duration(self.elapsed(Instant::now()));
+        let label = format_duration(self.elapsed(now));
         c.set_source_rgb(1.0, 1.0, 1.0);
         c.set_font_size(TIMER_FONT);
         let extents = c.text_extents(&label).unwrap();
@@ -301,12 +415,22 @@ impl WaveformWidget {
             cy - extents.y_bearing() - extents.height() / 2.0,
         );
         c.show_text(&label).unwrap();
-        // The scrolling level graph - the newest bar sits at the right edge
-        // and older history scrolls left - or a flat dim baseline while idle.
+        // The scrolling level graph - the newest bar eases in at the right
+        // edge while older history glides left between samples, or a flat
+        // dim baseline while idle. The fractional phase keeps positions
+        // continuous across sample boundaries: a bar one slot right at
+        // phase 0 is exactly where its predecessor ended at phase 1.
         if self.live {
             let len = self.history.len();
+            let phase = self.phase(now);
             for (i, level) in self.history.oldest_first().enumerate() {
-                let (x, y, w, h) = bar_rect(&layout, HISTORY - len + i, level);
+                let level = if i + 1 == len {
+                    display_level(self.previous_level, level, phase)
+                } else {
+                    f64::from(level)
+                };
+                let slot = (HISTORY - len + i) as f64 - phase;
+                let (x, y, w, h) = bar_rect(&layout, slot, level);
                 c.rectangle(left + x, y_shift + y, w, h);
             }
             c.fill().unwrap();
@@ -567,8 +691,8 @@ mod tests {
         assert!(layout.bar_max_half <= 30.0 - BARS_MARGIN);
         let mut previous = 0.0;
         for level in 0..=100u8 {
-            for index in 0..HISTORY {
-                let (x, y, w, h) = bar_rect(&layout, index, level);
+            for slot in [0.0, 0.25, 47.0] {
+                let (x, y, w, h) = bar_rect(&layout, slot, f64::from(level));
                 assert!(x >= layout.bars.0, "bar left of the area");
                 assert!(
                     x + w <= layout.bars.0 + layout.bars.1 + 1e-6,
@@ -578,16 +702,85 @@ mod tests {
                 assert!(y + h <= layout.mid_y + layout.bar_max_half + 1e-6);
                 assert!(h >= MIN_BAR * 2.0);
             }
-            let height = bar_rect(&layout, 0, level).3;
+            let height = bar_rect(&layout, 0.0, f64::from(level)).3;
             assert!(height >= previous, "heights must not shrink with level");
             previous = height;
         }
-        // Neighboring slots never overlap and silence still draws a pixel pair.
-        let (x0, _, w0, h0) = bar_rect(&layout, 0, 0);
-        let (x1, _, _, _) = bar_rect(&layout, 1, 0);
+        // Neighboring slots never overlap, eased levels stay in range, and
+        // silence still draws a pixel pair.
+        let (x0, _, w0, h0) = bar_rect(&layout, 0.0, 0.0);
+        let (x1, _, _, _) = bar_rect(&layout, 1.0, 0.0);
         assert!(x1 >= x0 + w0);
         assert!(h0 >= MIN_BAR * 2.0);
-        assert!(bar_rect(&layout, 0, 100).3 > bar_rect(&layout, 0, 0).3);
+        assert!(bar_rect(&layout, 0.0, 100.0).3 > bar_rect(&layout, 0.0, 0.0).3);
+        let (_, _, _, clamped) = bar_rect(&layout, 0.0, 140.0);
+        assert_eq!(clamped, bar_rect(&layout, 0.0, 100.0).3);
+        let (_, _, _, eased) = bar_rect(&layout, 0.0, 33.5);
+        assert!(bar_rect(&layout, 0.0, 33.0).3 < eased);
+        assert!(eased < bar_rect(&layout, 0.0, 34.0).3);
+    }
+
+    #[test]
+    fn interpolated_bars_scroll_and_ease_continuously_across_samples() {
+        let layout = layout(570.0, 60.0);
+        // The ease runs the full range, is monotone, and rests at both ends.
+        assert_eq!(smoothstep(0.0), 0.0);
+        assert_eq!(smoothstep(1.0), 1.0);
+        assert!((smoothstep(0.5) - 0.5).abs() < 1e-9);
+        let mut previous = display_level(20, 80, 0.0);
+        for step in 1..=10 {
+            let phase = f64::from(step) / 10.0;
+            let level = display_level(20, 80, phase);
+            assert!(level >= previous, "ease must not dip");
+            assert!(level <= 80.0);
+            previous = level;
+        }
+        assert_eq!(display_level(20, 80, 0.0), 20.0);
+        assert_eq!(display_level(20, 80, 1.0), 80.0);
+        assert_eq!(display_level(20, 80, 2.0), 80.0);
+
+        // Positions are continuous across a sample boundary: a bar that
+        // finished its period at phase 1 sits exactly where its successor
+        // starts at phase 0 after the graph shifts one slot.
+        let len = 12;
+        for i in 0..len {
+            let before = bar_rect(&layout, (HISTORY - len + i) as f64 - 1.0, 55.0);
+            let after = bar_rect(&layout, (HISTORY - (len + 1) + i) as f64, 55.0);
+            assert_eq!(before, after);
+        }
+        // Between samples every slot glides left by fractions of a slot.
+        let start = bar_rect(&layout, 10.0, 55.0).0;
+        let mid = bar_rect(&layout, 10.0 - 0.5, 55.0).0;
+        let end = bar_rect(&layout, 9.0, 55.0).0;
+        assert!(start > mid && mid > end);
+        assert!((start - mid - (start - end) / 2.0).abs() < 1e-9);
+
+        // The newest bar's height matches its eased level: it starts at the
+        // previous sample's height and ends at its own.
+        let widget_height = |phase| bar_rect(&layout, 0.0, display_level(40, 70, phase)).3;
+        assert_eq!(widget_height(0.0), bar_rect(&layout, 0.0, 40.0).3);
+        assert_eq!(widget_height(1.0), bar_rect(&layout, 0.0, 70.0).3);
+        assert!(widget_height(0.5) > widget_height(0.0));
+    }
+
+    #[test]
+    fn the_phase_advances_with_the_clock_and_rests_at_one() {
+        let now = Instant::now();
+        let mut wave = WaveformWidget::new();
+        assert_eq!(wave.phase(now), 1.0);
+        assert!(wave.activate(now));
+        assert_eq!(wave.phase(now + Duration::from_secs(3)), 1.0);
+        wave.sample(
+            Sample {
+                level: 60,
+                live: true,
+            },
+            now,
+        );
+        assert_eq!(wave.phase(now), 0.0);
+        assert!((wave.phase(now + Duration::from_millis(25)) - 0.5).abs() < 1e-9);
+        assert_eq!(wave.phase(now + SAMPLE_PERIOD), 1.0);
+        assert_eq!(wave.phase(now + Duration::from_secs(90)), 1.0);
     }
 
     #[test]
@@ -607,17 +800,18 @@ mod tests {
         assert!(wave.activate(start));
         assert!(!wave.activate(start));
         assert!(wave.is_active());
-        // Half a second in, the boundary is half a second away.
+        // Half a second in, the boundary is half a second away; with no
+        // live feed there is nothing to animate between seconds.
         let now = start + Duration::from_millis(500);
         assert_eq!(wave.next_timeout(now), 500);
-        assert!(!wave.tick(now));
+        assert!(!wave.frame(now));
         // The displayed second follows the elapsed monotonic time exactly.
         let now = now + Duration::from_millis(501);
         assert_eq!(wave.elapsed(now), Duration::from_millis(1001));
-        assert!(wave.tick(now));
-        assert!(!wave.tick(now + Duration::from_millis(400)));
+        assert!(wave.frame(now));
+        assert!(!wave.frame(now + Duration::from_millis(400)));
         let now = now + Duration::from_millis(1200);
-        assert!(wave.tick(now));
+        assert!(wave.frame(now));
         assert_eq!(wave.next_timeout(now), 799);
         // Leaving the layer ends the session; a return starts it fresh.
         wave.deactivate();
@@ -628,45 +822,69 @@ mod tests {
     }
 
     #[test]
-    fn widget_repaints_only_for_visible_changes() {
+    fn frames_repaint_while_the_graph_moves_and_settle_when_it_cannot() {
         let now = Instant::now();
         let mut wave = WaveformWidget::new();
-        // Samples before activation are ignored.
-        assert!(!wave.sample(Sample {
-            level: 80,
-            live: true
-        }));
-        wave.activate(now);
-        assert!(wave.sample(Sample {
-            level: 80,
-            live: true
-        }));
+        // Samples and frames before activation are ignored.
+        assert!(!wave.sample(
+            Sample {
+                level: 80,
+                live: true
+            },
+            now
+        ));
+        assert!(!wave.frame(now));
+        assert!(wave.activate(now));
+        assert!(wave.sample(
+            Sample {
+                level: 80,
+                live: true
+            },
+            now
+        ));
         assert_eq!(wave.history().len(), 1);
-        // Identical level, live, and settled pulse: nothing to repaint.
-        assert!(!wave.sample(Sample {
-            level: 80,
-            live: true
-        }));
-        // A lower level still repaints while the pulse decays toward it.
-        assert!(wave.sample(Sample {
-            level: 20,
-            live: true
-        }));
-        while wave.sample(Sample {
-            level: 20,
-            live: true,
-        }) {}
-        assert!(!wave.sample(Sample {
-            level: 20,
-            live: true
-        }));
-        assert_eq!(wave.history().len(), 7);
-        // A lost feed repaints the idle look immediately, then stays quiet
-        // once the pulse has faded.
-        assert!(wave.sample(Sample::default()));
-        while wave.sample(Sample::default()) {}
-        assert!(!wave.sample(Sample::default()));
-        assert!(wave.history().len() >= 9);
+        // A live graph is always in motion: every frame repaints and the
+        // epoll timeout drops to the frame cadence.
+        let mut frame_now = now;
+        for _ in 0..5 {
+            frame_now += Duration::from_millis(FRAME_INTERVAL_MS as u64);
+            assert!(wave.frame(frame_now));
+            assert_eq!(wave.next_timeout(frame_now), FRAME_INTERVAL_MS);
+        }
+        // Even a repeated identical level keeps the graph scrolling; only
+        // the sample gate reports no data change of its own.
+        assert!(!wave.sample(
+            Sample {
+                level: 80,
+                live: true
+            },
+            frame_now
+        ));
+        assert!(wave.frame(frame_now + Duration::from_millis(10)));
+        assert_eq!(
+            wave.next_timeout(frame_now + Duration::from_millis(10)),
+            FRAME_INTERVAL_MS
+        );
+        assert_eq!(wave.history().len(), 2);
+        // A lost feed freezes the scroll; the pulse decays out over a few
+        // frames, then the widget rests until the timer's next second.
+        assert!(wave.sample(Sample::default(), frame_now + Duration::from_secs(2)));
+        let mut settling = 0;
+        let mut idle_now = frame_now + Duration::from_secs(2);
+        while wave.frame(idle_now) {
+            idle_now += Duration::from_millis(FRAME_INTERVAL_MS as u64);
+            settling += 1;
+            assert!(settling < 100, "pulse never settled");
+        }
+        assert!(!wave.frame(idle_now));
+        assert_eq!(wave.history().len(), 3);
+        // Reaching a later second repaints the timer once, then repeated
+        // idle samples and frames keep the settled widget quiet.
+        let boundary = idle_now + Duration::from_millis(1100);
+        assert!(wave.frame(boundary));
+        let quiet = boundary + Duration::from_millis(1);
+        assert!(!wave.sample(Sample::default(), quiet));
+        assert!(!wave.frame(quiet));
     }
 
     #[test]
@@ -803,13 +1021,13 @@ mod tests {
     }
 
     #[test]
-    fn the_widget_paints_levels_and_an_idle_baseline_inside_its_button() {
-        fn render(wave: &WaveformWidget) -> Vec<u8> {
+    fn the_widget_paints_levels_an_idle_baseline_and_interpolation_frames() {
+        fn render(wave: &WaveformWidget, now: Instant) -> Vec<u8> {
             let mut surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
             {
                 let c = Context::new(&surface).unwrap();
                 c.set_source_rgb(1.0, 1.0, 1.0);
-                wave.render(&c, 60, 0.0, 570.0, 0.0);
+                wave.render_at(&c, 60, 0.0, 570.0, 0.0, now);
             }
             let data = surface.data().unwrap().to_vec();
             data
@@ -817,24 +1035,78 @@ mod tests {
         let now = Instant::now();
         let mut wave = WaveformWidget::new();
         wave.activate(now);
-        wave.tick(now + Duration::from_secs(83));
-        let idle = render(&wave);
+        wave.frame(now + Duration::from_secs(83));
+        let idle = render(&wave, now + Duration::from_secs(83));
         assert!(idle.iter().any(|b| *b != 0), "idle widget drew nothing");
         // A live feed with varied levels draws a different frame.
-        for level in [8, 22, 5, 41, 67, 88, 30, 12, 55, 73, 19, 96, 44, 27, 60] {
-            wave.sample(Sample { level, live: true });
+        for (step, level) in [8, 22, 5, 41, 67, 88, 30, 12, 55, 73, 19, 96, 44, 27, 60]
+            .into_iter()
+            .enumerate()
+        {
+            wave.sample(
+                Sample { level, live: true },
+                now + Duration::from_millis(50 * step as u64),
+            );
         }
-        let loud = render(&wave);
+        let last = now + Duration::from_millis(50 * 14);
+        let loud = render(&wave, last);
         assert_ne!(idle, loud);
+        // Between samples the interpolation repaints: the same history at
+        // three phases in one period draws three visibly different frames.
+        let early = render(&wave, last + Duration::from_millis(2));
+        let mid = render(&wave, last + Duration::from_millis(25));
+        let late = render(&wave, last + Duration::from_millis(48));
+        assert_ne!(early, mid, "no easing between samples");
+        assert_ne!(mid, late, "easing stops mid-period");
+        assert_ne!(early, late);
         // Silence after loud bars is visibly calmer but still live.
-        for _ in 0..HISTORY {
-            wave.sample(Sample {
-                level: 0,
-                live: true,
-            });
+        for step in 0..HISTORY {
+            wave.sample(
+                Sample {
+                    level: 0,
+                    live: true,
+                },
+                last + Duration::from_millis(50 + 50 * step as u64),
+            );
         }
-        let quiet = render(&wave);
+        let quiet = render(
+            &wave,
+            last + Duration::from_millis(50 + 50 * HISTORY as u64),
+        );
         assert_ne!(loud, quiet);
         assert_ne!(idle, quiet);
+    }
+
+    #[test]
+    fn incremental_repaint_of_one_button_stays_cheap() {
+        // Guards the frugal posture: at the frame cadence one button's
+        // repaint (erase, dot, timer, bars) must cost well under a frame
+        // budget even on this machine's slowest core.
+        let surface = ImageSurface::create(Format::ARgb32, 1300, 60).unwrap();
+        let mut wave = WaveformWidget::new();
+        let now = Instant::now();
+        wave.activate(now);
+        for step in 0..HISTORY {
+            wave.sample(
+                Sample {
+                    level: (step * 7 % 101) as u8,
+                    live: true,
+                },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        let mut frame = now + Duration::from_millis(50 * HISTORY as u64);
+        let budget = Duration::from_millis(2);
+        for _ in 0..100 {
+            frame += Duration::from_millis(FRAME_INTERVAL_MS as u64);
+            let c = Context::new(&surface).unwrap();
+            c.set_source_rgb(0.1, 0.1, 0.1);
+            c.rectangle(0.0, 0.0, 1300.0, 60.0);
+            c.fill().unwrap();
+            let started = Instant::now();
+            wave.render_at(&c, 60, 0.0, 1300.0, 0.0, frame);
+            let spent = started.elapsed();
+            assert!(spent < budget, "repaint took {spent:?}, budget {budget:?}");
+        }
     }
 }

@@ -136,8 +136,13 @@ class Dictation:
         raw = Path(self.recording.name) / "audio.raw"
         self.output = raw.open("wb")
         try:
+            # stdbuf -o0 keeps the capture tail fresh: pw-cat otherwise
+            # buffers its raw output in ~8 KB stdio chunks, which at this
+            # stream is a quarter second of audio the live level feed
+            # cannot see yet. Unbuffered the bytes land per quantum
+            # (~21 ms) while the file content stays byte-identical.
             self.recorder = subprocess.Popen(
-                ["pw-cat", "--record", "--rate", "16000", "--channels", "1",
+                ["stdbuf", "-o0", "pw-cat", "--record", "--rate", "16000", "--channels", "1",
                  "--format", "s16", "--raw", "--target", source, "-"],
                 stdout=self.output, stderr=subprocess.DEVNULL)
             deadline = time.monotonic() + 3

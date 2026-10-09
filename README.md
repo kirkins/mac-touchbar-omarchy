@@ -240,7 +240,9 @@ While that layer is displayed, the daemon polls a second abstract socket,
 `dfr-voice-level-1000`, exposed by the same optional voice receiver: the
 receiver passively tails the raw capture file its recorder is already
 writing and answers each `get` with the latest 0-100 input peak (`ok <n>`) or
-`idle` when no recording is active. Dictation mechanics, audio routing, and
+`idle` when no recording is active. The recorder runs unbuffered, so the tailed
+file trails the live microphone by only a few milliseconds. Dictation
+mechanics, audio routing, and
 the receiver's existing `start`/`stop`/`cancel` behavior are unchanged. The
 daemon verifies the receiver's kernel peer UID like the volume and brightness
 receivers, and a missing, rejecting, or garbling receiver simply shows the
@@ -248,8 +250,11 @@ widget's idle look - a dim dot, flat baseline, and the timer - never a fake
 signal.
 
 The repaint cadence stays bounded: the poller is armed only while the
-recording layer is displayed and repaints just that button's column at the
-20 Hz poll rate; every other layer keeps its existing redraws, and a silent
+recording layer is displayed, polling at 20 Hz, and the widget repaints just
+that button's column at roughly 30 fps while its graph is in motion: between
+two samples every bar glides fractionally left and the newest bar eases to
+its measured level, so the history flows instead of stepping one slot per
+sample. Every other layer keeps its existing redraws, and a settled, silent
 feed repaints nothing but the once-a-second timer tick.
 
 ## Time-of-day background

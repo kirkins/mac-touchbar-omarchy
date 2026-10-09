@@ -29,7 +29,10 @@ reader passively tails the raw capture file the recorder is already writing,
 under the same `SO_PEERCRED` boundary, and never touches the recorder, its file
 descriptors, or the dictation flow; capture finishing forgets the path at once.
 A capture that stops growing for two seconds reports silence so a stalled bar
-cannot freeze loud. The daemon polls this endpoint only while its recording
+cannot freeze loud. The recorder itself runs unbuffered - `stdbuf -o0`
+wraps `pw-cat` - so the tailed bytes trail the microphone by roughly one
+audio quantum instead of the quarter second an 8 KB stdio buffer would add;
+the captured file's content is unchanged. The daemon polls this endpoint only while its recording
 layer is displayed. Updating the installed helper and user service is enough
 to enable it; no new unit or permission is involved.
 

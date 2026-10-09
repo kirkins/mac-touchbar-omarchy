@@ -40,6 +40,14 @@ if name == "pactl":
     else:
         print("62\\talsa_input.headset\\tPipeWire\\ts32le 1ch 48000Hz\\tIDLE")
         print("68\\teffect_output.builtin-mic\\tPipeWire\\tfloat32le 1ch 48000Hz\\tSUSPENDED")
+elif name == "stdbuf":
+    # The helper unbuffers pw-cat through coreutils stdbuf; the prologue
+    # above already logged this call, so just exec the command it wraps
+    # (here the fake pw-cat adapter, found through the same PATH).
+    wrapped = list(args)
+    while wrapped and wrapped[0].startswith("-"):
+        wrapped.pop(0)
+    os.execvp(wrapped[0], wrapped)
 elif name == "pw-cat":
     if os.environ.get("FAKE_CAPTURE") != "empty":
         os.write(1, b"\\x00\\x10" * 3200)
@@ -72,7 +80,7 @@ class DictationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         binary = self.root / "bin"
         binary.mkdir()
-        for name in ("pactl", "pw-cat", "curl", "wtype", "notify-send"):
+        for name in ("pactl", "pw-cat", "curl", "wtype", "notify-send", "stdbuf"):
             path = binary / name
             path.write_text(ADAPTER)
             path.chmod(0o755)
@@ -101,6 +109,9 @@ class DictationTests(unittest.TestCase):
         self.assertEqual(len(self.calls("pw-cat")), 1)
         args = self.calls("pw-cat")[0]
         self.assertEqual(args[args.index("--target") + 1], "effect_output.builtin-mic")
+        # The recorder runs unbuffered so the passive level feed tails the
+        # capture as it is written instead of a quarter second behind.
+        self.assertEqual(self.calls("stdbuf"), [["-o0", "pw-cat"] + args])
         # The capture file is also published to the passive level feed.
         self.assertIsNotNone(self.engine.levels.path)
         self.engine.dispatch("stop")
