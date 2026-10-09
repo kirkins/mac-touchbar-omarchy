@@ -10,7 +10,11 @@
 //! layer also gets a painted backdrop scene: blue sky, a green ground strip
 //! with the sun and clouds above it. Taps inside
 //! the pet layer are offered to the pet before the layer's hit testing, so a
-//! consumed tap never activates the button underneath; the pet pauses while
+//! consumed tap never activates the button underneath: a tap on the pet
+//! itself is petting (the startle reaction, or a handout kibble when it is
+//! hungry), and a tap on open ground - away from the pet and from the
+//! layer's buttons - drops one kibble the pet walks over and munches, while
+//! taps on buttons pass through untouched. The pet pauses while
 //! any other layer is displayed and resumes with its state intact.
 
 use cairo::Context;
@@ -26,8 +30,6 @@ const EDGE_MARGIN: f64 = 26.0;
 const CLEAR_MARGIN: f64 = 6.0;
 /// Extra tap slop around the sprite in every direction.
 const TAP_PAD: f64 = 9.0;
-/// Taps this far to either side of the pet drop food while it is hungry.
-const FOOD_ZONE: f64 = 150.0;
 /// Satiety below which the pet is hungry and begs.
 const HUNGRY: f64 = 0.35;
 /// Napping requires at least this much satiety.
@@ -629,6 +631,9 @@ impl PetManager {
 
     /// Offer a touchbar tap to the pet before layer hit testing. Returns true
     /// when the pet consumed it and the widget underneath must not fire.
+    /// Precedence: the pet itself first (petting, always consumed), then
+    /// open ground (a kibble drop, consumed), while taps landing on a
+    /// widget span always pass through to that widget.
     pub fn tap(&mut self, x: f64, y: f64, now: Instant, shift_x: f64) -> bool {
         if !self.visible {
             return false;
@@ -658,15 +663,28 @@ impl PetManager {
             }
             return true;
         }
-        if receptive && self.satiety < HUNGRY && (x - screen_x).abs() <= FOOD_ZONE {
-            // A hungry pet takes nearby taps as food drops.
-            self.spawn_food(x - shift_x, now);
-            return true;
+        // A tap on open ground - not on the pet, not on a button - drops a
+        // kibble there. It never steals a tap aimed at a widget, never
+        // interrupts a meal in progress, and never wakes a napping or
+        // startled pet: those two find the kibble when their act ends.
+        let ground_x = x - shift_x;
+        if matches!(self.state, PetState::Munch { .. }) || span_at(&self.spans, ground_x).is_some()
+        {
+            return false;
         }
-        false
+        if receptive {
+            self.spawn_food(ground_x, now);
+        } else {
+            self.place_food(ground_x);
+        }
+        true
     }
 
-    fn spawn_food(&mut self, x: f64, now: Instant) {
+    /// Clamp a kibble drop onto open, standable ground and set it as the
+    /// one waiting kibble: the pet holds at most one at a time, so a new
+    /// drop replaces a waiting one (a meal in progress is never replaced -
+    /// [`PetManager::tap`] guards it). Returns where the kibble landed.
+    fn place_food(&mut self, x: f64) -> f64 {
         let x = clamp_outside(
             x.clamp(self.min_x(), self.max_x()),
             &self.spans,
@@ -674,6 +692,12 @@ impl PetManager {
             self.max_x(),
         );
         self.food = Some(Food { x });
+        x
+    }
+
+    /// Drop a kibble the receptive pet immediately goes for.
+    fn spawn_food(&mut self, x: f64, now: Instant) {
+        let x = self.place_food(x);
         self.lift = 0.0;
         if (x - self.pos).abs() < self.cadence().px_per_step {
             self.state = PetState::Munch {
@@ -1648,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn food_dropped_on_a_widget_lands_beside_it_and_is_still_eaten() {
+    fn food_dropped_beside_a_widget_lands_clear_and_is_still_eaten() {
         let spans = vec![Span {
             left: 1500.0,
             right: 1800.0,
@@ -1662,8 +1686,12 @@ mod tests {
             until: now + Duration::from_secs(10),
         };
         p.spans = spans.clone();
-        // Tap aimed inside the widget while the hungry pet is nearby.
-        assert!(p.tap(1550.0, HEIGHT / 2.0, now, 0.0));
+        // A tap aimed inside the widget goes to the widget, never the pet.
+        assert!(!p.tap(1550.0, HEIGHT / 2.0, now, 0.0));
+        assert!(p.food.is_none());
+        // The same tap just clear of its edge drops the kibble, clamped to
+        // standable ground beside the widget.
+        assert!(p.tap(1488.0, HEIGHT / 2.0, now, 0.0));
         let dropped = p.food.unwrap().x;
         assert_eq!(dropped, 1500.0 - half_sprite_w() - CLEAR_MARGIN);
         for _ in 0..3000 {
@@ -1677,6 +1705,176 @@ mod tests {
             tick(&mut p, &mut now, &spans, 60);
         }
         assert!(p.satiety > 0.99, "meal eaten, got {}", p.satiety);
+    }
+
+    #[test]
+    fn open_ground_taps_drop_one_kibble_at_the_tap() {
+        // The core feeding gesture: a tap away from the pet and any button
+        // drops exactly one kibble right there, whatever the pet's mood,
+        // and the pet sets out for it.
+        let mut p = pet();
+        let now = Instant::now();
+        p.satiety = 0.9;
+        let drop_x = 1500.0;
+        assert!(p.tap(drop_x, HEIGHT / 2.0, now, 0.0));
+        assert_eq!(p.food.map(|f| f.x), Some(drop_x));
+        assert!(matches!(
+            p.state,
+            PetState::Walk {
+                after: After::Munch,
+                target: 1500.0
+            }
+        ));
+        // The pet holds one kibble at a time: a second drop replaces the
+        // waiting one and retargets the walk.
+        assert!(p.tap(800.0, HEIGHT / 2.0, now, 0.0));
+        assert_eq!(p.food.map(|f| f.x), Some(800.0));
+        assert!(matches!(
+            p.state,
+            PetState::Walk {
+                after: After::Munch,
+                target: 800.0
+            }
+        ));
+    }
+
+    #[test]
+    fn a_kibble_dropped_beyond_the_bar_lands_reachable_and_gets_eaten() {
+        // Bounds: a drop aimed past the bar's edge clamps inside it, the
+        // pet walks there and the meal restores satiety and clears the
+        // kibble.
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.pos = 300.0;
+        p.satiety = 0.5;
+        assert!(p.tap(90000.0, HEIGHT / 2.0, now, 0.0));
+        let dropped = p.food.unwrap().x;
+        assert_eq!(dropped, p.max_x(), "the drop must clamp into the bar");
+        let mut munched = false;
+        for _ in 0..3000 {
+            tick(&mut p, &mut now, &[], 60);
+            if matches!(p.state, PetState::Munch { .. }) {
+                munched = true;
+                break;
+            }
+        }
+        assert!(munched, "the pet must reach the clamped kibble");
+        for _ in 0..100 {
+            tick(&mut p, &mut now, &[], 60);
+        }
+        assert!(p.satiety > 0.99, "meal eaten, got {}", p.satiety);
+        assert!(p.food.is_none(), "the eaten kibble must clear");
+    }
+
+    #[test]
+    fn a_kibble_dropped_during_a_nap_waits_for_the_pet_to_wake() {
+        // Nap gating survives the new gesture: the drop does not wake the
+        // pet, and the meal is eaten only after the nap ends on its own.
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.satiety = 0.9;
+        p.pos = 400.0;
+        p.state = PetState::Nap {
+            started: now,
+            until: now + Duration::from_secs(2),
+        };
+        p.blink_on = true;
+        p.next_step = None;
+        assert!(p.tap(1500.0, HEIGHT / 2.0, now, 0.0));
+        assert!(matches!(p.state, PetState::Nap { .. }), "the nap holds");
+        assert_eq!(p.food.map(|f| f.x), Some(1500.0));
+        // The nap runs its course untouched.
+        for _ in 0..8 {
+            tick(&mut p, &mut now, &[], 200);
+            assert!(matches!(p.state, PetState::Nap { .. }));
+        }
+        // Then the pet wakes, heads for the kibble, and eats it.
+        let mut munched = false;
+        for _ in 0..3000 {
+            tick(&mut p, &mut now, &[], 60);
+            if matches!(p.state, PetState::Munch { .. }) {
+                munched = true;
+                break;
+            }
+        }
+        assert!(munched, "the woken pet must still eat the waiting kibble");
+        for _ in 0..100 {
+            tick(&mut p, &mut now, &[], 60);
+        }
+        assert!(p.satiety > 0.99);
+        assert!(p.food.is_none());
+    }
+
+    #[test]
+    fn a_kibble_dropped_during_a_startle_is_eaten_after_the_flee() {
+        // Startle survives the new gesture: the drop neither cancels the
+        // startle nor its flee, and the meal follows once the pet lands.
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.pos = 1000.0;
+        p.state = PetState::Startled {
+            started: now,
+            until: now + Duration::from_millis(STARTLE_MS),
+            away: 1.0,
+        };
+        assert!(p.tap(400.0, HEIGHT / 2.0, now, 0.0));
+        assert!(
+            matches!(p.state, PetState::Startled { .. }),
+            "the startle holds"
+        );
+        assert_eq!(p.food.map(|f| f.x), Some(400.0));
+        let mut munched = false;
+        for _ in 0..3000 {
+            tick(&mut p, &mut now, &[], 60);
+            if matches!(p.state, PetState::Munch { .. }) {
+                munched = true;
+                break;
+            }
+        }
+        assert!(
+            munched,
+            "the startled pet must still eat the waiting kibble"
+        );
+        for _ in 0..100 {
+            tick(&mut p, &mut now, &[], 60);
+        }
+        assert!(p.satiety > 0.99);
+        assert!(p.food.is_none());
+    }
+
+    #[test]
+    fn a_waiting_kibble_survives_a_layer_switch_pause() {
+        // Pause/resume across layer switches survives the new gesture: the
+        // kibble waits through the pause and the pet finishes the errand
+        // after the layer reopens.
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.pos = 400.0;
+        p.satiety = 0.5;
+        assert!(p.tap(1500.0, HEIGHT / 2.0, now, 0.0));
+        assert!(matches!(p.state, PetState::Walk { .. }));
+        tick(&mut p, &mut now, &[], 60);
+        // Another layer opens: the walk and the kibble freeze in place.
+        now += Duration::from_millis(600_000);
+        let (_, timeout) = p.update(now, &bar(false), &[]);
+        assert_eq!(timeout, i32::MAX);
+        assert_eq!(p.food.map(|f| f.x), Some(1500.0));
+        assert!(
+            !p.tap(1600.0, HEIGHT / 2.0, now, 0.0),
+            "hidden pets drop nothing"
+        );
+        // Reopening resumes the walk to the waiting kibble.
+        now += Duration::from_millis(60);
+        p.update(now, &bar(true), &[]);
+        let mut munched = false;
+        for _ in 0..3000 {
+            tick(&mut p, &mut now, &[], 60);
+            if matches!(p.state, PetState::Munch { .. }) {
+                munched = true;
+                break;
+            }
+        }
+        assert!(munched, "the resumed walk must still reach the kibble");
     }
 
     #[test]
@@ -1725,12 +1923,13 @@ mod tests {
         let mut p = pet();
         let now = Instant::now();
         p.satiety = 0.9;
+        // On a bare bar every stretch is open ground, so any tap away from
+        // the pet drops food - hunger no longer gates the handout.
         assert!(
-            !p.tap(p.pos + 400.0, HEIGHT / 2.0, now, 0.0),
-            "far tap passes through to the widget underneath"
+            p.tap(p.pos + 400.0, HEIGHT / 2.0, now, 0.0),
+            "open-ground taps drop food even for a satiated pet"
         );
-        // Satiated pets ignore food drops: the widget underneath keeps working.
-        assert!(!p.tap(p.pos + 100.0, HEIGHT / 2.0, now, 0.0));
+        assert_eq!(p.food.map(|f| f.x), Some(p.pos + 400.0));
         // Hidden (other layer) pets never consume.
         let mut q = pet();
         let mut t = Instant::now();
@@ -1743,6 +1942,49 @@ mod tests {
         let shift = 11.0;
         assert!(p.tap(p.pos + shift, HEIGHT / 2.0, now, shift));
         assert!(matches!(p.state, PetState::Startled { .. }));
+    }
+
+    #[test]
+    fn food_drops_never_steal_taps_aimed_at_widgets() {
+        // Precedence: the pet itself first, open ground second, and widget
+        // spans never - a tap inside a button passes through whether the
+        // pet is hungry or not.
+        let spans = vec![Span {
+            left: 500.0,
+            right: 700.0,
+            clock: false,
+        }];
+        let mut p = pet();
+        let now = Instant::now();
+        p.pos = 900.0;
+        p.spans = spans.clone();
+        for satiety in [0.9, 0.1] {
+            p.satiety = satiety;
+            assert!(
+                !p.tap(600.0, HEIGHT / 2.0, now, 0.0),
+                "a widget tap must pass through (satiety {satiety})"
+            );
+            assert!(p.food.is_none(), "no kibble may appear on a widget");
+        }
+        // Open ground beside the button is consumed as a drop, in layout
+        // coordinates even under pixel shift.
+        assert!(p.tap(850.0, HEIGHT / 2.0, now, 11.0));
+        assert_eq!(p.food.map(|f| f.x), Some(850.0 - 11.0));
+        // A tap on the pet still wins over everything nearby.
+        p.satiety = 0.9;
+        assert!(p.tap(p.pos, HEIGHT / 2.0, now, 0.0));
+        assert!(matches!(p.state, PetState::Startled { .. }));
+        // A munching pet passes open-ground taps through: its meal is not
+        // replaced and the kibble in progress stays put.
+        p.satiety = 0.5;
+        p.state = PetState::Munch {
+            started: now,
+            until: now + Duration::from_millis(MUNCH_MS),
+        };
+        p.food = Some(Food { x: p.pos });
+        assert!(!p.tap(400.0, HEIGHT / 2.0, now, 0.0));
+        assert_eq!(p.food.map(|f| f.x), Some(p.pos));
+        assert!(matches!(p.state, PetState::Munch { .. }));
     }
 
     #[test]
@@ -2032,5 +2274,67 @@ mod tests {
             any(1600, 2008, 4, 30, &|p| p.0 > 220 && p.1 > 170 && p.2 < 120),
             "the sun must shine in the sky"
         );
+    }
+
+    #[test]
+    fn food_drop_walk_and_munch_frames_render_distinctly() {
+        // The feeding gesture in three frames: the dropped kibble, the walk
+        // toward it, and the munch. Under DFR_DECK_REVIEW_OUTPUT the frames
+        // land in that directory as horizontal PNGs for offline visual
+        // review, the same export path as the multibar review frames.
+        let mut p = pet();
+        let mut now = Instant::now();
+        p.satiety = 0.6;
+        p.pos = 300.0;
+        let frame = |p: &PetManager, name: &str| -> Vec<u8> {
+            let mut portrait =
+                ImageSurface::create(Format::ARgb32, HEIGHT as i32, WIDTH as i32).unwrap();
+            {
+                let c = Context::new(&portrait).unwrap();
+                c.translate(HEIGHT, 0.0);
+                c.rotate((90.0f64).to_radians());
+                p.draw(&c, HEIGHT as i32, (0.0, 0.0), Instant::now());
+            }
+            let pixels = portrait.data().unwrap().to_vec();
+            if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
+                let horizontal =
+                    ImageSurface::create(Format::ARgb32, WIDTH as i32, HEIGHT as i32).unwrap();
+                let c = Context::new(&horizontal).unwrap();
+                c.translate(0.0, HEIGHT);
+                c.rotate((-90.0_f64).to_radians());
+                c.set_source_surface(&portrait, 0.0, 0.0).unwrap();
+                c.paint().unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
+                horizontal
+                    .write_to_png(
+                        &mut std::fs::File::create(std::path::Path::new(&dir).join(name)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            pixels
+        };
+
+        // The drop: a kibble lands on open ground, the pet turns for it.
+        assert!(p.tap(1400.0, HEIGHT / 2.0, now, 0.0));
+        let drop_frame = frame(&p, "pet-food-drop.png");
+        // The walk: caught mid-stride, kibble still waiting ahead.
+        for _ in 0..60 {
+            tick(&mut p, &mut now, &[], CALM.step_ms);
+        }
+        assert!(matches!(p.state, PetState::Walk { .. }));
+        assert!((p.pos - 1400.0).abs() > 50.0, "still mid-walk at {}", p.pos);
+        let walk_frame = frame(&p, "pet-food-walk.png");
+        // The munch: arrived and eating, kibble gone afterwards.
+        for _ in 0..3000 {
+            tick(&mut p, &mut now, &[], CALM.step_ms);
+            if matches!(p.state, PetState::Munch { .. }) {
+                break;
+            }
+        }
+        assert!(matches!(p.state, PetState::Munch { .. }));
+        let munch_frame = frame(&p, "pet-food-munch.png");
+        assert_ne!(drop_frame, walk_frame);
+        assert_ne!(walk_frame, munch_frame);
+        assert_ne!(drop_frame, munch_frame);
     }
 }

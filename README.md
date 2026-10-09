@@ -32,6 +32,9 @@ Inspect `implemented-home.png`, `implemented-volume-mid.png`,
 `implemented-brightness.png`, and `implemented-recording.png` in that directory.
 These frames use the configured font and icon search paths; their battery and
 clock display is illustrative and they do not prove physical touch or dictation.
+Running the full test suite with the variable set also exports the pet's
+feeding frames `pet-food-drop.png`, `pet-food-walk.png`, and
+`pet-food-munch.png` from its unit tests.
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
@@ -42,7 +45,8 @@ isolation), command buttons (parse and
 combined layer dispatch, detached execution, and the one-invocation-per-command
 cap), and the virtual pet (pet-layer wiring and button toggle, wander bounds,
 pause and resume across layer switches, nap gating and placement, satiety decay
-and feeding, startle, tap consumption, and reload transitions). Physical
+and feeding, food drops on open ground and walk-to-food bounds, startle, tap
+consumption and hit-test precedence, and reload transitions). Physical
 layout, touch accuracy, brightness, media-key delivery to the desktop, live
 battery/clock refresh, the shared slider's on-glass drag feel, command buttons'
 interaction with a real helper, and the pet's on-glass charm still need a device
@@ -231,12 +235,18 @@ eyes - drawn as per-state pixel frames through the existing cairo surface
 (no images are loaded and no font glyphs are required). It is noticeably
 larger than the original pet, about four fifths of the bar height.
 Tapping the pet directly startles it (it jumps and scurries away); when it
-gets hungry it sits and begs, and tapping the pet itself or the bar next to
-it drops a kibble it walks over and munches. A satiety value decays over
-about an hour and gates the behavior: hungry pets beg and never nap,
-well-fed pets nap and wander. A direct tap on the pet is always consumed
-and never fires the button underneath; nearby taps are consumed only while
-the pet is hungry, whether it is idling, walking, or begging.
+gets hungry it sits and begs, and tapping the hungry pet itself drops a
+kibble right beside it. Tapping open ground anywhere else in the layer -
+away from the pet and from the layer's buttons - drops a kibble right at
+the tap, and the pet walks over and munches it, hungry or not. It holds
+one kibble at a time, so a new drop replaces a waiting one; a napping or
+startled pet finishes its act first and comes for the kibble after, and a
+pet already munching ignores further drops until it is done. A satiety
+value decays over about an hour and gates the behavior: hungry pets beg
+and never nap, well-fed pets nap and wander. A direct tap on the pet is
+always consumed and never fires the button underneath; food drops land
+only on open ground and never steal taps aimed at the layer's buttons,
+whether the pet is hungry or not.
 
 ```toml
 PetEnabled = true   # set false to remove the Pet button and pet layer
