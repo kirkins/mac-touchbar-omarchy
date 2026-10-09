@@ -1,8 +1,11 @@
 //! Live microphone input visualization for the recording layer.
 //!
-//! A button configured with `Waveform = true` renders a scrolling bar graph
-//! of recent input levels beside a recording duration timer, in place of the
-//! old static `● Recording` label. While its layer is displayed the daemon
+//! A button configured with `Waveform = true` renders the sound actually
+//! coming in beside a recording duration timer, in place of the old static
+//! `● Recording` label: by default a single drawn line - flat at rest,
+//! rippling into a smooth wave while speaking - with the previous
+//! scrolling bar graph still selectable per button via
+//! `WaveformStyle = "bars"`. While its layer is displayed the daemon
 //! polls the desktop voice receiver's level endpoint - the same abstract
 //! AF_UNIX and kernel peer-UID boundary as the volume and brightness
 //! receivers - and repaints only that button at the poll cadence. Everywhere
@@ -13,16 +16,16 @@
 //!
 //! Samples land at the poll cadence (one level every [`POLL_INTERVAL`]),
 //! but motion does not step at that cadence: between two samples the
-//! widget's frame clock ([`FRAME_INTERVAL_MS`], roughly 30 fps) scrolls
-//! the graph fractionally leftward and eases the newest bar from the
-//! previous level toward its measured one, so bars flow instead of
+//! widget's frame clock ([`FRAME_INTERVAL_MS`], roughly 30 fps) glides
+//! the curve fractionally leftward and eases the newest level from the
+//! previous one toward its measured value, so the line flows instead of
 //! snapping a full slot every 50 ms. Frames render only while the
 //! recording layer is displayed and only while something is in motion;
 //! an idle, settled widget still wakes at most once per second for the
 //! timer. The level feed itself stays as fresh as the desktop helper's
 //! capture tail - see `integrations/voice/README.md`.
 
-use cairo::Context;
+use cairo::{Context, LineCap, LineJoin};
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
@@ -62,8 +65,20 @@ const TEXT_GAP: f64 = 12.0;
 /// Width reserved on the left for dot plus duration label.
 const TIMER_BLOCK: f64 = 86.0;
 const TIMER_FONT: f64 = 22.0;
-/// Bars keep this much clearance from the button's inset fill edges.
+/// Bars and line keep this much clearance from the button's inset edges.
 const BARS_MARGIN: f64 = 10.0;
+/// Carrier cycles of the line's wave per history slot. The carrier is a
+/// function of the continuous sample index - which stays continuous across
+/// the phase reset each push performs - so the wave never pops when a new
+/// level lands; at the real button's slot width this reads as roughly a
+/// 60-pixel wavelength on the glass.
+const WAVE_CYCLES_PER_SLOT: f64 = 0.4;
+/// Stroke width of the rendered line.
+const LINE_WIDTH: f64 = 2.25;
+/// Horizontal distance between two points of the rendered polyline; at
+/// this step the carrier's steepest slope stays well inside the display's
+/// resolving power while the per-frame path cost stays trivial.
+const LINE_STEP: f64 = 2.0;
 /// Even silence draws a visible pixel pair on the midline.
 const MIN_BAR: f64 = 1.0;
 /// Gap between adjacent bars.
@@ -74,6 +89,26 @@ const BAR_GAP: f64 = 2.0;
 const PULSE_TAU_MS: f32 = 98.0;
 /// Repaint for the pulse alone only when it moved this much.
 const PULSE_EPSILON: f32 = 0.25;
+
+/// Visual style of the live graph: the line is the default; `bars` keeps
+/// the previous scrolling bar graph for owners who prefer it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Style {
+    #[default]
+    Line,
+    Bars,
+}
+
+impl Style {
+    /// Parse a config value, `None` for an unknown one.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "line" => Some(Style::Line),
+            "bars" => Some(Style::Bars),
+            _ => None,
+        }
+    }
+}
 
 /// One live microphone observation from the desktop receiver: `level` is
 /// 0-100 (latest capture peak) and `live` reports whether a recording was
@@ -131,6 +166,15 @@ impl LevelHistory {
     pub fn oldest_first(&self) -> impl Iterator<Item = u8> + '_ {
         let start = (self.next + HISTORY - self.len) % HISTORY;
         (0..self.len).map(move |i| self.entries[(start + i) % HISTORY])
+    }
+
+    /// The level at position `i` of the oldest-first sequence.
+    pub fn at(&self, i: usize) -> Option<u8> {
+        if i >= self.len {
+            return None;
+        }
+        let start = (self.next + HISTORY - self.len) % HISTORY;
+        Some(self.entries[(start + i) % HISTORY])
     }
 }
 
@@ -193,6 +237,68 @@ pub fn smoothstep(t: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Catmull-Rom interpolation through `p1` and `p2` with `p0` and `p3` as
+/// tangent guides: a curve that passes exactly through its samples with a
+/// continuous slope, so the line flows where linear joins would kink.
+fn catmull_rom(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * ((2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+}
+
+/// The line's envelope level (0-100) at continuous sample index `s`, where
+/// 0 is the oldest retained sample and `len-1` the newest, eased toward its
+/// measured level by `phase`. Indices left of the retained window read as
+/// silence and fade in over the first slot, so the curve leaves and enters
+/// the graph flat rather than stepping; right of the newest sample the eased
+/// level holds, so the line's right end rides the measurement exactly where
+/// the previous period's curve ended.
+pub fn envelope_at(history: &LevelHistory, previous_level: u8, phase: f64, s: f64) -> f64 {
+    let len = history.len();
+    if len == 0 || s <= 0.0 {
+        return 0.0;
+    }
+    let newest = history.newest().unwrap_or(0);
+    let value = |j: usize| {
+        let j = j.min(len - 1);
+        if j + 1 == len {
+            display_level(previous_level, newest, phase)
+        } else {
+            f64::from(history.at(j).unwrap_or(0))
+        }
+    };
+    let level = if s >= (len - 1) as f64 {
+        value(len - 1)
+    } else {
+        let i = s.floor() as usize;
+        let t = s - s.floor();
+        catmull_rom(
+            value(i.saturating_sub(1)),
+            value(i),
+            value(i + 1),
+            value(i + 2),
+            t,
+        )
+        .clamp(0.0, 100.0)
+    };
+    // Fade the curve flat across the first slot so the data boundary and
+    // the graph's left edge never show a corner.
+    level * smoothstep(s.clamp(0.0, 1.0))
+}
+
+/// The line's vertical offset from the baseline at continuous sample index
+/// `s`: the envelope scaled to the graph's half-height, carried by a sine
+/// of the sample coordinate, so the wave scrolls with the history and
+/// stays continuous across the sample boundary instead of standing still
+/// under a moving envelope.
+pub fn wave_offset(layout: &Layout, s: f64, envelope: f64) -> f64 {
+    let amplitude = layout.bar_max_half * envelope.clamp(0.0, 100.0) / 100.0;
+    amplitude * (2.0 * std::f64::consts::PI * WAVE_CYCLES_PER_SLOT * s).sin()
+}
+
 /// The level the newest bar displays at `phase` into the current sample
 /// period: it rises from the previous sample's level, which is what the
 /// bar showed the instant the previous period ended, so heights stay
@@ -212,6 +318,7 @@ pub fn format_duration(duration: Duration) -> String {
 /// layer carrying the widget; the history and pulse follow the live feed,
 /// and the frame clock interpolates motion between samples.
 pub struct WaveformWidget {
+    style: Style,
     history: LevelHistory,
     started: Option<Instant>,
     live: bool,
@@ -230,8 +337,9 @@ pub struct WaveformWidget {
 }
 
 impl WaveformWidget {
-    pub fn new() -> Self {
+    pub fn new(style: Style) -> Self {
         Self {
+            style,
             history: LevelHistory::new(),
             started: None,
             live: false,
@@ -415,36 +523,93 @@ impl WaveformWidget {
             cy - extents.y_bearing() - extents.height() / 2.0,
         );
         c.show_text(&label).unwrap();
-        // The scrolling level graph - the newest bar eases in at the right
-        // edge while older history glides left between samples, or a flat
-        // dim baseline while idle. The fractional phase keeps positions
-        // continuous across sample boundaries: a bar one slot right at
+        // The live input visualization - the newest level eases in at the
+        // right edge while older history glides left between samples, or a
+        // flat dim baseline while idle. The fractional phase keeps positions
+        // continuous across sample boundaries: a feature one slot right at
         // phase 0 is exactly where its predecessor ended at phase 1.
         if self.live {
-            let len = self.history.len();
-            let phase = self.phase(now);
-            for (i, level) in self.history.oldest_first().enumerate() {
-                let level = if i + 1 == len {
-                    display_level(self.previous_level, level, phase)
-                } else {
-                    f64::from(level)
-                };
-                let slot = (HISTORY - len + i) as f64 - phase;
-                let (x, y, w, h) = bar_rect(&layout, slot, level);
-                c.rectangle(left + x, y_shift + y, w, h);
+            match self.style {
+                Style::Line => self.render_line(c, &layout, left, cy, now),
+                Style::Bars => self.render_bars(c, &layout, left, y_shift, now),
             }
-            c.fill().unwrap();
         } else {
             c.set_source_rgb(0.42, 0.42, 0.42);
             c.rectangle(left + layout.bars.0, cy - 0.5, layout.bars.1, 1.0);
             c.fill().unwrap();
         }
     }
+
+    /// The line renderer: one continuous stroke across the graph area,
+    /// flat where the envelope rests and rippling with live input. Both the
+    /// envelope and the carrier are functions of the continuous sample
+    /// index, so between samples the whole curve glides left by fractions
+    /// of a slot - the same scroll the bars ride - and a new level landing
+    /// never pops the wave's shape.
+    fn render_line(&self, c: &Context, layout: &Layout, left: f64, cy: f64, now: Instant) {
+        let phase = self.phase(now);
+        let area_left = left + layout.bars.0;
+        let right = area_left + layout.bars.1;
+        c.set_source_rgb(1.0, 1.0, 1.0);
+        c.set_line_width(LINE_WIDTH);
+        c.set_line_cap(LineCap::Round);
+        c.set_line_join(LineJoin::Round);
+        let mut x = area_left;
+        let mut started = false;
+        while x < right {
+            let y = cy - self.line_offset(layout, x, phase);
+            if started {
+                c.line_to(x, y);
+            } else {
+                c.move_to(x, y);
+                started = true;
+            }
+            x += LINE_STEP;
+        }
+        // Close exactly on the right edge whatever the step remainder is.
+        let y = cy - self.line_offset(layout, right, phase);
+        if started {
+            c.line_to(right, y);
+        } else {
+            c.move_to(right, y);
+        }
+        c.stroke().unwrap();
+    }
+
+    /// The line's vertical offset from the baseline at button-local pixel
+    /// `x`, positive upward: the eased envelope at that pixel's continuous
+    /// sample position, carried by the scrolling sine. Kept as data-side
+    /// math so tests can check continuity and bounds without a context.
+    fn line_offset(&self, layout: &Layout, x: f64, phase: f64) -> f64 {
+        let s = (x + phase * layout.slot_w - layout.bars.0) / layout.slot_w
+            - (HISTORY - self.history.len()) as f64;
+        let envelope = envelope_at(&self.history, self.previous_level, phase, s);
+        wave_offset(layout, s, envelope)
+    }
+
+    /// The bar renderer, the style this widget shipped with before the
+    /// line: vertical bars mirroring around the baseline, gliding left.
+    fn render_bars(&self, c: &Context, layout: &Layout, left: f64, y_shift: f64, now: Instant) {
+        let len = self.history.len();
+        let phase = self.phase(now);
+        c.set_source_rgb(1.0, 1.0, 1.0);
+        for (i, level) in self.history.oldest_first().enumerate() {
+            let level = if i + 1 == len {
+                display_level(self.previous_level, level, phase)
+            } else {
+                f64::from(level)
+            };
+            let slot = (HISTORY - len + i) as f64 - phase;
+            let (x, y, w, h) = bar_rect(layout, slot, level);
+            c.rectangle(left + x, y_shift + y, w, h);
+        }
+        c.fill().unwrap();
+    }
 }
 
 impl Default for WaveformWidget {
     fn default() -> Self {
-        Self::new()
+        Self::new(Style::Line)
     }
 }
 
@@ -764,9 +929,235 @@ mod tests {
     }
 
     #[test]
+    fn styles_parse_from_config_values() {
+        assert_eq!(Style::parse("line"), Some(Style::Line));
+        assert_eq!(Style::parse("bars"), Some(Style::Bars));
+        assert_eq!(Style::parse("squiggle"), None);
+        assert_eq!(Style::parse(""), None);
+        assert_ne!(Style::default(), Style::Bars);
+    }
+
+    #[test]
+    fn the_envelope_interpolates_smoothly_and_fades_in_at_the_data_edge() {
+        let mut history = LevelHistory::new();
+        // Silence reads as a perfectly flat line whatever the carrier does.
+        for _ in 0..HISTORY {
+            history.push(0);
+        }
+        for s in [0.0, 0.5, 12.25, 47.0] {
+            assert_eq!(envelope_at(&history, 0, 0.5, s), 0.0);
+        }
+        // The curve passes exactly through its samples and stays in range.
+        let mut history = LevelHistory::new();
+        for level in [10, 30, 55, 40, 70, 25, 60, 45] {
+            history.push(level);
+        }
+        for (i, level) in [55, 40, 70, 25, 60].into_iter().enumerate() {
+            let s = i as f64 + 2.0;
+            assert!((envelope_at(&history, 70, 1.0, s) - f64::from(level)).abs() < 1e-9);
+        }
+        for step in 0..=14 {
+            for phase in [0.0, 0.5, 1.0] {
+                let value = envelope_at(&history, 70, phase, f64::from(step) / 2.0);
+                assert!(
+                    (0.0..=100.0).contains(&value),
+                    "envelope out of range at {}",
+                    step / 2
+                );
+            }
+        }
+        // The data edge fades in over the first slot: no corner where the
+        // flat no-data region meets the oldest sample.
+        assert_eq!(envelope_at(&history, 70, 1.0, 0.0), 0.0);
+        assert!(envelope_at(&history, 70, 1.0, 0.5) < 30.0);
+        // Right of the newest sample the eased level holds, so the line's
+        // right end rides the measurement: it starts at the previous
+        // sample's level and rests at the newest one.
+        assert!((envelope_at(&history, 70, 1.0, 9.0) - 45.0).abs() < 1e-9);
+        assert!((envelope_at(&history, 70, 0.0, 9.0) - 70.0).abs() < 1e-9);
+        assert!((envelope_at(&history, 70, 0.5, 9.0) - 57.5).abs() < 1e-9);
+        // An empty history is silence at every index.
+        assert_eq!(envelope_at(&LevelHistory::new(), 80, 0.5, 3.0), 0.0);
+    }
+
+    #[test]
+    fn the_line_rests_flat_stays_bounded_and_stays_continuous_across_samples() {
+        let layout = layout(570.0, 60.0);
+        let now = Instant::now();
+        let sweep = (0..250)
+            .map(|i| layout.bars.0 + layout.bars.1 * f64::from(i) / 249.0)
+            .collect::<Vec<_>>();
+
+        // A live but silent feed is exactly the flat resting line.
+        let mut wave = WaveformWidget::new(Style::Line);
+        wave.activate(now);
+        for step in 0..HISTORY {
+            wave.sample(
+                Sample {
+                    level: 0,
+                    live: true,
+                },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        for &x in &sweep {
+            assert_eq!(
+                wave.line_offset(&layout, x, 0.37),
+                0.0,
+                "silence must be flat"
+            );
+        }
+
+        // Loud input ripples within the graph's half-height at every phase.
+        let mut wave = WaveformWidget::new(Style::Line);
+        wave.activate(now);
+        for (step, level) in [8, 22, 5, 41, 67, 88, 30, 12, 55, 73, 19, 96, 44, 27, 60]
+            .into_iter()
+            .enumerate()
+        {
+            wave.sample(
+                Sample { level, live: true },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        let loudest = sweep
+            .iter()
+            .flat_map(|&x| [0.0, 0.25, 0.5, 0.75, 1.0].map(|p| wave.line_offset(&layout, x, p)))
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            loudest > layout.bar_max_half * 0.5,
+            "loud input barely ripples"
+        );
+        assert!(
+            loudest <= layout.bar_max_half + 1e-9,
+            "ripple left the area"
+        );
+
+        // Quieter input ripples less: the excursion follows the level.
+        let mut quiet = WaveformWidget::new(Style::Line);
+        quiet.activate(now);
+        for (step, level) in [3, 9, 6, 11, 8, 12, 5, 10, 7, 9, 4, 11, 6, 8, 9]
+            .into_iter()
+            .enumerate()
+        {
+            quiet.sample(
+                Sample { level, live: true },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        let quietest = sweep
+            .iter()
+            .flat_map(|&x| [0.0, 0.25, 0.5, 0.75, 1.0].map(|p| quiet.line_offset(&layout, x, p)))
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            quietest < loudest * 0.5,
+            "excursion does not follow the level"
+        );
+
+        // The wave stays continuous across a sample boundary: the curve at
+        // phase 1 sits exactly where it restarts at phase 0 once the new
+        // level lands, at every retained sample position.
+        let len = 15;
+        let positions = (0..len)
+            .map(|i| layout.bars.0 + (HISTORY - len + i - 1) as f64 * layout.slot_w)
+            .collect::<Vec<_>>();
+        let before: Vec<_> = positions
+            .iter()
+            .map(|&x| wave.line_offset(&layout, x, 1.0))
+            .collect();
+        wave.sample(
+            Sample {
+                level: 33,
+                live: true,
+            },
+            now + Duration::from_millis(50 * len as u64),
+        );
+        for (i, &x) in positions.iter().enumerate().skip(1) {
+            let after = wave.line_offset(&layout, x, 0.0);
+            assert!((before[i] - after).abs() < 1e-9, "pop at sample {i}");
+        }
+    }
+
+    #[test]
+    fn the_line_paints_a_continuous_stroke_and_the_bars_style_stays_available() {
+        let graph = |surface: &mut ImageSurface| {
+            let stride = surface.stride() as usize;
+            let data = surface.data().unwrap();
+            // Lit-pixel rows per graph-area column: the timer block and dot
+            // live left of the graph, so scan only the wave's own area
+            // (86..558 for this button width) with an inset on both ends.
+            let left = 100;
+            let right = 550;
+            let mut rows = vec![Vec::new(); (right - left) as usize];
+            for x in left..right {
+                for y in 0..60 {
+                    let i = y as usize * stride + x as usize * 4;
+                    let luminance = data[i].max(data[i + 1]).max(data[i + 2]);
+                    if luminance > 40 {
+                        rows[(x - left) as usize].push(y);
+                    }
+                }
+            }
+            rows
+        };
+        let render = |style: Style, levels: &[u8]| -> ImageSurface {
+            let surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
+            let now = Instant::now();
+            let mut wave = WaveformWidget::new(style);
+            wave.activate(now);
+            for (step, &level) in levels.iter().enumerate() {
+                wave.sample(
+                    Sample { level, live: true },
+                    now + Duration::from_millis(50 * step as u64),
+                );
+            }
+            let c = Context::new(&surface).unwrap();
+            wave.render_at(&c, 60, 0.0, 570.0, 0.0, now + Duration::from_millis(40));
+            surface
+        };
+        let loud = [8, 22, 5, 41, 67, 88, 30, 12, 55, 73, 19, 96, 44, 27, 60];
+
+        // The line is one continuous stroke: every graph column carries
+        // ink, and loud input carries it well above and below the baseline.
+        let mut line_surface = render(Style::Line, &loud);
+        let rows = graph(&mut line_surface);
+        assert!(rows.iter().all(|r| !r.is_empty()), "the stroke has gaps");
+        assert!(
+            rows.iter().any(|r| r.iter().any(|&y| y < 15)),
+            "no ink above the baseline"
+        );
+        assert!(
+            rows.iter().any(|r| r.iter().any(|&y| y > 45)),
+            "no ink below the baseline"
+        );
+
+        // Live silence is a bright flat line hugging the baseline.
+        let mut flat_surface = render(Style::Line, &[0; 12]);
+        let rows = graph(&mut flat_surface);
+        assert!(rows
+            .iter()
+            .all(|r| r.iter().all(|&y| (25..=35).contains(&y))));
+        assert!(
+            rows.iter()
+                .any(|r| r.iter().any(|&y| (29..=31).contains(&y))),
+            "flat line lost its baseline"
+        );
+
+        // The bars style still draws its bar graph: same feed, visibly
+        // different frame, and columns inside the bar gaps stay empty.
+        let mut bars_surface = render(Style::Bars, &loud);
+        assert_ne!(
+            line_surface.data().unwrap().to_vec(),
+            bars_surface.data().unwrap().to_vec()
+        );
+        let rows = graph(&mut bars_surface);
+        assert!(rows.iter().any(|r| r.is_empty()), "bars lost their gaps");
+    }
+
+    #[test]
     fn the_phase_advances_with_the_clock_and_rests_at_one() {
         let now = Instant::now();
-        let mut wave = WaveformWidget::new();
+        let mut wave = WaveformWidget::new(Style::Line);
         assert_eq!(wave.phase(now), 1.0);
         assert!(wave.activate(now));
         assert_eq!(wave.phase(now + Duration::from_secs(3)), 1.0);
@@ -791,7 +1182,7 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(667)), "11:07");
         assert_eq!(format_duration(Duration::from_secs(4505)), "75:05");
         let start = Instant::now();
-        let mut wave = WaveformWidget::new();
+        let mut wave = WaveformWidget::new(Style::Line);
         // Before its layer is shown the widget neither times nor ticks.
         assert!(!wave.is_active());
         assert!(!wave.tick(start + Duration::from_secs(5)));
@@ -824,7 +1215,7 @@ mod tests {
     #[test]
     fn frames_repaint_while_the_graph_moves_and_settle_when_it_cannot() {
         let now = Instant::now();
-        let mut wave = WaveformWidget::new();
+        let mut wave = WaveformWidget::new(Style::Line);
         // Samples and frames before activation are ignored.
         assert!(!wave.sample(
             Sample {
@@ -1033,7 +1424,7 @@ mod tests {
             data
         }
         let now = Instant::now();
-        let mut wave = WaveformWidget::new();
+        let mut wave = WaveformWidget::new(Style::Line);
         wave.activate(now);
         wave.frame(now + Duration::from_secs(83));
         let idle = render(&wave, now + Duration::from_secs(83));
@@ -1083,7 +1474,7 @@ mod tests {
         // repaint (erase, dot, timer, bars) must cost well under a frame
         // budget even on this machine's slowest core.
         let surface = ImageSurface::create(Format::ARgb32, 1300, 60).unwrap();
-        let mut wave = WaveformWidget::new();
+        let mut wave = WaveformWidget::new(Style::Line);
         let now = Instant::now();
         wave.activate(now);
         for step in 0..HISTORY {

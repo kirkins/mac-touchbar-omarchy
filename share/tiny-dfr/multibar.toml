@@ -49,10 +49,12 @@ Keys = [
 # Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
 # opens this recording layer in one press; the layer itself is the visual
 # state. The middle Waveform button shows the sound actually coming in: a
-# scrolling bar graph of recent microphone input levels, a recording dot
-# that pulses with live level, and a duration timer counting from entering
-# the layer, all driven by the optional desktop-session level feed (see
-# README; without it the widget shows a calm idle baseline and the timer).
+# drawn line that rests flat while silent and ripples into a smooth wave
+# while speaking, a recording dot that pulses with live level, and a duration
+# timer counting from entering the layer, all driven by the optional
+# desktop-session level feed (see README; without it the widget shows a calm
+# idle baseline and the timer). Set WaveformStyle = "bars" on the button to
+# keep the previous scrolling bar graph instead of the line.
 # Stop keeps the recording and types the transcript into the focused
 # window, Cancel discards a mis-start; both run their command and return
 # home. Install the optional integrations/voice client and desktop-session

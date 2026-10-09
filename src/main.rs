@@ -71,7 +71,7 @@ use level_control::{LevelControl, State as LevelState};
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use slider::{Geometry, Kind, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
-use waveform::{MicLevels, Sample as MicSample, WaveformWidget};
+use waveform::{MicLevels, Sample as MicSample, Style, WaveformWidget};
 
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
@@ -495,7 +495,7 @@ impl Button {
         } else if let Some(battery_mode) = cfg.battery {
             Button::new_battery(cfg.action, battery_mode, cfg.theme)
         } else if cfg.waveform.unwrap_or(false) {
-            Button::new_waveform(cfg.action)
+            Button::new_waveform(cfg.action, cfg.waveform_style.as_deref())
         } else {
             Button::new_spacer()
         };
@@ -607,12 +607,16 @@ impl Button {
         }
     }
 
-    fn new_waveform(action: ButtonAction) -> Button {
+    fn new_waveform(action: ButtonAction, style: Option<&str>) -> Button {
+        let style = style.map_or(Style::Line, |value| {
+            Style::parse(value)
+                .unwrap_or_else(|| panic!("invalid waveform style, accepted styles: line, bars"))
+        });
         Button {
             action,
             active: false,
             changed: false,
-            image: ButtonImage::Waveform(WaveformWidget::new()),
+            image: ButtonImage::Waveform(WaveformWidget::new(style)),
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,

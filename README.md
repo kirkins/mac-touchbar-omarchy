@@ -47,8 +47,9 @@ selection without stepping, combined-region geometry and drag math, safe ranges,
 auto-collapse timing, confirmed readback, failures, stale replies and selection
 isolation), command buttons (parse and
 combined layer dispatch, detached execution, and the one-invocation-per-command
-cap), the recording waveform (level-history ring behavior, bar geometry from
-synthetic levels, incremental button repaints, recording-only fast cadence,
+cap), the recording waveform (level-history ring behavior, line and bar
+geometry from synthetic levels, flatness, bounds, and sample-boundary
+continuity of the line, incremental button repaints, recording-only fast cadence,
 monotonic duration timer, live/idle rendering, and the level poller's arming,
 reply parsing, and peer-UID boundary against fake receivers), and the virtual
 pet (pet-layer wiring and button toggle, wander bounds,
@@ -228,13 +229,15 @@ to confirm recording started.
 
 A button configured with `{ Waveform = true, Stretch = 3 }` - the middle of
 the multibar example's `recording` layer - replaces the old static
-`● Recording` label with the sound actually coming in: a scrolling bar graph
-of roughly the last two seconds of microphone input levels, a red recording
-dot whose
-pulse follows the live level, and a duration timer counting `m:ss` from
-entering the layer. Re-entering the layer starts the timer and graph fresh.
-This indicates live capture as reported by the receiver; it does not confirm
-transcription success.
+`● Recording` label with the sound actually coming in: a single drawn line
+that rests flat and silent until you speak, then ripples into a smooth
+traveling wave whose height follows the last two seconds of microphone
+input, beside a red recording dot whose pulse follows the live level and a
+duration timer counting `m:ss` from entering the layer. Re-entering the
+layer starts the timer and graph fresh. This indicates live capture as
+reported by the receiver; it does not confirm transcription success. Owners
+who prefer the previous look can set `WaveformStyle = "bars"` on the button
+to keep the scrolling bar graph instead of the line.
 
 While that layer is displayed, the daemon polls a second abstract socket,
 `dfr-voice-level-1000`, exposed by the same optional voice receiver: the
@@ -251,9 +254,9 @@ signal.
 
 The repaint cadence stays bounded: the poller is armed only while the
 recording layer is displayed, polling at 20 Hz, and the widget repaints just
-that button's column at roughly 30 fps while its graph is in motion: between
-two samples every bar glides fractionally left and the newest bar eases to
-its measured level, so the history flows instead of stepping one slot per
+that button's column at roughly 30 fps while its curve is in motion: between
+two samples the whole line glides fractionally left and its newest end eases
+to the measured level, so the wave flows instead of stepping one slot per
 sample. Every other layer keeps its existing redraws, and a settled, silent
 feed repaints nothing but the once-a-second timer tick.
 

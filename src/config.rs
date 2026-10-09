@@ -160,6 +160,7 @@ pub struct ButtonConfig {
     pub time: Option<String>,
     pub battery: Option<String>,
     pub waveform: Option<bool>,
+    pub waveform_style: Option<String>,
     pub locale: Option<String>,
     #[serde(default)]
     pub action: ButtonAction,
@@ -696,6 +697,31 @@ Keys = [{ Text = "F1", Action = "F1" }]
     }
 
     #[test]
+    fn waveform_buttons_carry_an_optional_graph_style() {
+        for (value, style) in [
+            ("line", crate::waveform::Style::Line),
+            ("bars", crate::waveform::Style::Bars),
+        ] {
+            let candidate = NAMED.replace(
+                "Text = \"F1\"",
+                &format!("Waveform = true, WaveformStyle = \"{value}\""),
+            );
+            let (_, styled) = parse_config(BASE, Some(&candidate), 2008).unwrap();
+            let key = styled.layers[1].keys.last().unwrap();
+            assert_eq!(key.waveform, Some(true));
+            assert_eq!(key.waveform_style.as_deref(), Some(value));
+            assert_eq!(crate::waveform::Style::parse(value), Some(style));
+        }
+        // A style without a Waveform button stays inert; an unknown value
+        // maps to no style, which the button builder reports as a
+        // configuration error.
+        let inert = NAMED.replace("Text = \"F1\"", "Text = \"F1\", WaveformStyle = \"line\"");
+        let (_, styled) = parse_config(BASE, Some(&inert), 2008).unwrap();
+        assert_eq!(styled.layers[1].keys.last().unwrap().waveform, None);
+        assert!(crate::waveform::Style::parse("dots").is_none());
+    }
+
+    #[test]
     fn approved_multibar_preserves_voice_dispatch_and_renders_offline() {
         use chrono::Timelike;
         let tmp = TempDir::new();
@@ -906,8 +932,8 @@ Keys = [{ Text = "F1", Action = "F1" }]
             deck.waveform_tick(Some(crate::MicSample { level, live: true }), feed_now);
         }
         // Mid-period frame: the graph is caught halfway between two samples,
-        // with the newest bar eased to half its measured level and every
-        // bar glided half a slot left of its sample position.
+        // with the newest level eased to half its measured value and the
+        // whole curve glided half a slot left of its sample positions.
         let mid = Instant::now() - Duration::from_millis(25);
         deck.waveform_tick(
             Some(crate::MicSample {
@@ -1089,8 +1115,10 @@ DoublePressSwitchLayers = 200
                 layer: "home".into()
             }
         );
-        // The middle button is the live input-level waveform widget.
+        // The middle button is the live input-level waveform widget; the
+        // line style is the default, so no style in the shipped config.
         assert_eq!(recording.keys[1].waveform, Some(true));
+        assert_eq!(recording.keys[1].waveform_style, None);
         assert!(recording.keys[1].text.is_none());
         assert_eq!(recording.keys[1].stretch, Some(3));
         assert_eq!(

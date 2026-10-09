@@ -183,11 +183,12 @@ PrimaryLayerKeys = [
     # Example of the live recording waveform (see the recording layer in
     # share/tiny-dfr/multibar.toml):
     # { Waveform = true, Stretch = 3 }
-    # This will display a scrolling graph of recent microphone input levels
-    # with a recording dot and duration timer while dictation runs, on the
-    # layer carrying it. The daemon polls levels only while that layer is
-    # displayed; without the desktop voice receiver it shows a calm idle
-    # baseline and the timer.
+    # This will display a drawn line of recent microphone input - flat at
+    # rest, rippling into a smooth wave while speaking - with a recording
+    # dot and duration timer while dictation runs, on the layer carrying it.
+    # Add WaveformStyle = "bars" to keep the previous bar graph instead.
+    # The daemon polls levels only while that layer is displayed; without
+    # the desktop voice receiver it shows a calm idle baseline and the timer.
 
     # Example of a Spacer:
     # { Stretch = 3 }
