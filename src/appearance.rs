@@ -11,6 +11,7 @@ pub enum ButtonAccent {
     Neutral,
     Cyan,
     Amber,
+    Blue,
     Violet,
     Red,
     Green,
@@ -40,11 +41,12 @@ impl ButtonAccent {
         }
     }
 
-    fn rgb(self) -> (f64, f64, f64) {
+    pub fn rgb(self) -> (f64, f64, f64) {
         match self {
             Self::Neutral => (0.58, 0.63, 0.72),
             Self::Cyan => (0.19, 0.83, 0.95),
             Self::Amber => (1.0, 0.72, 0.27),
+            Self::Blue => (0.36, 0.60, 1.0),
             Self::Violet => (0.67, 0.53, 1.0),
             Self::Red => (1.0, 0.32, 0.42),
             Self::Green => (0.27, 0.88, 0.57),

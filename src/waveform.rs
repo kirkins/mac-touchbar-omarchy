@@ -25,6 +25,7 @@
 //! timer. The level feed itself stays as fresh as the desktop helper's
 //! capture tail - see `integrations/voice/README.md`.
 
+use crate::appearance::ButtonAccent;
 use cairo::{Context, LineCap, LineJoin};
 use std::{
     io::{self, Read, Write},
@@ -319,6 +320,8 @@ pub fn format_duration(duration: Duration) -> String {
 /// and the frame clock interpolates motion between samples.
 pub struct WaveformWidget {
     style: Style,
+    /// Live color of the recording dot, from the button's accent.
+    live_rgb: (f64, f64, f64),
     history: LevelHistory,
     started: Option<Instant>,
     live: bool,
@@ -340,6 +343,7 @@ impl WaveformWidget {
     pub fn new(style: Style) -> Self {
         Self {
             style,
+            live_rgb: ButtonAccent::Blue.rgb(),
             history: LevelHistory::new(),
             started: None,
             live: false,
@@ -478,6 +482,13 @@ impl WaveformWidget {
         &self.history
     }
 
+    /// Take the live dot color from the button's accent, defaulting to
+    /// the shipped blue when the button carries no explicit accent.
+    pub fn with_accent(mut self, accent: Option<ButtonAccent>) -> Self {
+        self.live_rgb = accent.unwrap_or(ButtonAccent::Blue).rgb();
+        self
+    }
+
     /// Draw the widget. `c` carries the layer's rotation; the caller clips
     /// to the button's rect, so the layout never exceeds `width`/`height`.
     pub fn render(&self, c: &Context, height: i32, left: f64, width: f64, y_shift: f64) {
@@ -500,7 +511,7 @@ impl WaveformWidget {
         // The recording dot pulses with live level; idle it stays small and dim.
         let radius = DOT_R_BASE + DOT_R_SPAN * f64::from(self.smoothed) / 100.0;
         let (r, g, b) = if self.live {
-            (1.0, 0.32, 0.42)
+            self.live_rgb
         } else {
             (0.45, 0.45, 0.45)
         };
@@ -926,6 +937,57 @@ mod tests {
         assert_eq!(widget_height(0.0), bar_rect(&layout, 0.0, 40.0).3);
         assert_eq!(widget_height(1.0), bar_rect(&layout, 0.0, 70.0).3);
         assert!(widget_height(0.5) > widget_height(0.0));
+    }
+
+    #[test]
+    fn the_live_dot_defaults_to_blue_and_honors_the_button_accent() {
+        use crate::appearance::ButtonAccent;
+
+        assert_eq!(
+            WaveformWidget::new(Style::Line).live_rgb,
+            ButtonAccent::Blue.rgb()
+        );
+        assert_eq!(
+            WaveformWidget::new(Style::Line)
+                .with_accent(Some(ButtonAccent::Red))
+                .live_rgb,
+            ButtonAccent::Red.rgb()
+        );
+        assert_ne!(ButtonAccent::Blue.rgb(), ButtonAccent::Red.rgb());
+    }
+
+    #[test]
+    fn the_live_dot_paints_the_accent_color_not_the_old_red() {
+        // A live dot in default blue: some painted pixel carries a
+        // distinctly stronger blue channel than red, which the old hardcoded
+        // red could never do (ARGB32 bytes are B, G, R, A here).
+        let mut surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
+        let now = Instant::now();
+        let mut wave = WaveformWidget::new(Style::Line);
+        wave.activate(now);
+        wave.sample(
+            Sample {
+                level: 50,
+                live: true,
+            },
+            now,
+        );
+        {
+            let c = Context::new(&surface).unwrap();
+            wave.render_at(&c, 60, 0.0, 570.0, 0.0, now + Duration::from_millis(40));
+        }
+        // A live dot in default blue: some painted pixel carries a
+        // distinctly stronger blue channel than red, which the old hardcoded
+        // red could never do (ARGB32 bytes are B, G, R, A here).
+        let data = surface.data().unwrap();
+        let mut blue_dominant = false;
+        for i in (0..data.len()).step_by(4) {
+            if i32::from(data[i]) > i32::from(data[i + 2]) + 20 {
+                blue_dominant = true;
+                break;
+            }
+        }
+        assert!(blue_dominant, "live dot is not painted blue");
     }
 
     #[test]

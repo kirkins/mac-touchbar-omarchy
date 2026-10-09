@@ -64,7 +64,7 @@ Keys = [
 Name = "recording"
 Keys = [
     { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
-    { Waveform = true, Accent = "red", Stretch = 3 },
+    { Waveform = true, Accent = "blue", Stretch = 3 },
     { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
 ]
 

@@ -679,6 +679,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
             ("neutral", ButtonAccent::Neutral),
             ("cyan", ButtonAccent::Cyan),
             ("amber", ButtonAccent::Amber),
+            ("blue", ButtonAccent::Blue),
             ("violet", ButtonAccent::Violet),
             ("red", ButtonAccent::Red),
             ("green", ButtonAccent::Green),

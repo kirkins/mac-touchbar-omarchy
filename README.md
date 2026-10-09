@@ -232,8 +232,13 @@ the multibar example's `recording` layer - replaces the old static
 `● Recording` label with the sound actually coming in: a single drawn line
 that rests flat and silent until you speak, then ripples into a smooth
 traveling wave whose height follows the last two seconds of microphone
-input, beside a red recording dot whose pulse follows the live level and a
-duration timer counting `m:ss` from entering the layer. Re-entering the
+input, beside a recording dot whose pulse follows the live level and a
+duration timer counting `m:ss` from entering the layer. The button's
+`Accent` key colors both the dot and the button's background tint; the
+shipped default is `Accent = "blue"` (RGB 0.36, 0.60, 1.0 - a readable
+blue on the Touch Bar's dark glass, matching the deck's accent palette).
+Owners who prefer the previous red can set `Accent = "red"` on the button,
+or any of the deck's other accents. Re-entering the
 layer starts the timer and graph fresh. This indicates live capture as
 reported by the receiver; it does not confirm transcription success. Owners
 who prefer the previous look can set `WaveformStyle = "bars"` on the button
