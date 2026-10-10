@@ -24,6 +24,18 @@
 //! an idle, settled widget still wakes at most once per second for the
 //! timer. The level feed itself stays as fresh as the desktop helper's
 //! capture tail - see `integrations/voice/README.md`.
+//!
+//! The same widget, in [`Mode::Music`], is the media layer's opt-in music
+//! visualizer: it drops the recording dot and duration timer, draws the
+//! graph across the whole button, and shows a centered `Viz` label while
+//! its session is off - the visualizer never shows by default. Its feed
+//! is [`MonitorLevels`], which dials a second desktop receiver whose
+//! capture is the default sink's *output* monitor. That stream exists
+//! only while the visualizer is enabled: arming the poller sends `on`, so
+//! the helper starts capturing, and disarming - toggle-off, leaving the
+//! media layer, a reload, or the daemon going away - sends `off` (or, for
+//! a vanished daemon, trips the helper's own idle watchdog), so no
+//! monitor stream outlives its consumer. See `integrations/viz/README.md`.
 
 use crate::appearance::ButtonAccent;
 use cairo::{Context, LineCap, LineJoin};
@@ -62,6 +74,8 @@ const PAD: f64 = 12.0;
 /// Idle recording-dot radius and the extra radius a full level adds.
 const DOT_R_BASE: f64 = 3.5;
 const DOT_R_SPAN: f64 = 3.0;
+/// Centered label the music visualizer shows while its session is off.
+const VIZ_LABEL: &str = "Viz";
 /// Gap between the pulsing dot and the duration label.
 const TEXT_GAP: f64 = 12.0;
 /// Width reserved on the left for dot plus duration label.
@@ -94,6 +108,9 @@ const PULSE_EPSILON: f32 = 0.25;
 /// Upper bound for the optional visual lag, in milliseconds: a lag past
 /// half a second would read as broken rather than calm.
 const LAG_MAX_MS: u64 = 500;
+/// How long a lifecycle `on`/`off` control reply may take: starting the
+/// capture spawns a recorder, so it is far laxer than a level poll.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Render-side motion feel for the waveform's level envelope: an
 /// asymmetric attack/release smoothing time constant plus an optional
@@ -163,6 +180,16 @@ pub enum Style {
     #[default]
     Line,
     Bars,
+}
+
+/// What a [`WaveformWidget`] visualizes: the microphone on the recording
+/// layer, or the media layer's music visualizer. The music mode drops
+/// the recording dot and duration timer, spans the whole button with the
+/// graph, and shows a centered `Viz` label while its session is off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Mic,
+    Music,
 }
 
 impl Style {
@@ -284,6 +311,20 @@ pub fn layout(width: f64, height: f64) -> Layout {
     }
 }
 
+/// Widget layout for the music visualizer: no timer block is reserved,
+/// so the graph spans the button between its side padding.
+pub fn layout_music(width: f64, height: f64) -> Layout {
+    let bars_width = (width - 2.0 * PAD).max(0.0);
+    Layout {
+        dot: (0.0, 0.0),
+        text_x: 0.0,
+        bars: (PAD, bars_width),
+        mid_y: height / 2.0,
+        bar_max_half: (height / 2.0 - BARS_MARGIN).max(MIN_BAR),
+        slot_w: bars_width / HISTORY as f64,
+    }
+}
+
 /// The mirrored bar one history sample draws: `(x, y, width, height)`.
 /// `slot` is the bar's logical position and may be fractional - the
 /// interpolation shifts every bar leftward by fractions of a slot between
@@ -385,6 +426,8 @@ pub fn format_duration(duration: Duration) -> String {
 /// and the frame clock interpolates motion between samples.
 pub struct WaveformWidget {
     style: Style,
+    /// Whether this widget meters the microphone or visualizes music.
+    mode: Mode,
     /// Live color of the recording dot, from the button's accent.
     live_rgb: (f64, f64, f64),
     history: LevelHistory,
@@ -414,6 +457,7 @@ impl WaveformWidget {
     pub fn new(style: Style) -> Self {
         Self {
             style,
+            mode: Mode::Mic,
             live_rgb: ButtonAccent::Blue.rgb(),
             history: LevelHistory::new(),
             started: None,
@@ -428,6 +472,22 @@ impl WaveformWidget {
             pending: VecDeque::new(),
             last_frame: None,
         }
+    }
+
+    /// A music-visualizer widget for the media layer: the same line
+    /// renderer, history, and frame clock as the microphone meter,
+    /// without the recording chrome and drawing across the full button.
+    pub fn new_music(style: Style) -> Self {
+        Self {
+            mode: Mode::Music,
+            ..Self::new(style)
+        }
+    }
+
+    /// Whether this widget is the media layer's music visualizer rather
+    /// than the recording layer's microphone meter.
+    pub fn is_music(&self) -> bool {
+        self.mode == Mode::Music
     }
 
     /// Take the render-side motion knobs from the button's config.
@@ -543,8 +603,12 @@ impl WaveformWidget {
     }
 
     /// Advance the duration timer to `now`. Returns whether the displayed
-    /// second changed and the widget must repaint.
+    /// second changed and the widget must repaint. The music visualizer
+    /// keeps no timer, so it never ticks.
     pub fn tick(&mut self, now: Instant) -> bool {
+        if self.mode == Mode::Music {
+            return false;
+        }
         let Some(second) = self
             .started
             .map(|start| now.saturating_duration_since(start).as_secs())
@@ -572,14 +636,18 @@ impl WaveformWidget {
 
     /// Milliseconds until the next frame for the shared epoll timeout.
     /// While the widget animates that is the frame cadence; a settled,
-    /// idle widget wakes only for the timer's second boundary; an inactive
-    /// one (`i32::MAX - 1`) never runs fast.
+    /// idle microphone widget wakes only for the timer's second boundary;
+    /// the music visualizer keeps no timer, so an on-but-idle one adds no
+    /// wakes at all; an inactive one (`i32::MAX - 1`) never runs fast.
     pub fn next_timeout(&self, now: Instant) -> i32 {
         let Some(start) = self.started else {
             return i32::MAX - 1;
         };
         if (self.live && !self.history.is_empty()) || self.smoothed > PULSE_EPSILON {
             return FRAME_INTERVAL_MS;
+        }
+        if self.mode == Mode::Music {
+            return i32::MAX - 1;
         }
         let elapsed = now.saturating_duration_since(start).as_millis() as i64;
         (1000 - elapsed % 1000).clamp(1, i32::MAX as i64 - 1) as i32
@@ -619,6 +687,10 @@ impl WaveformWidget {
         y_shift: f64,
         now: Instant,
     ) {
+        if self.mode == Mode::Music {
+            self.render_music(c, height, left, width, y_shift, now);
+            return;
+        }
         let layout = layout(width, height as f64);
         let cy = y_shift + layout.mid_y;
         // The recording dot pulses with live level; idle it stays small and dim.
@@ -652,6 +724,45 @@ impl WaveformWidget {
         // flat dim baseline while idle. The fractional phase keeps positions
         // continuous across sample boundaries: a feature one slot right at
         // phase 0 is exactly where its predecessor ended at phase 1.
+        if self.live {
+            match self.style {
+                Style::Line => self.render_line(c, &layout, left, cy, now),
+                Style::Bars => self.render_bars(c, &layout, left, y_shift, now),
+            }
+        } else {
+            c.set_source_rgb(0.42, 0.42, 0.42);
+            c.rectangle(left + layout.bars.0, cy - 0.5, layout.bars.1, 1.0);
+            c.fill().unwrap();
+        }
+    }
+
+    /// The music visualizer's chrome-free rendering: the same line or bar
+    /// graph across the whole button while a session runs and the feed is
+    /// live, a dim flat baseline while on without a feed, and a centered
+    /// `Viz` label while off - the visualizer is opt-in every time its
+    /// layer is entered, and the label keeps the control discoverable.
+    fn render_music(
+        &self,
+        c: &Context,
+        height: i32,
+        left: f64,
+        width: f64,
+        y_shift: f64,
+        now: Instant,
+    ) {
+        let layout = layout_music(width, height as f64);
+        let cy = y_shift + layout.mid_y;
+        if self.started.is_none() {
+            c.set_source_rgb(1.0, 1.0, 1.0);
+            c.set_font_size(TIMER_FONT);
+            let extents = c.text_extents(VIZ_LABEL).unwrap();
+            c.move_to(
+                left + (width - extents.width()) / 2.0 - extents.x_bearing(),
+                cy - extents.y_bearing() - extents.height() / 2.0,
+            );
+            c.show_text(VIZ_LABEL).unwrap();
+            return;
+        }
         if self.live {
             match self.style {
                 Style::Line => self.render_line(c, &layout, left, cy, now),
@@ -799,7 +910,18 @@ fn fetch_level(address: &SocketAddr, uid: u32) -> Sample {
 }
 
 fn fetch_level_result(address: &SocketAddr, uid: u32) -> io::Result<Sample> {
-    let mut connection = UnixStream::connect_addr(address)?;
+    let mut connection = connect_verified(address, uid)?;
+    connection.write_all(b"get")?;
+    connection.shutdown(Shutdown::Write)?;
+    let mut response = String::new();
+    connection.take(32).read_to_string(&mut response)?;
+    parse_level(&response)
+}
+
+/// Connect to a desktop receiver's abstract socket and verify the
+/// kernel-supplied peer UID - the same boundary every receiver shares.
+fn connect_verified(address: &SocketAddr, uid: u32) -> io::Result<UnixStream> {
+    let connection = UnixStream::connect_addr(address)?;
     connection.set_read_timeout(Some(LEVEL_TIMEOUT))?;
     connection.set_write_timeout(Some(LEVEL_TIMEOUT))?;
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
@@ -820,14 +942,31 @@ fn fetch_level_result(address: &SocketAddr, uid: u32) -> io::Result<Sample> {
     if credentials.uid != uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Unexpected voice level receiver UID",
+            "Unexpected level receiver UID",
         ));
     }
-    connection.write_all(b"get")?;
+    Ok(connection)
+}
+
+/// Ask the visualizer receiver to start (`on`) or stop (`off`) its output
+/// capture. A missing receiver is the normal not-installed case and a
+/// rejected request is the helper's own error; the poller ignores both,
+/// since the level feed reports not-live either way.
+fn fetch_control(address: &SocketAddr, uid: u32, command: &str) -> io::Result<()> {
+    let mut connection = connect_verified(address, uid)?;
+    connection.set_read_timeout(Some(CONTROL_TIMEOUT))?;
+    connection.write_all(command.as_bytes())?;
     connection.shutdown(Shutdown::Write)?;
     let mut response = String::new();
     connection.take(32).read_to_string(&mut response)?;
-    parse_level(&response)
+    if response.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Visualizer receiver rejected request",
+        ))
+    }
 }
 
 fn parse_level(response: &str) -> io::Result<Sample> {
@@ -854,6 +993,57 @@ fn parse_level(response: &str) -> io::Result<Sample> {
             io::ErrorKind::InvalidData,
             "Level receiver rejected request",
         )),
+    }
+}
+
+/// Client for the visualizer receiver's monitor endpoint. Identical in
+/// shape to [`MicLevels`], with the capture lifecycle riding the arm
+/// flag: arming sends `on`, so the desktop helper starts its output-
+/// monitor capture, and disarming - or losing the consumer - sends `off`,
+/// so the stream exists only while the visualizer actually consumes it.
+pub struct MonitorLevels {
+    arm: Arc<Arm>,
+    samples: Receiver<Sample>,
+    pub wake: UnixStream,
+}
+
+impl MonitorLevels {
+    /// Connect to the installed desktop receiver (UID 1000), mirroring
+    /// the volume, brightness, and voice level endpoints.
+    pub fn visualizer() -> Self {
+        let address = SocketAddr::from_abstract_name(b"dfr-viz-1000").unwrap();
+        Self::connect_to(address, 1000)
+    }
+
+    fn connect_to(address: SocketAddr, uid: u32) -> Self {
+        let arm = Arc::new(Arm {
+            armed: Mutex::new(false),
+            signal: Condvar::new(),
+        });
+        let (outgoing, samples) = mpsc::channel();
+        let (wake, mut notify) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        notify.set_nonblocking(true).unwrap();
+        let poller_arm = Arc::clone(&arm);
+        thread::spawn(move || viz_poller(address, uid, &poller_arm, &outgoing, &mut notify));
+        Self { arm, samples, wake }
+    }
+
+    /// Arm or disarm the poller; the value only signals on change so the
+    /// render loop can call this every iteration. Flipping it also hands
+    /// the capture lifecycle to the desktop receiver.
+    pub fn set_armed(&self, armed: bool) {
+        let mut state = self.arm.armed.lock().unwrap();
+        if *state != armed {
+            *state = armed;
+            self.arm.signal.notify_all();
+        }
+    }
+
+    /// Drain pending results and return the freshest sample, if any.
+    pub fn update(&mut self) -> Option<Sample> {
+        while matches!(self.wake.read(&mut [0; 64]), Ok(n) if n > 0) {}
+        self.samples.try_iter().last()
     }
 }
 
@@ -901,6 +1091,67 @@ fn poller(
         }
         let sample = fetch_level(&address, uid);
         if samples.send(sample).is_err() {
+            return;
+        }
+        let _ = notify.write(&[1]);
+    }
+}
+
+/// The visualizer's poller: identical pacing to [`poller`], plus the
+/// capture lifecycle handshake. The first armed transition sends `on` so
+/// the desktop receiver starts its output-monitor capture, level polls
+/// follow at the shared cadence, and disarming - or losing the consumer -
+/// sends `off` so the monitor stream never outlives the visualizer.
+fn viz_poller(
+    address: SocketAddr,
+    uid: u32,
+    arm: &Arm,
+    samples: &Sender<Sample>,
+    notify: &mut UnixStream,
+) {
+    let mut armed = false;
+    let mut deadline: Option<Instant> = None;
+    loop {
+        // Block until the arm state flips or the poll interval elapses.
+        let mut state = arm.armed.lock().unwrap();
+        let mut flipped = false;
+        loop {
+            if *state != armed {
+                armed = *state;
+                deadline = None;
+                flipped = true;
+                break;
+            }
+            match deadline {
+                None if armed => deadline = Some(Instant::now() + POLL_INTERVAL),
+                Some(at) if Instant::now() >= at => {
+                    deadline = None;
+                    break;
+                }
+                _ => {}
+            }
+            state = match deadline {
+                Some(at) => {
+                    arm.signal
+                        .wait_timeout(state, at.saturating_duration_since(Instant::now()))
+                        .unwrap()
+                        .0
+                }
+                None => arm.signal.wait(state).unwrap(),
+            };
+        }
+        drop(state);
+        if flipped {
+            // The capture stream's whole lifecycle rides the arm flag.
+            let _ = fetch_control(&address, uid, if armed { "on" } else { "off" });
+        }
+        if !armed {
+            continue;
+        }
+        let sample = fetch_level(&address, uid);
+        if samples.send(sample).is_err() {
+            // The daemon end is gone: stop the capture before exiting.
+            let _ = fetch_control(&address, uid, "off");
             return;
         }
         let _ = notify.write(&[1]);
@@ -1745,5 +1996,258 @@ mod tests {
             let spent = started.elapsed();
             assert!(spent < budget, "repaint took {spent:?}, budget {budget:?}");
         }
+    }
+
+    #[test]
+    fn the_music_visualizer_keeps_no_timer_and_adds_no_idle_wakes() {
+        let now = Instant::now();
+        let mut viz = WaveformWidget::new_music(Style::Line);
+        assert!(viz.is_music());
+        assert!(!WaveformWidget::new(Style::Line).is_music());
+        // Off: nothing runs, no timeout is requested, no timer ticks.
+        assert!(!viz.tick(now));
+        assert_eq!(viz.next_timeout(now), i32::MAX - 1);
+        assert!(!viz.frame(now));
+        // On with a live feed: the frame clock runs at the shared cadence.
+        assert!(viz.activate(now));
+        assert!(viz.sample(
+            Sample {
+                level: 50,
+                live: true
+            },
+            now
+        ));
+        assert_eq!(viz.next_timeout(now), FRAME_INTERVAL_MS);
+        assert!(viz.frame(now + Duration::from_millis(33)));
+        // On with a lost feed: no timer boundary keeps it waking; the
+        // visualizer rests until the feed returns or it is toggled off.
+        assert!(viz.sample(Sample::default(), now + Duration::from_secs(2)));
+        let mut idle = now + Duration::from_secs(2);
+        while viz.frame(idle) {
+            idle += Duration::from_millis(FRAME_INTERVAL_MS as u64);
+        }
+        assert_eq!(viz.next_timeout(idle), i32::MAX - 1);
+        assert!(!viz.tick(idle + Duration::from_secs(30)));
+        // Off again ends the session; re-enabling starts one over.
+        viz.deactivate();
+        assert_eq!(viz.next_timeout(idle), i32::MAX - 1);
+        assert!(viz.activate(idle));
+        assert!(viz.history().is_empty());
+    }
+
+    #[test]
+    fn the_music_visualizer_shows_its_off_label_and_spans_the_whole_button() {
+        let render = |viz: &WaveformWidget, now: Instant| {
+            let mut surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
+            {
+                let c = Context::new(&surface).unwrap();
+                viz.render_at(&c, 60, 0.0, 570.0, 0.0, now);
+            }
+            let data = surface.data().unwrap().to_vec();
+            data
+        };
+        let lit_columns = |data: &[u8]| {
+            let stride = 570 * 4;
+            let mut columns = 0;
+            for x in 0..570usize {
+                (0..60)
+                    .any(|y| {
+                        let i = y as usize * stride + x * 4;
+                        data[i].max(data[i + 1]).max(data[i + 2]) > 40
+                    })
+                    .then(|| columns += 1);
+            }
+            columns
+        };
+        let now = Instant::now();
+
+        // Off: a centered Viz label - ink clustered mid-button, nowhere
+        // near the edges, and visibly fewer lit columns than any live line.
+        let off = WaveformWidget::new_music(Style::Line);
+        let off_frame = render(&off, now);
+        assert!(off_frame.iter().any(|b| *b != 0), "off label drew nothing");
+        let lit = lit_columns(&off_frame);
+        assert!(lit < 120, "the off label must be a small centered label");
+
+        // On with live music: the line spans the whole button, including
+        // the left third where the microphone widget reserves its timer.
+        let mut viz = WaveformWidget::new_music(Style::Line);
+        viz.activate(now);
+        for (step, level) in [12, 38, 8, 61, 84, 30, 55, 72, 21, 47, 66, 15]
+            .into_iter()
+            .enumerate()
+        {
+            viz.sample(
+                Sample { level, live: true },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        let last = now + Duration::from_millis(50 * 11);
+        let live_frame = render(&viz, last + Duration::from_millis(40));
+        let stride = 570 * 4;
+        for x in (16..80usize).step_by(8) {
+            assert!(
+                (0..60usize).any(|y| {
+                    let i = y * stride + x * 4;
+                    live_frame[i].max(live_frame[i + 1]).max(live_frame[i + 2]) > 40
+                }),
+                "no ink in the timer block's columns at x={x}"
+            );
+        }
+        assert!(
+            lit_columns(&live_frame) > lit,
+            "the live line is narrower than its label"
+        );
+
+        // On without a feed: a calm dim baseline across the button.
+        let mut stalled = WaveformWidget::new_music(Style::Line);
+        stalled.activate(now);
+        stalled.sample(Sample::default(), now);
+        let stalled_frame = render(&stalled, now + Duration::from_millis(25));
+        assert_ne!(stalled_frame, off_frame);
+        assert_ne!(stalled_frame, live_frame);
+
+        // The bars style rides the same music layout: visibly different
+        // frame, gaps between bars stay empty.
+        let mut bars = WaveformWidget::new_music(Style::Bars);
+        bars.activate(now);
+        for (step, level) in [12, 38, 8, 61, 84, 30, 55, 72, 21, 47, 66, 15]
+            .into_iter()
+            .enumerate()
+        {
+            bars.sample(
+                Sample { level, live: true },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        let bars_frame = render(&bars, last + Duration::from_millis(40));
+        assert_ne!(bars_frame, live_frame);
+    }
+
+    #[test]
+    fn the_visualizer_poller_handshakes_the_capture_lifecycle() {
+        let address = address();
+        let server_address = address.clone();
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&commands);
+        let (ready, bound) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let listener = UnixListener::bind_addr(&server_address).unwrap();
+            ready.send(()).unwrap();
+            loop {
+                let Ok((mut connection, _)) = listener.accept() else {
+                    return;
+                };
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = String::new();
+                (&mut connection)
+                    .take(32)
+                    .read_to_string(&mut request)
+                    .unwrap();
+                let reply = match request.as_str() {
+                    "on" | "off" => "ok",
+                    "get" => "ok 42",
+                    _ => "error",
+                };
+                observed.lock().unwrap().push(request);
+                connection.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let uid = unsafe { libc::geteuid() };
+        let mut client = MonitorLevels::connect_to(address, uid);
+        bound.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Disarmed, the poller neither starts nor polls anything.
+        thread::sleep(POLL_INTERVAL * 6);
+        assert!(commands.lock().unwrap().is_empty());
+        assert_eq!(client.update(), None);
+        // Arming first starts the capture, then streams levels.
+        client.set_armed(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.update()
+            != Some(Sample {
+                level: 42,
+                live: true,
+            })
+        {
+            assert!(Instant::now() < deadline, "armed poller never sampled");
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let commands = commands.lock().unwrap();
+            assert_eq!(commands.first().map(String::as_str), Some("on"));
+            assert!(commands.iter().filter(|c| c.as_str() == "get").count() >= 1);
+            assert!(!commands.contains(&"off".to_string()));
+        }
+        // Disarming stops the capture promptly; no further poll runs.
+        client.set_armed(false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !commands.lock().unwrap().contains(&"off".to_string()) {
+            assert!(
+                Instant::now() < deadline,
+                "disarm never stopped the capture"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let settled = commands.lock().unwrap().len();
+        thread::sleep(POLL_INTERVAL * 4);
+        assert_eq!(commands.lock().unwrap().len(), settled);
+        drop(client);
+        drop(server);
+    }
+
+    #[test]
+    fn a_lost_consumer_stops_the_capture_before_the_poller_exits() {
+        let address = address();
+        let server_address = address.clone();
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&commands);
+        let (ready, bound) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let listener = UnixListener::bind_addr(&server_address).unwrap();
+            ready.send(()).unwrap();
+            for _ in 0..8 {
+                let Ok((mut connection, _)) = listener.accept() else {
+                    return;
+                };
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = String::new();
+                (&mut connection)
+                    .take(32)
+                    .read_to_string(&mut request)
+                    .unwrap();
+                observed.lock().unwrap().push(request.clone());
+                let reply = match request.as_str() {
+                    "on" | "off" => "ok",
+                    _ => "ok 7",
+                };
+                connection.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let uid = unsafe { libc::geteuid() };
+        let mut client = MonitorLevels::connect_to(address, uid);
+        bound.recv_timeout(Duration::from_secs(3)).unwrap();
+        client.set_armed(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.update().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Dropping the daemon end (a crash, or shutdown) must leave the
+        // capture stopped, not streaming to a vanished consumer: after the
+        // in-flight poll fails to deliver, the poller sends `off` and exits.
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while commands.lock().unwrap().last().map(String::as_str) != Some("off") {
+            assert!(
+                Instant::now() < deadline,
+                "poller never stopped the capture"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(server);
     }
 }

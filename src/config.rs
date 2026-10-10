@@ -163,6 +163,10 @@ pub struct ButtonConfig {
     pub waveform_style: Option<String>,
     pub waveform_smoothing: Option<u32>,
     pub waveform_lag: Option<u32>,
+    pub visualizer: Option<bool>,
+    pub visualizer_style: Option<String>,
+    pub visualizer_smoothing: Option<u32>,
+    pub visualizer_lag: Option<u32>,
     pub locale: Option<String>,
     #[serde(default)]
     pub action: ButtonAction,
@@ -725,6 +729,51 @@ Keys = [{ Text = "F1", Action = "F1" }]
     }
 
     #[test]
+    fn visualizer_buttons_carry_their_own_knobs_and_stay_inert_without_one() {
+        for (value, style) in [
+            ("line", crate::waveform::Style::Line),
+            ("bars", crate::waveform::Style::Bars),
+        ] {
+            let candidate = NAMED.replace(
+                "Text = \"F1\"",
+                &format!(
+                    "Visualizer = true, VisualizerStyle = \"{value}\", \
+                     VisualizerSmoothing = 240, VisualizerLag = 80"
+                ),
+            );
+            let (_, styled) = parse_config(BASE, Some(&candidate), 2008).unwrap();
+            let key = styled.layers[1].keys.last().unwrap();
+            assert_eq!(key.visualizer, Some(true));
+            assert_eq!(key.visualizer_style.as_deref(), Some(value));
+            assert_eq!(key.visualizer_smoothing, Some(240));
+            assert_eq!(key.visualizer_lag, Some(80));
+            assert_eq!(crate::waveform::Style::parse(value), Some(style));
+        }
+        // The knobs without a Visualizer button stay inert, and an
+        // unknown style maps to no style, which the button builder
+        // reports as a configuration error.
+        let inert = NAMED.replace("Text = \"F1\"", "Text = \"F1\", VisualizerStyle = \"line\"");
+        let (_, styled) = parse_config(BASE, Some(&inert), 2008).unwrap();
+        assert_eq!(styled.layers[1].keys.last().unwrap().visualizer, None);
+        assert!(crate::waveform::Style::parse("dots").is_none());
+        // A waveform button and a visualizer button coexist on one bar as
+        // distinct widgets: the first meters the mic, the second music. The
+        // synthesized Home button leads the sub-bar as usual.
+        let both = NAMED.replace("Text = \"F1\"", "Waveform = true, Text = \"F1\"")
+            + "\n[[Layers]]\nName = \"media\"\nKeys = [{ Visualizer = true, Stretch = 2 }]\n";
+        let (_, styled) = parse_config(BASE, Some(&both), 2008).unwrap();
+        let media = styled
+            .layers
+            .iter()
+            .find(|layer| layer.name == "media")
+            .unwrap();
+        assert_eq!(media.keys.len(), 2);
+        assert_eq!(media.keys[0].text.as_deref(), Some("Home"));
+        assert_eq!(media.keys[1].visualizer, Some(true));
+        assert_eq!(media.keys[1].waveform, None);
+    }
+
+    #[test]
     fn approved_multibar_preserves_voice_dispatch_and_renders_offline() {
         use chrono::Timelike;
         let tmp = TempDir::new();
@@ -837,6 +886,34 @@ Keys = [{ Text = "F1", Action = "F1" }]
         }
         deck.switch_to(deck.names["media"], &mut |_, _| {});
         render(&mut deck, "implemented-media.png");
+        // The media bar's visualizer button: off by default with only its
+        // centered Viz label, then enabled with live monitor levels, then
+        // toggled off again - each exported for review.
+        let viz_index = deck.current().visualizer.unwrap();
+        let spans = deck.current().layout_spans(2008, 0);
+        let viz_x = (spans[viz_index].left + spans[viz_index].right) / 2.0;
+        assert!(!deck.viz_active());
+        let mut viz_emit = |_: &[Key], _: bool| panic!("visualizer emitted keys");
+        deck.touch_down_at(0, viz_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
+        assert!(deck.viz_active());
+        let mut viz_now = Instant::now();
+        for level in [
+            12, 38, 8, 61, 84, 30, 55, 72, 21, 47, 66, 15, 52, 33, 70, 44,
+        ] {
+            viz_now += Duration::from_millis(50);
+            deck.visualizer_tick(Some(crate::MicSample { level, live: true }), viz_now);
+        }
+        render(&mut deck, "implemented-media-viz.png");
+        deck.touch_down_at(1, viz_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
+        assert!(!deck.viz_active());
+        deck.visualizer_tick(
+            Some(crate::MicSample {
+                level: 90,
+                live: true,
+            }),
+            viz_now,
+        );
+        render(&mut deck, "implemented-media-off.png");
         deck.switch_to(deck.home, &mut |_, _| {});
         let spans = deck.current().layout_spans(2008, 0);
         let x = (spans[0].left + spans[0].right) / 2.0;
@@ -1157,6 +1234,25 @@ DoublePressSwitchLayers = 200
             })
             .collect();
         assert_eq!(positions, vec![3, 4, 5]);
+        // The media bar keeps its existing controls and gains exactly one
+        // new button at the end: the opt-in music visualizer, off by
+        // default every time.
+        let media = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "media")
+            .unwrap();
+        assert_eq!(media.keys.len(), 6);
+        assert_eq!(media.keys[1].icon.as_deref(), Some("fast_rewind"));
+        assert_eq!(media.keys[2].icon.as_deref(), Some("play_pause"));
+        assert_eq!(media.keys[3].icon.as_deref(), Some("fast_forward"));
+        assert_eq!(media.keys[4].action, ButtonAction::VolumeSlider);
+        assert_eq!(media.keys[4].stretch, Some(3));
+        let viz = media.keys.last().unwrap();
+        assert_eq!(viz.visualizer, Some(true));
+        assert_eq!(viz.waveform, None);
+        assert_eq!(viz.stretch, Some(2));
+        assert_eq!(viz.action, ButtonAction::Keys(vec![]));
         let pet_button = &home.keys[positions[2]];
         assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout

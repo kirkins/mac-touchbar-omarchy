@@ -30,7 +30,9 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
 
 Inspect `implemented-home.png`, `implemented-volume-mid.png`,
 `implemented-brightness.png`, `implemented-recording-live.png`, and
-`implemented-recording-idle.png` in that directory, plus the per-band frames
+`implemented-recording-idle.png` in that directory, plus the media bar's
+visualizer frames `implemented-media-viz.png` and `implemented-media-off.png`,
+and the per-band frames
 `implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
 `implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
 the same home bar over each time-of-day background.
@@ -66,7 +68,12 @@ battery/clock refresh, the shared slider's on-glass drag feel, command buttons'
 interaction with a real helper, the pet's on-glass charm, and the background's
 one-shot repaint at a real band change still need a device
 test; battery checks there must include repeated tap-to-cycle, device labels in
-each display mode, hotplug, and timed return.
+each display mode, hotplug, and timed return. The media visualizer's offline
+tests cover the toggle lifecycle (off by default, arming starts the capture
+feed, toggle-off/layer-exit/reload stop it, a lost consumer still sends `off`),
+the music widget's rendering and idle wakes, config parsing, and the helper's
+capture, protocol, and idle-watchdog behavior against fakes; its on-glass look
+with real playback is a device check.
 
 ## Named bars
 
@@ -275,6 +282,44 @@ two samples the whole line glides fractionally left and its newest end eases
 to the measured level, so the wave flows instead of stepping one slot per
 sample. Every other layer keeps its existing redraws, and a settled, silent
 feed repaints nothing but the once-a-second timer tick.
+
+### Media visualizer
+
+The media bar ends with an opt-in music visualizer: a button that shows only a
+centered `Viz` label until tapped. A tap turns it into the same drawn line the
+recording layer uses - flat at rest, rippling into a smooth wave with the music
+actually playing on the default output - and a second tap turns it back off.
+It is off by default every time: leaving the media bar or reloading the
+configuration also turns it off, and nothing runs while it is off - no sockets,
+no capture. The monitor stream exists only while it is on, at the same 20 Hz
+poll cadence as the recording waveform's feed.
+
+```toml
+{ Visualizer = true, Stretch = 2 }  # on the media bar
+```
+
+The feed is the optional [desktop-session receiver](integrations/viz/README.md):
+`dfr-viz` captures the default sink's *output monitor* - the sound heading to
+the speakers, not the microphone - and serves one-shot level requests over the
+same abstract AF_UNIX and kernel peer-UID boundary as the volume, brightness,
+and voice receivers. Without it, an enabled visualizer rests on a calm dim
+baseline, exactly like the recording waveform without its helper. Measured on
+the target machine, the enabled capture costs about 0.5% of one CPU core,
+keeps the sinks suspended, and writes nothing to disk; a five-second watchdog
+in the helper also stops the capture if the daemon ever vanishes without
+turning it off. Changing the default output while enabled requires toggling
+the visualizer off and on to follow the new sink.
+
+The line reuses the recording waveform's motion knobs, per button:
+`VisualizerStyle = "bars"` keeps the scrolling bar graph instead of the line,
+and `VisualizerSmoothing` (ms decay; attack a third of it) with
+`VisualizerLag` (ms of visual delay, capped at 500) calm the motion, e.g.
+`{ Visualizer = true, Stretch = 2, VisualizerSmoothing = 240, VisualizerLag = 80 }`.
+v1 deliberately ships a level-driven wave rather than a full spectrum: the
+level feed reuses the landed waveform line renderer and frame clock unchanged,
+needs no FFT dependency in the narrow desktop helper, and keeps the wire
+protocol a single `ok <level>` - a spectrum would have needed a new renderer,
+a larger protocol, and a math dependency for marginal gain at Touch Bar size.
 
 ## Time-of-day background
 

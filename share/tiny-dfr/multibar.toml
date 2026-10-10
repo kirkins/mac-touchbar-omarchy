@@ -44,7 +44,21 @@ Keys = [
     { Icon = "play_pause", Action = "PlayPause" },
     { Icon = "fast_forward", Action = "NextSong" },
     { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
+    { Visualizer = true, Stretch = 2 },
 ]
+
+# Music visualizer: the media bar's last button is off by default - it
+# shows only a centered Viz label until tapped. A tap turns it on and the
+# button becomes the same drawn line the recording layer uses, rippling
+# with the music actually playing on the default output; a second tap,
+# leaving the media bar, or reloading the configuration turns it off and
+# stops the capture. The feed is the optional desktop-session helper in
+# integrations/viz (see README); without it an enabled visualizer rests on
+# a calm dim baseline. The line reuses the recording waveform's motion
+# knobs: VisualizerStyle = "bars" keeps the bar graph, VisualizerSmoothing
+# (ms decay, attack a third of it) and VisualizerLag (ms of visual delay,
+# capped at 500) calm the motion, e.g.
+# { Visualizer = true, Stretch = 2, VisualizerSmoothing = 240, VisualizerLag = 80 }.
 
 # Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
 # opens this recording layer in one press; the layer itself is the visual

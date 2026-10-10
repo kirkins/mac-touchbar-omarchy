@@ -71,7 +71,7 @@ use level_control::{LevelControl, State as LevelState};
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use slider::{Geometry, Kind, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
-use waveform::{MicLevels, Sample as MicSample, Style, WaveformWidget};
+use waveform::{MicLevels, MonitorLevels, Sample as MicSample, Style, WaveformWidget};
 
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
@@ -502,6 +502,13 @@ impl Button {
                 cfg.waveform_smoothing,
                 cfg.waveform_lag,
             )
+        } else if cfg.visualizer.unwrap_or(false) {
+            Button::new_visualizer(
+                cfg.action,
+                cfg.visualizer_style.as_deref(),
+                cfg.visualizer_smoothing,
+                cfg.visualizer_lag,
+            )
         } else {
             Button::new_spacer()
         };
@@ -632,6 +639,29 @@ impl Button {
                 WaveformWidget::new(style)
                     .with_accent(accent)
                     .with_motion(smoothing, lag),
+            ),
+            icon_width: 0.0,
+            icon_height: 0.0,
+            accent: None,
+        }
+    }
+
+    fn new_visualizer(
+        action: ButtonAction,
+        style: Option<&str>,
+        smoothing: Option<u32>,
+        lag: Option<u32>,
+    ) -> Button {
+        let style = style.map_or(Style::Line, |value| {
+            Style::parse(value)
+                .unwrap_or_else(|| panic!("invalid visualizer style, accepted styles: line, bars"))
+        });
+        Button {
+            action,
+            active: false,
+            changed: false,
+            image: ButtonImage::Waveform(
+                WaveformWidget::new_music(style).with_motion(smoothing, lag),
             ),
             icon_width: 0.0,
             icon_height: 0.0,
@@ -904,6 +934,9 @@ pub struct FunctionLayer {
     // The button index of the live microphone waveform widget, if this
     // layer carries one; it owns the fast repaint cadence while displayed.
     waveform: Option<usize>,
+    // The button index of the media layer's opt-in music visualizer, if
+    // this layer carries one; it runs only while its button turned it on.
+    visualizer: Option<usize>,
     // The shared region the last draw covered with the slider, so a
     // later draw without it can erase and repaint the whole region.
     slider_region_drawn: Option<(usize, usize)>,
@@ -933,13 +966,17 @@ impl FunctionLayer {
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
         let waveform = buttons
             .iter()
-            .position(|(_, b)| matches!(b.image, ButtonImage::Waveform(_)));
+            .position(|(_, b)| matches!(&b.image, ButtonImage::Waveform(wave) if !wave.is_music()));
+        let visualizer = buttons
+            .iter()
+            .position(|(_, b)| matches!(&b.image, ButtonImage::Waveform(wave) if wave.is_music()));
         FunctionLayer {
             displays_time,
             buttons,
             virtual_button_count,
             faster_refresh,
             waveform,
+            visualizer,
             slider_region_drawn: None,
         }
     }
@@ -1259,6 +1296,10 @@ pub struct LayerDeck {
     fn_return: Option<usize>,
     touches: HashMap<u32, TouchState>,
     slider: Overlay,
+    // Whether the media layer's visualizer button turned the visualizer
+    // on. Off by default, and reset by toggle-off, leaving the layer, or
+    // a reload - never sticky.
+    visualizer_on: bool,
 }
 
 impl LayerDeck {
@@ -1286,6 +1327,7 @@ impl LayerDeck {
             fn_return: None,
             touches: HashMap::new(),
             slider: Overlay::default(),
+            visualizer_on: false,
         }
     }
 
@@ -1309,6 +1351,58 @@ impl LayerDeck {
         self.current().waveform.is_some()
     }
 
+    /// Whether the media layer's visualizer is both displayed and turned
+    /// on; only that arms its monitor-level poller, so the desktop capture
+    /// stream exists exactly while the visualizer is there to show it.
+    fn viz_active(&self) -> bool {
+        self.visualizer_on && self.current().visualizer.is_some()
+    }
+
+    /// End the visualizer session wherever it lives: the toggle state
+    /// resets to off whenever the media layer stops being displayed, so a
+    /// later return always starts with the visualizer off. The capture
+    /// stream itself stops when the disarmed poller sends its `off`.
+    fn disable_visualizer(&mut self) {
+        if !self.visualizer_on {
+            return;
+        }
+        self.visualizer_on = false;
+        for layer in &mut self.layers {
+            if let Some(i) = layer.visualizer {
+                if let ButtonImage::Waveform(wave) = &mut layer.buttons[i].1.image {
+                    wave.deactivate();
+                }
+            }
+        }
+    }
+
+    /// Toggle the visualizer on a touch-down of its button: the first
+    /// press starts the session (and with it, once the poller arms, the
+    /// desktop capture); a second press ends it. Returns whether the tap
+    /// was consumed, which is always the case for this button.
+    fn toggle_visualizer(&mut self, now: Instant) -> bool {
+        let Some(index) = self.current().visualizer else {
+            return false;
+        };
+        if !matches!(&self.current().buttons[index].1.image,
+            ButtonImage::Waveform(wave) if wave.is_music())
+        {
+            return false;
+        }
+        self.visualizer_on = !self.visualizer_on;
+        let enabled = self.visualizer_on;
+        let button = &mut self.current_mut().buttons[index].1;
+        if let ButtonImage::Waveform(wave) = &mut button.image {
+            if enabled {
+                wave.activate(now);
+            } else {
+                wave.deactivate();
+            }
+        }
+        button.changed = true;
+        true
+    }
+
     /// Feed one microphone level sample, when the poller produced one, and
     /// the shared clock into the displayed layer's waveform widget. The
     /// widget's frame clock interpolates motion between samples (roughly
@@ -1328,6 +1422,41 @@ impl LayerDeck {
                 }
             }
             return (false, i32::MAX - 1);
+        };
+        let button = &mut self.layers[self.active].buttons[index].1;
+        let ButtonImage::Waveform(wave) = &mut button.image else {
+            return (false, i32::MAX - 1);
+        };
+        let mut changed = wave.activate(now);
+        if let Some(sample) = sample {
+            changed |= wave.sample(sample, now);
+        }
+        changed |= wave.frame(now);
+        let timeout = wave.next_timeout(now);
+        if changed {
+            button.changed = true;
+        }
+        (changed, timeout)
+    }
+
+    /// Feed one music monitor level sample, when the poller produced one,
+    /// into the displayed layer's visualizer widget. Mirrors
+    /// [`Self::waveform_tick`] but gated on the toggle as well as the
+    /// layer: while off - or on any other layer - the widget holds its
+    /// idle label, any session ends, and no fast cadence runs.
+    fn visualizer_tick(&mut self, sample: Option<MicSample>, now: Instant) -> (bool, i32) {
+        let index = match (self.current().visualizer, self.visualizer_on) {
+            (Some(index), true) => index,
+            _ => {
+                for layer in &mut self.layers {
+                    if let Some(i) = layer.visualizer {
+                        if let ButtonImage::Waveform(wave) = &mut layer.buttons[i].1.image {
+                            wave.deactivate();
+                        }
+                    }
+                }
+                return (false, i32::MAX - 1);
+            }
         };
         let button = &mut self.layers[self.active].buttons[index].1;
         let ButtonImage::Waveform(wave) = &mut button.image else {
@@ -1392,6 +1521,9 @@ impl LayerDeck {
             return false;
         }
         self.release_all(emit_keys);
+        // Leaving the media layer turns the visualizer off; it is opt-in
+        // per visit and its capture must not outlive the layer switch.
+        self.disable_visualizer();
         self.active = target;
         true
     }
@@ -1454,6 +1586,11 @@ impl LayerDeck {
         self.touch_up(slot, emit_keys);
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
             return false;
+        }
+        // The visualizer button consumes its own tap: the toggle is the
+        // whole action, and no layer switch or key ever fires from it.
+        if self.current().visualizer == Some(button) {
+            return self.toggle_visualizer(Instant::now());
         }
         let selected = Kind::for_action(&self.current().buttons[button].1.action);
         if let Some(kind) = selected {
@@ -1860,6 +1997,9 @@ fn real_main(drm: &mut DrmBackend) {
     let mut brightness_control = LevelControl::brightness();
     // Live microphone levels for the recording layer's waveform widget.
     let mut mic_levels = MicLevels::levels();
+    // Live output-monitor levels for the media layer's visualizer, which
+    // exist only while the visualizer is on and its layer is displayed.
+    let mut viz_levels = MonitorLevels::visualizer();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -1908,6 +2048,9 @@ fn real_main(drm: &mut DrmBackend) {
         .unwrap();
     epoll
         .add(&mic_levels.wake, EpollEvent::new(EpollFlags::EPOLLIN, 7))
+        .unwrap();
+    epoll
+        .add(&viz_levels.wake, EpollEvent::new(EpollFlags::EPOLLIN, 8))
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
@@ -2001,6 +2144,15 @@ fn real_main(drm: &mut DrmBackend) {
         mic_levels.set_armed(layers.waveform_active());
         let (_, waveform_timeout_ms) = layers.waveform_tick(mic_sample, Instant::now());
         next_timeout_ms = min(next_timeout_ms, waveform_timeout_ms);
+
+        // The media layer's visualizer polls the desktop output monitor
+        // only while its button turned it on and its layer is displayed;
+        // arming the poller starts the helper's capture and disarming it -
+        // toggle-off, leaving the layer, a reload - stops the stream.
+        let viz_sample = viz_levels.update();
+        viz_levels.set_armed(layers.viz_active());
+        let (_, visualizer_timeout_ms) = layers.visualizer_tick(viz_sample, Instant::now());
+        next_timeout_ms = min(next_timeout_ms, visualizer_timeout_ms);
 
         // The shared slider collapses on its own after a moment.
         layers.slider_refresh(Instant::now());
@@ -2921,6 +3073,136 @@ mod tests {
         };
         assert!(wave.history().is_empty());
         assert_eq!(wave.elapsed(later), Duration::ZERO);
+    }
+
+    /// A deck shaped like the multibar example's media flow: the media bar
+    /// with its play control and the opt-in visualizer button at the end.
+    fn media_deck() -> LayerDeck {
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        nav("Media", "media"),
+                    ]),
+                ),
+                (
+                    "media".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        keys("Play", &[Key::PlayPause]),
+                        ButtonConfig {
+                            visualizer: Some(true),
+                            stretch: Some(2),
+                            ..ButtonConfig::default()
+                        },
+                    ]),
+                ),
+            ],
+            0,
+            Some(1),
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn the_visualizer_is_off_by_default_and_shuts_down_cleanly() {
+        let mut deck = media_deck();
+        let now = Instant::now();
+        let mut emit = |_: &[Key], _: bool| panic!("visualizer button emitted keys");
+
+        // On the home bar nothing runs.
+        assert!(!deck.viz_active());
+        let (changed, timeout) = deck.visualizer_tick(None, now);
+        assert!(!changed);
+        assert_eq!(timeout, i32::MAX - 1);
+
+        // Enter the media bar: the visualizer button is present but off -
+        // it never shows by default.
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+        assert_eq!(deck.active, deck.names["media"]);
+        assert_eq!(deck.current().visualizer, Some(2));
+        assert!(!deck.viz_active());
+        let (changed, timeout) = deck.visualizer_tick(None, now);
+        assert!(!changed);
+        assert_eq!(timeout, i32::MAX - 1);
+
+        // The tap consumes itself: no keys, no commands, no held touch.
+        assert!(deck.touch_down(1, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touches.is_empty());
+        assert!(deck.viz_active());
+        assert!(deck.current().buttons[2].1.changed);
+        deck.current_mut().buttons[2].1.changed = false;
+
+        // Live monitor samples stream into the graph at the frame cadence.
+        for level in [12, 47, 78, 33] {
+            let (changed, timeout) =
+                deck.visualizer_tick(Some(MicSample { level, live: true }), now);
+            assert!(changed);
+            assert_eq!(timeout, waveform::FRAME_INTERVAL_MS);
+        }
+        let ButtonImage::Waveform(viz) = &deck.current().buttons[2].1.image else {
+            panic!()
+        };
+        assert_eq!(
+            viz.history().oldest_first().collect::<Vec<_>>(),
+            vec![12, 47, 78, 33]
+        );
+
+        // A second tap ends the session: no cadence, no repaint, and any
+        // late in-flight sample lands on the idle label.
+        assert!(deck.touch_down(2, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(!deck.viz_active());
+        deck.current_mut().buttons[2].1.changed = false;
+        let later = now + Duration::from_secs(4);
+        let (changed, timeout) = deck.visualizer_tick(
+            Some(MicSample {
+                level: 90,
+                live: true,
+            }),
+            later,
+        );
+        assert!(!changed);
+        assert_eq!(timeout, i32::MAX - 1);
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
+
+        // Leaving the media layer turns an enabled visualizer off; the
+        // toggle never survives the layer switch, and coming back starts
+        // from off again.
+        assert!(deck.touch_down(3, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.viz_active());
+        assert!(deck.touch_down(4, 0, 100.0, 30.0, &mut emit, &mut |_| {}));
+        assert_eq!(deck.active, deck.home);
+        assert!(!deck.viz_active());
+        let (changed, _) = deck.visualizer_tick(
+            Some(MicSample {
+                level: 90,
+                live: true,
+            }),
+            later,
+        );
+        assert!(!changed);
+        assert!(deck.touch_down(5, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+        assert_eq!(deck.active, deck.names["media"]);
+        assert!(!deck.viz_active());
+        let ButtonImage::Waveform(viz) = &deck.current().buttons[2].1.image else {
+            panic!()
+        };
+        assert!(viz.history().is_empty());
+
+        // A reload replaces the deck wholesale: the fresh one is off.
+        assert!(deck.touch_down(6, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.viz_active());
+        deck.replace(media_deck(), &mut |_, _| {});
+        assert!(!deck.viz_active());
+        let (changed, timeout) = deck.visualizer_tick(None, later);
+        assert!(!changed);
+        assert_eq!(timeout, i32::MAX - 1);
     }
 
     #[test]

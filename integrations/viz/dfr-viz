@@ -1,0 +1,246 @@
+#!/usr/bin/python3
+"""Desktop-session output-monitor receiver for the Touch Bar visualizer."""
+
+import array
+import os
+from pathlib import Path
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+ACTIONS = frozenset(("on", "off", "get"))
+LEVEL_GAIN = 96           # peak scaling, tuned for mastered music
+IDLE_TIMEOUT = 5.0        # seconds without a request before capture stops
+STALL_TIMEOUT = 2.0       # seconds without fresh samples before level reads 0
+CHUNK = 4096
+
+
+class MonitorError(Exception):
+    pass
+
+
+def idle_timeout():
+    try:
+        return max(1.0, float(os.environ.get("DFR_VIZ_IDLE_TIMEOUT", IDLE_TIMEOUT)))
+    except ValueError:
+        return IDLE_TIMEOUT
+
+
+def resolve_sink():
+    """The sink whose output should be visualized; never a monitor itself."""
+    name = os.environ.get("DFR_VIZ_SINK", "").strip()
+    if name:
+        return name
+    for command in (["omarchy-audio-output-sink"], ["pactl", "get-default-sink"]):
+        try:
+            result = subprocess.check_output(
+                command, text=True, timeout=3,
+                env={**os.environ, "LC_ALL": "C"}).strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result and not result.endswith(".monitor"):
+            return result
+    raise MonitorError("Cannot resolve the output sink")
+
+
+class MonitorFeed:
+    """Captures the default sink's monitor only while a consumer polls it.
+
+    pw-cat records the sink's monitor into a pipe this feed drains, folding
+    each chunk into a 0-100 peak for the Touch Bar's visualizer. Nothing
+    runs while disabled: `start` spawns the capture, `stop` - or the idle
+    watchdog covering a vanished daemon - ends it, and the pipe is drained
+    and closed either way so no stream or bytes outlive the visualizer.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.process = None
+        self.level = 0
+        self.grown = None      # monotonic time of the newest sample
+        self.last_poll = None  # monotonic time of the newest request
+
+    def running(self):
+        with self.lock:
+            return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return
+            self.process = None
+            self.level = 0
+            self.grown = None
+            self.last_poll = time.monotonic()
+        sink = resolve_sink()
+        try:
+            # stdbuf -o0 keeps the pipe fresh: pw-cat otherwise buffers its
+            # raw output in stdio chunks the live level feed cannot see yet.
+            process = subprocess.Popen(
+                ["stdbuf", "-o0", "pw-cat", "--record", "--rate", "16000",
+                 "--channels", "1", "--format", "s16", "--raw",
+                 "--target", sink + ".monitor", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as error:
+            raise MonitorError("Cannot start the monitor capture") from error
+        threading.Thread(target=self.drain, args=(process,), daemon=True).start()
+        with self.lock:
+            self.process = process
+        # Fail fast when the capture cannot run at all: either it exits, or
+        # samples arrive (silence included - the monitor always streams).
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                self.stop()
+                raise MonitorError("Monitor capture exited without data")
+            with self.lock:
+                arrived = self.grown is not None and self.process is process
+            if arrived:
+                return
+            time.sleep(0.02)
+        # Still alive but quiet: keep it; a stalled feed reads as silence.
+        return
+
+    def drain(self, process):
+        """Fold captured chunks into the latest peak until the pipe ends."""
+        while True:
+            try:
+                data = process.stdout.read(CHUNK)
+            except (OSError, ValueError):
+                break
+            if not data:
+                break
+            even = len(data) & ~1
+            if even:
+                samples = array.array("h")
+                samples.frombytes(data[:even])
+                peak = max(abs(min(samples)), abs(max(samples)))
+                with self.lock:
+                    if self.process is process:
+                        self.level = min(100, peak * LEVEL_GAIN // 32768)
+                        self.grown = time.monotonic()
+        # Whatever ended the capture, the feed must not keep reporting a
+        # stale level as if the monitor were still running.
+        with self.lock:
+            if self.process is process:
+                self.process = None
+                self.grown = None
+
+    def stop(self):
+        with self.lock:
+            process, self.process = self.process, None
+            self.grown = None
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+
+    def level_now(self):
+        """Latest monitor level, or None when no capture is running."""
+        with self.lock:
+            process, self.last_poll = self.process, time.monotonic()
+            level, grown = self.level, self.grown
+        if process is None:
+            return None
+        if grown is None or time.monotonic() - grown > STALL_TIMEOUT:
+            return 0
+        return level
+
+    def note_request(self):
+        with self.lock:
+            self.last_poll = time.monotonic()
+
+    def watchdog(self):
+        """Stop the capture when nothing consumes it, even if the daemon
+        vanished without sending `off`: no monitor stream outlives its
+        consumer by more than the idle timeout."""
+        pause = min(1.0, idle_timeout() / 2)
+        while True:
+            time.sleep(pause)
+            with self.lock:
+                process = self.process
+                last = self.last_poll
+            if (process is not None and last is not None
+                    and time.monotonic() - last > idle_timeout()):
+                print("Visualizer consumer idle; stopping monitor capture",
+                      file=sys.stderr, flush=True)
+                self.stop()
+
+
+def handle(connection, feed, allowed_uids):
+    with connection:
+        connection.settimeout(3)
+        try:
+            _, uid, _ = struct.unpack(
+                "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid not in allowed_uids:
+                raise MonitorError("Caller UID is not permitted")
+            request = bytearray()
+            while len(request) < 32:
+                chunk = connection.recv(33 - len(request))
+                if not chunk:
+                    break
+                request.extend(chunk)
+            action = request.decode("ascii", "replace").strip()
+            if action not in ACTIONS:
+                raise MonitorError("Invalid visualizer request")
+            feed.note_request()
+            if action == "on":
+                feed.start()
+                reply = "ok"
+            elif action == "off":
+                feed.stop()
+                reply = "ok"
+            else:
+                level = feed.level_now()
+                reply = "idle" if level is None else f"ok {level}"
+        except (MonitorError, OSError, ValueError) as error:
+            print(str(error), file=sys.stderr, flush=True)
+            reply = "error"
+        try:
+            connection.sendall(reply.encode("ascii"))
+        except OSError:
+            pass
+
+
+def serve(feed, address=None, allowed_uids=None):
+    address = address or "\0dfr-viz-" + str(os.getuid())
+    allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(address)
+        listener.listen(8)
+        print("Visualizer receiver ready", flush=True)
+        while True:
+            connection, _ = listener.accept()
+            threading.Thread(target=handle, args=(connection, feed, allowed_uids),
+                             daemon=True).start()
+
+
+def main():
+    feed = MonitorFeed()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        threading.Thread(target=feed.watchdog, daemon=True).start()
+        serve(feed)
+    finally:
+        feed.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

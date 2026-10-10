@@ -193,6 +193,18 @@ PrimaryLayerKeys = [
     # The daemon polls levels only while that layer is displayed; without
     # the desktop voice receiver it shows a calm idle baseline and the timer.
 
+    # Example of the media bar's opt-in music visualizer (see the media
+    # layer in share/tiny-dfr/multibar.toml):
+    # { Visualizer = true, Stretch = 2 }
+    # This displays a centered Viz label until tapped; a tap turns the
+    # button into a drawn line rippling with the music playing on the
+    # default output. Off by default every time: a second tap, leaving
+    # the media bar, or reloading the configuration turns it off. The
+    # capture stream exists only while it is on. VisualizerStyle,
+    # VisualizerSmoothing, and VisualizerLag mirror the waveform knobs.
+    # Requires the optional desktop-session helper in integrations/viz;
+    # without it an enabled visualizer rests on a dim baseline.
+
     # Example of a Spacer:
     # { Stretch = 3 }
     # Stretch functions the same way as it does for normal buttons.
