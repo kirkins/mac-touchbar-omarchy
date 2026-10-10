@@ -44,7 +44,7 @@ Keys = [
     { Icon = "play_pause", Action = "PlayPause" },
     { Icon = "fast_forward", Action = "NextSong" },
     { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
-    { Visualizer = true, Stretch = 2 },
+    { Visualizer = true, Accent = "blue", Stretch = 2 },
 ]
 
 # Music visualizer: the media bar's last button is off by default - it
