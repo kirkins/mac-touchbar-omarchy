@@ -196,14 +196,18 @@ PrimaryLayerKeys = [
     # Example of the media bar's opt-in music visualizer (see the media
     # layer in share/tiny-dfr/multibar.toml):
     # { Visualizer = true, Stretch = 2 }
-    # This displays a centered Viz label until tapped; a tap turns the
-    # button into a drawn line rippling with the music playing on the
-    # default output. Off by default every time: a second tap, leaving
-    # the media bar, or reloading the configuration turns it off. The
-    # capture stream exists only while it is on. VisualizerStyle,
+    # This displays a centered Viz label until tapped; a tap expands it
+    # into a dedicated full-bar view - the drawn line rippling with the
+    # music playing on the default output, spanning the whole bar except
+    # one Off button that returns this exact bar. Off by default every
+    # time: the Off button, any navigation away, or reloading the
+    # configuration leaves the view and stops the capture; no key ever
+    # fires from the toggle, so playback is never disturbed. The capture
+    # stream exists only while the view is displayed. VisualizerStyle,
     # VisualizerSmoothing, and VisualizerLag mirror the waveform knobs.
-    # Requires the optional desktop-session helper in integrations/viz;
-    # without it an enabled visualizer rests on a dim baseline.
+    # Requires the optional desktop-session helper in integrations/viz,
+    # installed and enabled; without it the view rests on a dim baseline
+    # and the daemon logs one line per enable.
 
     # Example of a Spacer:
     # { Stretch = 3 }

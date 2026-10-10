@@ -25,17 +25,20 @@
 //! timer. The level feed itself stays as fresh as the desktop helper's
 //! capture tail - see `integrations/voice/README.md`.
 //!
-//! The same widget, in [`Mode::Music`], is the media layer's opt-in music
+//! The same widget, in [`Mode::Music`], is the media bar's opt-in music
 //! visualizer: it drops the recording dot and duration timer, draws the
 //! graph across the whole button, and shows a centered `Viz` label while
-//! its session is off - the visualizer never shows by default. Its feed
-//! is [`MonitorLevels`], which dials a second desktop receiver whose
-//! capture is the default sink's *output* monitor. That stream exists
-//! only while the visualizer is enabled: arming the poller sends `on`, so
-//! the helper starts capturing, and disarming - toggle-off, leaving the
-//! media layer, a reload, or the daemon going away - sends `off` (or, for
-//! a vanished daemon, trips the helper's own idle watchdog), so no
-//! monitor stream outlives its consumer. See `integrations/viz/README.md`.
+//! its bar's visualizer is off - the visualizer never shows by default.
+//! Tapping that button expands it into the deck's full-bar visualizer
+//! view - the graph spanning the whole Touch Bar except one Off button -
+//! and its feed is [`MonitorLevels`], which dials a second desktop
+//! receiver whose capture is the default sink's *output* monitor. That
+//! stream exists only while the view is displayed: arming the poller
+//! sends `on`, so the helper starts capturing, and disarming - the Off
+//! button, any navigation away from the view, a reload, or the daemon
+//! going away - sends `off` (or, for a vanished daemon, trips the
+//! helper's own idle watchdog), so no monitor stream outlives its
+//! consumer. See `integrations/viz/README.md`.
 
 use crate::appearance::ButtonAccent;
 use cairo::{Context, LineCap, LineJoin};
@@ -423,7 +426,10 @@ pub fn format_duration(duration: Duration) -> String {
 
 /// State of one recording-page widget. The timer counts from entering the
 /// layer carrying the widget; the history and pulse follow the live feed,
-/// and the frame clock interpolates motion between samples.
+/// and the frame clock interpolates motion between samples. Cloning a
+/// fresh widget seeds the full-bar visualizer view with the same style
+/// and motion knobs as the media bar's toggle button.
+#[derive(Clone)]
 pub struct WaveformWidget {
     style: Style,
     /// Whether this widget meters the microphone or visualizes music.
@@ -1142,8 +1148,21 @@ fn viz_poller(
         }
         drop(state);
         if flipped {
-            // The capture stream's whole lifecycle rides the arm flag.
-            let _ = fetch_control(&address, uid, if armed { "on" } else { "off" });
+            // The capture stream's whole lifecycle rides the arm flag. A
+            // receiver that answers nothing at `on` time is the single
+            // failure the captain cannot see on the glass: the widget
+            // rests on its idle baseline and the daemon would otherwise
+            // stay silent about it, so say it once per arm - the missing
+            // integrations/viz install must be diagnosable from the log.
+            if armed && fetch_control(&address, uid, "on").is_err() {
+                eprintln!(
+                    "tiny-dfr: visualizer receiver unavailable; \
+                     install and enable integrations/viz/dfr-viz"
+                );
+            }
+            if !armed {
+                let _ = fetch_control(&address, uid, "off");
+            }
         }
         if !armed {
             continue;

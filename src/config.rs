@@ -887,8 +887,9 @@ Keys = [{ Text = "F1", Action = "F1" }]
         deck.switch_to(deck.names["media"], &mut |_, _| {});
         render(&mut deck, "implemented-media.png");
         // The media bar's visualizer button: off by default with only its
-        // centered Viz label, then enabled with live monitor levels, then
-        // toggled off again - each exported for review.
+        // centered Viz label, then expanded into the full-bar view with
+        // live monitor levels, then Off returning the plain media bar -
+        // each exported for review.
         let viz_index = deck.current().visualizer.unwrap();
         let spans = deck.current().layout_spans(2008, 0);
         let viz_x = (spans[viz_index].left + spans[viz_index].right) / 2.0;
@@ -896,6 +897,8 @@ Keys = [{ Text = "F1", Action = "F1" }]
         let mut viz_emit = |_: &[Key], _: bool| panic!("visualizer emitted keys");
         deck.touch_down_at(0, viz_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
         assert!(deck.viz_active());
+        assert!(deck.current().viz_view);
+        assert_eq!(deck.current().layout_spans(2008, 0).len(), 2);
         let mut viz_now = Instant::now();
         for level in [
             12, 38, 8, 61, 84, 30, 55, 72, 21, 47, 66, 15, 52, 33, 70, 44,
@@ -904,8 +907,14 @@ Keys = [{ Text = "F1", Action = "F1" }]
             deck.visualizer_tick(Some(crate::MicSample { level, live: true }), viz_now);
         }
         render(&mut deck, "implemented-media-viz.png");
-        deck.touch_down_at(1, viz_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
+        // The view's single control is its Off button; tapping it restores
+        // the exact media bar that opened the view.
+        let off_spans = deck.current().layout_spans(2008, 0);
+        let off_x = (off_spans[1].left + off_spans[1].right) / 2.0;
+        deck.touch_down_at(1, off_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
         assert!(!deck.viz_active());
+        assert!(!deck.current().viz_view);
+        assert_eq!(deck.current().visualizer, Some(viz_index));
         deck.visualizer_tick(
             Some(crate::MicSample {
                 level: 90,
@@ -1747,7 +1756,10 @@ Color = "301020"
         let (cfg, deck) = manager.load_config(2008);
         assert_eq!(cfg.double_press_switch_layers, 0);
         assert!(!deck.legacy);
-        assert_eq!(deck.layers.len(), 5);
+        // The multibar's media bar carries the Viz button, so the deck
+        // also synthesized its full-bar visualizer view.
+        assert_eq!(deck.layers.len(), 6);
+        assert!(deck.names.contains_key("visualizer:media"));
     }
 
     #[test]

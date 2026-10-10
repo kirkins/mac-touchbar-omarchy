@@ -30,8 +30,9 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
 
 Inspect `implemented-home.png`, `implemented-volume-mid.png`,
 `implemented-brightness.png`, `implemented-recording-live.png`, and
-`implemented-recording-idle.png` in that directory, plus the media bar's
-visualizer frames `implemented-media-viz.png` and `implemented-media-off.png`,
+`implemented-recording-idle.png` in that directory, plus the visualizer
+frames `implemented-media-viz.png` (the expanded full-bar view) and
+`implemented-media-off.png` (the restored plain media bar),
 and the per-band frames
 `implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
 `implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
@@ -69,8 +70,9 @@ interaction with a real helper, the pet's on-glass charm, and the background's
 one-shot repaint at a real band change still need a device
 test; battery checks there must include repeated tap-to-cycle, device labels in
 each display mode, hotplug, and timed return. The media visualizer's offline
-tests cover the toggle lifecycle (off by default, arming starts the capture
-feed, toggle-off/layer-exit/reload stop it, a lost consumer still sends `off`),
+tests cover the full-bar view's lifecycle (off by default, the Viz tap switches
+in with no keys fired, Off/navigation/reload switch out, the capture feed arms
+exactly while the view is displayed, a lost consumer still sends `off`),
 the music widget's rendering and idle wakes, config parsing, and the helper's
 capture, protocol, and idle-watchdog behavior against fakes; its on-glass look
 with real playback is a device check.
@@ -286,13 +288,17 @@ feed repaints nothing but the once-a-second timer tick.
 ### Media visualizer
 
 The media bar ends with an opt-in music visualizer: a button that shows only a
-centered `Viz` label until tapped. A tap turns it into the same drawn line the
-recording layer uses - flat at rest, rippling into a smooth wave with the music
-actually playing on the default output - and a second tap turns it back off.
-It is off by default every time: leaving the media bar or reloading the
-configuration also turns it off, and nothing runs while it is off - no sockets,
-no capture. The monitor stream exists only while it is on, at the same 20 Hz
-poll cadence as the recording waveform's feed.
+centered `Viz` label until tapped. A tap expands it into a dedicated full-bar
+view - the same drawn line the recording layer uses, flat at rest, rippling
+into a smooth wave with the music actually playing on the default output -
+spanning the whole Touch Bar except one `Off` button at the end that toggles
+back to the plain media bar, which returns exactly as it was. The toggle and
+its exit are pure layer switches: no key ever fires, and media playback is
+never disturbed. It is off by default every time: leaving the view by any
+navigation or reloading the configuration returns to the normal bars, and
+nothing runs while it is off - no sockets, no capture. The monitor stream
+exists only while the view is displayed, at the same 20 Hz poll cadence as the
+recording waveform's feed.
 
 ```toml
 { Visualizer = true, Stretch = 2 }  # on the media bar
@@ -300,15 +306,19 @@ poll cadence as the recording waveform's feed.
 
 The feed is the optional [desktop-session receiver](integrations/viz/README.md):
 `dfr-viz` captures the default sink's *output monitor* - the sound heading to
-the speakers, not the microphone - and serves one-shot level requests over the
-same abstract AF_UNIX and kernel peer-UID boundary as the volume, brightness,
-and voice receivers. Without it, an enabled visualizer rests on a calm dim
-baseline, exactly like the recording waveform without its helper. Measured on
-the target machine, the enabled capture costs about 0.5% of one CPU core,
-keeps the sinks suspended, and writes nothing to disk; a five-second watchdog
-in the helper also stops the capture if the daemon ever vanishes without
-turning it off. Changing the default output while enabled requires toggling
-the visualizer off and on to follow the new sink.
+the speakers, not the microphone, regardless of which player owns it - and
+serves one-shot level requests over the same abstract AF_UNIX and kernel
+peer-UID boundary as the volume, brightness, and voice receivers. **The
+receiver must be installed and its service enabled before the visualizer can
+draw anything**: without it an enabled view rests on a calm dim baseline and
+the daemon logs one line per enable (`visualizer receiver unavailable; install
+and enable integrations/viz/dfr-viz`) so a missing helper is diagnosable from
+the journal instead of failing silently, exactly like the recording waveform
+without its helper. Measured on the target machine, the enabled capture costs
+about 0.5% of one CPU core, keeps the sinks suspended, and writes nothing to
+disk; a five-second watchdog in the helper also stops the capture if the daemon
+ever vanishes without turning it off. Changing the default output while
+enabled requires toggling the visualizer off and on to follow the new sink.
 
 The line reuses the recording waveform's motion knobs, per button:
 `VisualizerStyle = "bars"` keeps the scrolling bar graph instead of the line,

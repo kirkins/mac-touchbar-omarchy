@@ -934,9 +934,15 @@ pub struct FunctionLayer {
     // The button index of the live microphone waveform widget, if this
     // layer carries one; it owns the fast repaint cadence while displayed.
     waveform: Option<usize>,
-    // The button index of the media layer's opt-in music visualizer, if
-    // this layer carries one; it runs only while its button turned it on.
+    // The button index of this bar's opt-in music visualizer toggle -
+    // on a configured bar the idle `Viz` button whose tap opens the
+    // deck's full-bar view, and inside that view the graph button that
+    // draws it.
     visualizer: Option<usize>,
+    // Whether this layer is a synthesized full-bar visualizer view rather
+    // than a configured bar: its visualizer button draws the graph and its
+    // one remaining button exits back to the bar that opened the view.
+    viz_view: bool,
     // The shared region the last draw covered with the slider, so a
     // later draw without it can erase and repaint the whole region.
     slider_region_drawn: Option<(usize, usize)>,
@@ -977,6 +983,54 @@ impl FunctionLayer {
             faster_refresh,
             waveform,
             visualizer,
+            viz_view: false,
+            slider_region_drawn: None,
+        }
+    }
+
+    /// The full-bar visualizer view a media bar's Viz button toggles
+    /// into: the same drawn graph, spanning the whole bar, plus exactly
+    /// one button that switches back to the bar that opened the view.
+    /// Built from the toggle button's own widget so the view inherits its
+    /// style and motion knobs; nothing here ever emits a key.
+    fn viz_view(toggle: &Button, owner: &str) -> FunctionLayer {
+        let ButtonImage::Waveform(graph) = &toggle.image else {
+            panic!("visualizer view built from a non-visualizer button");
+        };
+        let graph = graph.clone();
+        FunctionLayer {
+            displays_time: false,
+            buttons: vec![
+                (
+                    0,
+                    Button {
+                        action: ButtonAction::default(),
+                        active: false,
+                        changed: false,
+                        image: ButtonImage::Waveform(graph),
+                        icon_width: 0.0,
+                        icon_height: 0.0,
+                        accent: None,
+                    },
+                ),
+                (
+                    5,
+                    Button {
+                        action: ButtonAction::SwitchLayer(owner.into()),
+                        active: false,
+                        changed: false,
+                        image: ButtonImage::Text("Off".into()),
+                        icon_width: 0.0,
+                        icon_height: 0.0,
+                        accent: None,
+                    },
+                ),
+            ],
+            virtual_button_count: 6,
+            faster_refresh: false,
+            waveform: None,
+            visualizer: Some(0),
+            viz_view: true,
             slider_region_drawn: None,
         }
     }
@@ -1296,10 +1350,10 @@ pub struct LayerDeck {
     fn_return: Option<usize>,
     touches: HashMap<u32, TouchState>,
     slider: Overlay,
-    // Whether the media layer's visualizer button turned the visualizer
-    // on. Off by default, and reset by toggle-off, leaving the layer, or
-    // a reload - never sticky.
-    visualizer_on: bool,
+    // For each configured bar carrying a Viz button, the deck index of
+    // its synthesized full-bar visualizer view; the map is the toggle's
+    // whole routing table.
+    viz_view_of: HashMap<usize, usize>,
 }
 
 impl LayerDeck {
@@ -1310,14 +1364,39 @@ impl LayerDeck {
         pet_layer: Option<usize>,
         legacy: bool,
     ) -> Self {
-        let names = layers
+        let mut names = layers
             .iter()
             .enumerate()
             .map(|(i, (name, _))| (name.clone(), i))
-            .collect();
+            .collect::<HashMap<_, _>>();
+        // Every bar carrying a Viz button gets its dedicated full-bar
+        // visualizer view appended to the deck: tapping the button
+        // switches into it, its single Off button switches back, and the
+        // view lives and dies with the deck that synthesized it.
+        let mut viz_view_of = HashMap::new();
+        let mut views = Vec::new();
+        for (index, (name, layer)) in layers.iter().enumerate() {
+            if let Some(button) = layer.visualizer {
+                let view_name = format!("visualizer:{name}");
+                // A pathological config naming its own layer like a
+                // synthesized view keeps that name; the map still routes
+                // the toggle, only the lookup name is yielded.
+                if !names.contains_key(&view_name) {
+                    let view = FunctionLayer::viz_view(&layer.buttons[button].1, name);
+                    viz_view_of.insert(index, names.len() + views.len());
+                    views.push((view_name, view));
+                }
+            }
+        }
+        let mut layers = layers;
+        for (name, view) in views {
+            names.insert(name.clone(), layers.len());
+            layers.push((name, view));
+        }
         Self {
             layers: layers.into_iter().map(|(_, layer)| layer).collect(),
             names,
+            viz_view_of,
             home,
             fn_layer,
             pet_layer,
@@ -1327,7 +1406,6 @@ impl LayerDeck {
             fn_return: None,
             touches: HashMap::new(),
             slider: Overlay::default(),
-            visualizer_on: false,
         }
     }
 
@@ -1351,56 +1429,29 @@ impl LayerDeck {
         self.current().waveform.is_some()
     }
 
-    /// Whether the media layer's visualizer is both displayed and turned
-    /// on; only that arms its monitor-level poller, so the desktop capture
-    /// stream exists exactly while the visualizer is there to show it.
+    /// Whether the full-bar visualizer view is the layer displayed; only
+    /// that arms its monitor-level poller, so the desktop capture stream
+    /// exists exactly while the view is there to show it. Tapping Viz on
+    /// the media bar switches into the view and any layer switch - the
+    /// Off button, Fn, navigation - leaves it, so the visualizer is never
+    /// sticky and its capture never outlives the view.
     fn viz_active(&self) -> bool {
-        self.visualizer_on && self.current().visualizer.is_some()
+        self.current().viz_view && self.current().visualizer.is_some()
     }
 
-    /// End the visualizer session wherever it lives: the toggle state
-    /// resets to off whenever the media layer stops being displayed, so a
-    /// later return always starts with the visualizer off. The capture
-    /// stream itself stops when the disarmed poller sends its `off`.
-    fn disable_visualizer(&mut self) {
-        if !self.visualizer_on {
-            return;
-        }
-        self.visualizer_on = false;
-        for layer in &mut self.layers {
-            if let Some(i) = layer.visualizer {
-                if let ButtonImage::Waveform(wave) = &mut layer.buttons[i].1.image {
-                    wave.deactivate();
-                }
-            }
-        }
-    }
-
-    /// Toggle the visualizer on a touch-down of its button: the first
-    /// press starts the session (and with it, once the poller arms, the
-    /// desktop capture); a second press ends it. Returns whether the tap
-    /// was consumed, which is always the case for this button.
-    fn toggle_visualizer(&mut self, now: Instant) -> bool {
-        let Some(index) = self.current().visualizer else {
+    /// Toggle the visualizer on a touch-down of its button: the press
+    /// switches into this bar's dedicated full-bar view - the graph plus
+    /// one Off button - as a pure layer change, so no key ever fires and
+    /// media playback is never disturbed. Returns whether the tap was
+    /// consumed, which is always the case for this button.
+    fn toggle_visualizer(&mut self, emit_keys: &mut impl FnMut(&[Key], bool)) -> bool {
+        let Some(&view) = self.viz_view_of.get(&self.active) else {
             return false;
         };
-        if !matches!(&self.current().buttons[index].1.image,
-            ButtonImage::Waveform(wave) if wave.is_music())
-        {
-            return false;
-        }
-        self.visualizer_on = !self.visualizer_on;
-        let enabled = self.visualizer_on;
-        let button = &mut self.current_mut().buttons[index].1;
-        if let ButtonImage::Waveform(wave) = &mut button.image {
-            if enabled {
-                wave.activate(now);
-            } else {
-                wave.deactivate();
-            }
-        }
-        button.changed = true;
-        true
+        // Explicit navigation wins over a temporary Fn selection, exactly
+        // like any other layer-switching button.
+        self.fn_return = None;
+        self.switch_to(view, emit_keys)
     }
 
     /// Feed one microphone level sample, when the poller produced one, and
@@ -1440,12 +1491,12 @@ impl LayerDeck {
     }
 
     /// Feed one music monitor level sample, when the poller produced one,
-    /// into the displayed layer's visualizer widget. Mirrors
-    /// [`Self::waveform_tick`] but gated on the toggle as well as the
-    /// layer: while off - or on any other layer - the widget holds its
-    /// idle label, any session ends, and no fast cadence runs.
+    /// into the full-bar view's visualizer widget. Mirrors
+    /// [`Self::waveform_tick`] but gated on the view: on any other layer -
+    /// including the media bar that opened it - every music widget holds
+    /// its idle state, any session ends, and no fast cadence runs.
     fn visualizer_tick(&mut self, sample: Option<MicSample>, now: Instant) -> (bool, i32) {
-        let index = match (self.current().visualizer, self.visualizer_on) {
+        let index = match (self.current().visualizer, self.current().viz_view) {
             (Some(index), true) => index,
             _ => {
                 for layer in &mut self.layers {
@@ -1521,9 +1572,6 @@ impl LayerDeck {
             return false;
         }
         self.release_all(emit_keys);
-        // Leaving the media layer turns the visualizer off; it is opt-in
-        // per visit and its capture must not outlive the layer switch.
-        self.disable_visualizer();
         self.active = target;
         true
     }
@@ -1587,10 +1635,12 @@ impl LayerDeck {
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
             return false;
         }
-        // The visualizer button consumes its own tap: the toggle is the
-        // whole action, and no layer switch or key ever fires from it.
-        if self.current().visualizer == Some(button) {
-            return self.toggle_visualizer(Instant::now());
+        // A configured bar's visualizer button consumes its own tap: the
+        // toggle into the full-bar view is the whole action, and no key
+        // ever fires from it. Inside the view itself the graph button is
+        // inert - only its Off button leaves the view.
+        if !self.current().viz_view && self.current().visualizer == Some(button) {
+            return self.toggle_visualizer(emit_keys);
         }
         let selected = Kind::for_action(&self.current().buttons[button].1.action);
         if let Some(kind) = selected {
@@ -2145,10 +2195,10 @@ fn real_main(drm: &mut DrmBackend) {
         let (_, waveform_timeout_ms) = layers.waveform_tick(mic_sample, Instant::now());
         next_timeout_ms = min(next_timeout_ms, waveform_timeout_ms);
 
-        // The media layer's visualizer polls the desktop output monitor
-        // only while its button turned it on and its layer is displayed;
-        // arming the poller starts the helper's capture and disarming it -
-        // toggle-off, leaving the layer, a reload - stops the stream.
+        // The visualizer polls the desktop output monitor only while the
+        // full-bar view is the displayed layer; arming the poller starts
+        // the helper's capture and disarming it - the Off button, any
+        // navigation away, a reload - stops the stream.
         let viz_sample = viz_levels.update();
         viz_levels.set_armed(layers.viz_active());
         let (_, visualizer_timeout_ms) = layers.visualizer_tick(viz_sample, Instant::now());
@@ -3108,10 +3158,32 @@ mod tests {
     }
 
     #[test]
-    fn the_visualizer_is_off_by_default_and_shuts_down_cleanly() {
+    fn the_visualizer_view_is_off_by_default_full_bar_and_shuts_down_cleanly() {
         let mut deck = media_deck();
         let now = Instant::now();
-        let mut emit = |_: &[Key], _: bool| panic!("visualizer button emitted keys");
+        let mut emit = |_: &[Key], _: bool| panic!("visualizer toggle emitted keys");
+
+        // The deck synthesized exactly one full-bar view for the media bar.
+        let view = deck.names["visualizer:media"];
+        assert_eq!(deck.layers.len(), 3);
+        assert_eq!(
+            deck.viz_view_of,
+            HashMap::from([(deck.names["media"], view)])
+        );
+        assert_eq!(deck.layers[view].buttons.len(), 2);
+        assert_eq!(deck.layers[view].virtual_button_count, 6);
+        assert!(deck.layers[view].viz_view);
+        assert_eq!(deck.layers[view].visualizer, Some(0));
+        assert!(matches!(
+            &deck.layers[view].buttons[1].1,
+            Button { image: ButtonImage::Text(text), action: ButtonAction::SwitchLayer(target), .. }
+                if text == "Off" && target == "media"
+        ));
+        // The graph button itself is inert: only Off leaves the view.
+        assert_eq!(
+            deck.layers[view].buttons[0].1.action,
+            ButtonAction::Keys(vec![])
+        );
 
         // On the home bar nothing runs.
         assert!(!deck.viz_active());
@@ -3120,42 +3192,59 @@ mod tests {
         assert_eq!(timeout, i32::MAX - 1);
 
         // Enter the media bar: the visualizer button is present but off -
-        // it never shows by default.
+        // it never shows by default, and the media bar is exactly the
+        // configured layout it will return to.
         assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
         assert_eq!(deck.active, deck.names["media"]);
         assert_eq!(deck.current().visualizer, Some(2));
         assert!(!deck.viz_active());
+        let before = deck.current().layout_spans(2008, 0);
         let (changed, timeout) = deck.visualizer_tick(None, now);
         assert!(!changed);
         assert_eq!(timeout, i32::MAX - 1);
 
-        // The tap consumes itself: no keys, no commands, no held touch.
+        // The Viz tap is a pure layer switch: no keys, no commands, no
+        // held touch, and the full-bar view is what comes up.
         assert!(deck.touch_down(1, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
         assert!(deck.touches.is_empty());
+        assert_eq!(deck.active, view);
         assert!(deck.viz_active());
-        assert!(deck.current().buttons[2].1.changed);
-        deck.current_mut().buttons[2].1.changed = false;
 
-        // Live monitor samples stream into the graph at the frame cadence.
+        // Live monitor samples stream into the full-bar graph at the
+        // frame cadence, filling everything but the Off button.
         for level in [12, 47, 78, 33] {
             let (changed, timeout) =
                 deck.visualizer_tick(Some(MicSample { level, live: true }), now);
             assert!(changed);
             assert_eq!(timeout, waveform::FRAME_INTERVAL_MS);
         }
-        let ButtonImage::Waveform(viz) = &deck.current().buttons[2].1.image else {
+        let ButtonImage::Waveform(viz) = &deck.current().buttons[0].1.image else {
             panic!()
         };
         assert_eq!(
             viz.history().oldest_first().collect::<Vec<_>>(),
             vec![12, 47, 78, 33]
         );
+        let spans = deck.current().layout_spans(2008, 0);
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].right - spans[0].left > 0.8 * 2008.0);
 
-        // A second tap ends the session: no cadence, no repaint, and any
-        // late in-flight sample lands on the idle label.
-        assert!(deck.touch_down(2, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        // Tapping the graph itself is inert: it holds no keys, so the
+        // press may highlight it but nothing ever fires, and the view
+        // stays up.
+        let mut silent =
+            |keys: &[Key], _: bool| assert!(keys.is_empty(), "the graph button emitted {keys:?}");
+        assert!(!deck.touch_down(2, 0, 1000.0, 30.0, &mut silent, &mut |_| {}));
+        assert_eq!(deck.active, view);
+        assert!(deck.viz_active());
+        deck.touch_up(2, &mut silent);
+
+        // The Off tap returns to the media bar unchanged: same buttons,
+        // same hit spans, the toggle never sticky.
+        assert!(deck.touch_down(3, 1, 1850.0, 30.0, &mut emit, &mut |_| {}));
+        assert_eq!(deck.active, deck.names["media"]);
         assert!(!deck.viz_active());
-        deck.current_mut().buttons[2].1.changed = false;
+        assert_eq!(deck.current().layout_spans(2008, 0), before);
         let later = now + Duration::from_secs(4);
         let (changed, timeout) = deck.visualizer_tick(
             Some(MicSample {
@@ -3166,18 +3255,20 @@ mod tests {
         );
         assert!(!changed);
         assert_eq!(timeout, i32::MAX - 1);
-        assert!(deck
-            .layers
-            .iter()
-            .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
+        // The restored media bar is fully settled - no button waits on a
+        // repaint, and a late in-flight sample marks nothing changed.
+        assert!(deck.current().buttons.iter().all(|(_, b)| !b.changed));
+        let ButtonImage::Waveform(viz) = &deck.current().buttons[2].1.image else {
+            panic!()
+        };
+        assert!(viz.history().is_empty());
 
-        // Leaving the media layer turns an enabled visualizer off; the
-        // toggle never survives the layer switch, and coming back starts
-        // from off again.
-        assert!(deck.touch_down(3, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        // Leaving the view by any other navigation - here, straight to
+        // home - ends the session the same way, and coming back to the
+        // media bar starts from off again.
+        assert!(deck.touch_down(4, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
         assert!(deck.viz_active());
-        assert!(deck.touch_down(4, 0, 100.0, 30.0, &mut emit, &mut |_| {}));
-        assert_eq!(deck.active, deck.home);
+        assert!(deck.switch_named("home", &mut emit));
         assert!(!deck.viz_active());
         let (changed, _) = deck.visualizer_tick(
             Some(MicSample {
@@ -3187,16 +3278,11 @@ mod tests {
             later,
         );
         assert!(!changed);
-        assert!(deck.touch_down(5, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
-        assert_eq!(deck.active, deck.names["media"]);
+        assert!(deck.switch_named("media", &mut emit));
         assert!(!deck.viz_active());
-        let ButtonImage::Waveform(viz) = &deck.current().buttons[2].1.image else {
-            panic!()
-        };
-        assert!(viz.history().is_empty());
 
         // A reload replaces the deck wholesale: the fresh one is off.
-        assert!(deck.touch_down(6, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(5, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
         assert!(deck.viz_active());
         deck.replace(media_deck(), &mut |_, _| {});
         assert!(!deck.viz_active());

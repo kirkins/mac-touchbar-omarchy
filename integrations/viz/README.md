@@ -6,6 +6,13 @@ the default output. It follows the installed voice integration's shape -
 same session, same abstract AF_UNIX boundary, different source - without
 connecting to its socket or modifying its files.
 
+**Install and enable this receiver before expecting the visualizer to
+work.** A missing receiver is the number-one silent failure: the Touch Bar
+shows only a calm dim baseline and, since v2, the daemon logs one line per
+enable (`visualizer receiver unavailable; install and enable
+integrations/viz/dfr-viz`) - check `journalctl -u tiny-dfr` if the view
+stays flat.
+
 ## What it captures
 
 The receiver resolves the session's default output sink through the
@@ -35,10 +42,12 @@ paths.
 
 The capture stream exists only while something consumes it:
 
-- The daemon arms its poller only while the media layer is displayed AND
-  its visualizer button was tapped on. Arming sends `on`; toggle-off,
-  leaving the media layer, a configuration reload, or daemon shutdown
-  disarms it, which sends `off`.
+- The daemon arms its poller only while the full-bar visualizer view is
+  displayed (entered by tapping the media bar's Viz button). Arming sends
+  `on`; the view's Off button, any navigation away from the view, a
+  configuration reload, or daemon shutdown disarms it, which sends `off`.
+  An arm that cannot reach the receiver logs one journal line from the
+  daemon - the missing-helper case is diagnosable, not silent.
 - If the daemon vanishes without sending `off`, an idle watchdog stops
   the capture after five seconds without a request
   (`DFR_VIZ_IDLE_TIMEOUT` seconds, minimum one, for tests).
