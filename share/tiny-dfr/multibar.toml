@@ -60,22 +60,22 @@ Keys = [
 # installed and its service enabled; without it the view rests on a calm
 # dim baseline and the daemon logs one line per enable. The line reuses
 # the recording waveform's motion knobs: VisualizerStyle = "bars" keeps
-# the bar graph, VisualizerSmoothing (ms decay, attack a third of it) and
-# VisualizerLag (ms of visual delay, capped at 500) calm the motion, e.g.
-# { Visualizer = true, Stretch = 2, VisualizerSmoothing = 240, VisualizerLag = 80 }.
+# the bar graph. The line follows the level directly, unsmoothed; opt into a
+# calmer motion with VisualizerSmoothing (ms decay, attack a third of it) and
+# VisualizerLag (ms of visual delay, capped at 500).
 
 # Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
 # opens this recording layer in one press; the layer itself is the visual
 # state. The middle Waveform button shows the sound actually coming in: a
-# drawn line that rests flat while silent and ripples into a smooth wave
-# while speaking, a recording dot that pulses with live level, and a duration
-# timer counting from entering the layer, all driven by the optional
-# desktop-session level feed (see README; without it the widget shows a calm
-# idle baseline and the timer). Set WaveformStyle = "bars" on the button to
-# keep the previous scrolling bar graph instead of the line, and calm the
-# line's motion with WaveformSmoothing (ms decay, attack a third of it) and
-# WaveformLag (ms of visual delay, capped at 500), e.g.
-# { Waveform = true, Stretch = 3, WaveformSmoothing = 240, WaveformLag = 80 }.
+# drawn line that rests flat while silent and ripples while speaking, a
+# recording dot that pulses with live level, and a duration timer counting
+# from entering the layer, all driven by the optional desktop-session level
+# feed (see README; without it the widget shows a calm idle baseline and the
+# timer). The line follows the level directly, unsmoothed. Set
+# WaveformStyle = "bars" on the button to keep the previous scrolling bar
+# graph instead of the line, or opt into a calmer motion with
+# WaveformSmoothing (ms decay, attack a third of it) and WaveformLag (ms of
+# visual delay, capped at 500).
 # Stop keeps the recording and types the transcript into the focused
 # window, Cancel discards a mis-start; both run their command and return
 # home. Install the optional integrations/voice client and desktop-session
@@ -85,7 +85,7 @@ Keys = [
 Name = "recording"
 Keys = [
     { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
-    { Waveform = true, Accent = "blue", Stretch = 3, WaveformSmoothing = 240, WaveformLag = 80 },
+    { Waveform = true, Accent = "blue", Stretch = 3 },
     { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
 ]
 
