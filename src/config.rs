@@ -1056,12 +1056,20 @@ Keys = [{ Text = "F1", Action = "F1" }]
         tap(&mut deck, "Mic", &mut commands);
         tap(&mut deck, "Cancel", &mut commands);
         assert_eq!(deck.active, deck.home);
-        assert_eq!(commands.len(), 4);
+        // The home bar's More button opens the quick-keys bar; its
+        // Screenshot entry fires the screenshot flow and returns home in
+        // one press.
+        tap(&mut deck, "More", &mut commands);
+        assert_eq!(deck.active, deck.names["more"]);
+        render(&mut deck, "implemented-more.png");
+        tap(&mut deck, "Screenshot", &mut commands);
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(commands.len(), 5);
         let actions: Vec<_> = commands
             .iter()
             .map(|command| command.split_whitespace().last().unwrap())
             .collect();
-        assert_eq!(actions, ["start", "stop", "start", "cancel"]);
+        assert_eq!(actions, ["start", "stop", "start", "cancel", "screenshot"]);
     }
 
     #[test]
@@ -1165,11 +1173,13 @@ DoublePressSwitchLayers = 200
             2008,
         )
         .unwrap();
-        assert_eq!(layout.layers.len(), 5);
+        assert_eq!(layout.layers.len(), 6);
         let home = &layout.layers[layout.home];
-        assert!(home.keys.iter().any(|key| key.time.is_some()));
+        // The clock is gone from the shipped home bar; its width goes to
+        // the remaining buttons.
+        assert!(!home.keys.iter().any(|key| key.time.is_some()));
         assert!(home.keys.iter().any(|key| key.battery.is_some()));
-        for name in ["function", "media", "pet"] {
+        for name in ["function", "media", "more", "pet"] {
             assert!(home
                 .keys
                 .iter()
@@ -1231,9 +1241,31 @@ DoublePressSwitchLayers = 200
                 layer: "recording".into()
             }
         );
-        // The Pet button joins the navigation cluster after Functions and
-        // Media, matching their styling.
-        let positions: Vec<usize> = ["function", "media", "pet"]
+        // The quick-keys bar: its one shipped entry fires the screenshot
+        // flow and returns home, behind an explicit Home button that
+        // leaves without running anything.
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert_eq!(more.keys.len(), 2);
+        assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
+        assert_eq!(
+            more.keys[0].action,
+            ButtonAction::SwitchLayer("home".into())
+        );
+        assert_eq!(more.keys[1].text.as_deref(), Some("Screenshot"));
+        assert_eq!(
+            more.keys[1].action,
+            ButtonAction::CommandLayer {
+                command: "omarchy capture screenshot".into(),
+                layer: "home".into()
+            }
+        );
+        // The Pet button joins the navigation cluster after Functions,
+        // Media, and More, matching their styling.
+        let positions: Vec<usize> = ["function", "media", "more", "pet"]
             .into_iter()
             .map(|name| {
                 home.keys
@@ -1242,7 +1274,7 @@ DoublePressSwitchLayers = 200
                     .unwrap()
             })
             .collect();
-        assert_eq!(positions, vec![3, 4, 5]);
+        assert_eq!(positions, vec![3, 4, 5, 6]);
         // The media bar keeps its existing controls and gains exactly one
         // new button at the end: the opt-in music visualizer, off by
         // default every time.
@@ -1262,7 +1294,7 @@ DoublePressSwitchLayers = 200
         assert_eq!(viz.waveform, None);
         assert_eq!(viz.stretch, Some(2));
         assert_eq!(viz.action, ButtonAction::Keys(vec![]));
-        let pet_button = &home.keys[positions[2]];
+        let pet_button = &home.keys[positions[3]];
         assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout
             .layers
@@ -1360,6 +1392,76 @@ Keys = [\n\
         let function = &layout.layers[1];
         assert_eq!(function.keys.len(), 2);
         assert_eq!(function.keys[0].text.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn quick_key_entries_carry_a_label_an_optional_glyph_and_a_command() {
+        // The shipped quick-keys bar: one example entry firing the
+        // screenshot flow and returning home, behind an explicit Home
+        // button that leaves without running anything.
+        let example = include_str!("../share/tiny-dfr/multibar.toml");
+        let (_, layout) = parse_config(BASE, Some(example), 2008).unwrap();
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert_eq!(more.keys.len(), 2);
+        assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
+        assert_eq!(
+            more.keys[0].action,
+            ButtonAction::SwitchLayer("home".into())
+        );
+        let screenshot = &more.keys[1];
+        assert_eq!(screenshot.text.as_deref(), Some("Screenshot"));
+        assert_eq!(screenshot.icon, None);
+        assert_eq!(
+            screenshot.action,
+            ButtonAction::CommandLayer {
+                command: "omarchy capture screenshot".into(),
+                layer: "home".into()
+            }
+        );
+
+        // A captain's own quick keys are further entries in the same Keys
+        // array - a Text label or an Icon glyph, an optional Accent, and
+        // the Command to run, with or without a Layer switch. Entries
+        // without a Layer switch stay on the bar, and the visible
+        // home-targeting buttons keep the synthesized Home button from
+        // duplicating the explicit one.
+        let screenshot_line = "    { Text = \"Screenshot\", Action = { Command = \"omarchy capture screenshot\", Layer = \"home\" } },\n";
+        let with_own_keys = concat!(
+            "    { Text = \"Screenshot\", Action = { Command = \"omarchy capture screenshot\", Layer = \"home\" } },\n",
+            "    { Icon = \"search\", Action = { Command = \"my-quick-tool\" } },\n",
+            "    { Text = \"Lock\", Accent = \"amber\", Action = { Command = \"loginctl lock-session\" } },\n",
+        );
+        let config = example.replace(screenshot_line, with_own_keys);
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert_eq!(more.keys.len(), 4);
+        assert_eq!(more.keys[2].icon.as_deref(), Some("search"));
+        assert!(more.keys[2].text.is_none());
+        assert_eq!(
+            more.keys[2].action,
+            ButtonAction::Command("my-quick-tool".into())
+        );
+        assert_eq!(more.keys[3].text.as_deref(), Some("Lock"));
+        assert_eq!(more.keys[3].accent, Some(ButtonAccent::Amber));
+        assert_eq!(
+            more.keys[3].action,
+            ButtonAction::Command("loginctl lock-session".into())
+        );
+        // A quick key naming an unknown layer is rejected like any other
+        // button target.
+        let invalid = config.replace(
+            "Command = \"my-quick-tool\"",
+            "Command = \"my-quick-tool\", Layer = \"missing\"",
+        );
+        assert!(parse_config(BASE, Some(&invalid), 2008).is_err());
     }
 
     #[test]
@@ -1757,8 +1859,9 @@ Color = "301020"
         assert_eq!(cfg.double_press_switch_layers, 0);
         assert!(!deck.legacy);
         // The multibar's media bar carries the Viz button, so the deck
-        // also synthesized its full-bar visualizer view.
-        assert_eq!(deck.layers.len(), 6);
+        // also synthesized its full-bar visualizer view; the named layers
+        // are home, function, media, recording, more, and pet.
+        assert_eq!(deck.layers.len(), 7);
         assert!(deck.names.contains_key("visualizer:media"));
     }
 

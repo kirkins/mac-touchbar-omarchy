@@ -30,15 +30,16 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
 
 Inspect `implemented-home.png`, `implemented-volume-mid.png`,
 `implemented-brightness.png`, `implemented-recording-live.png`, and
-`implemented-recording-idle.png` in that directory, plus the visualizer
+`implemented-recording-idle.png` in that directory, plus the quick-keys frame
+`implemented-more.png` (the More bar), the visualizer
 frames `implemented-media-viz.png` (the expanded full-bar view) and
 `implemented-media-off.png` (the restored plain media bar),
 and the per-band frames
 `implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
 `implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
 the same home bar over each time-of-day background.
-These frames use the configured font and icon search paths; their battery and
-clock display is illustrative and they do not prove physical touch or dictation.
+These frames use the configured font and icon search paths; their battery
+display is illustrative and they do not prove physical touch or dictation.
 Running the full test suite with the variable set also exports the pet's
 feeding frames `pet-food-drop.png`, `pet-food-walk.png`, and
 `pet-food-munch.png` from its unit tests.
@@ -49,8 +50,9 @@ presses/releases, battery widget cycling, the shared volume/brightness slider (e
 selection without stepping, combined-region geometry and drag math, safe ranges,
 auto-collapse timing, confirmed readback, failures, stale replies and selection
 isolation), command buttons (parse and
-combined layer dispatch, detached execution, and the one-invocation-per-command
-cap), the recording waveform (level-history ring behavior, line and bar
+combined layer dispatch, detached execution, the one-invocation-per-command
+cap, and the More bar's quick-key entries and shipped screenshot flow), the
+recording waveform (level-history ring behavior, line and bar
 geometry from synthetic levels, flatness, bounds, and sample-boundary
 continuity of the line, incremental button repaints, recording-only fast cadence,
 monotonic duration timer, live/idle rendering, and the level poller's arming,
@@ -82,8 +84,9 @@ with real playback is a device check.
 The daemon merges `/etc/tiny-dfr/config.toml` over
 `/usr/share/tiny-dfr/config.toml`. The optional
 [multibar example](share/tiny-dfr/multibar.toml) defines a home bar with volume,
-brightness, play/pause, battery, and clock controls, buttons opening F1-F12 and
-media bars, and a mic button that starts voice dictation on a recording layer.
+brightness, play/pause, and battery controls, buttons opening F1-F12, media,
+and quick-key bars, and a mic button that starts voice dictation on a recording
+layer.
 
 ```toml
 DefaultLayer = "home"
@@ -234,6 +237,31 @@ integration separately; without a receiver these presses still switch layers
 and log the failed command. Check the desktop notification or receiver journal
 to confirm recording started.
 
+### Custom quick keys
+
+The multibar home bar carries a `More` button in its navigation cluster
+(beside `F1-F12` and `Media`) opening the `more` layer: a parking lot for
+one-press quick keys with room for as many entries as you want. Each quick
+key is an ordinary button entry - a `Text` label or an `Icon` glyph - whose
+action runs a shell command:
+
+```toml
+[[Layers]]
+Name = "more"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "Screenshot", Action = { Command = "omarchy capture screenshot", Layer = "home" } },
+]
+```
+
+The shipped example fires the Omarchy screenshot flow and returns home in
+one press. An entry without `Layer` stays on the bar so several keys can run
+in a row, and the leading `Home` button always leaves without running
+anything. Adding a quick key is a config edit, not a code change; labels,
+glyphs, accents, and `Stretch` work as on any bar, and command execution
+follows the command-button rules above (detached, at most one invocation per
+command string, failures journalled).
+
 ### Live recording waveform
 
 A button configured with `{ Waveform = true, Stretch = 3 }` - the middle of
@@ -373,8 +401,9 @@ static background at every hour.
 A small virtual pet, in the spirit of the 2016 Touchbar Pet, lives on its own
 pet layer (a behavioral homage written from scratch - no original assets or
 code). With `PetEnabled = true` the home bar gains a Pet button beside the
-other navigation buttons - the same styling as Functions and Media - that
-opens the pet layer, a bar carrying a Home button like every other sub-bar
+other navigation buttons - the same styling as Functions, Media, and More -
+that opens the pet layer, a bar carrying a Home button like every other
+sub-bar
 and otherwise open ground. The pet exists and animates only inside its
 layer; it never renders on or interferes with the home bar or any other
 layer, and the layer follows the same rules as any named bar, including Fn
@@ -462,7 +491,8 @@ sudo systemctl status tiny-dfr.service --no-pager
 ```
 
 On the device, check Home → Functions → Home and Home → Media → Home, all
-F1-F12/media controls, the battery and clock, and Home → Pet → pet
+F1-F12/media controls, the battery, Home → More → Screenshot → Home (the
+screenshot flow runs and the bar returns home), and Home → Pet → pet
 wandering, feeding, and startling → Home, plus Fn press/release. With the
 desktop-session voice integration installed, check the mic button opens
 the recording layer while dictation starts, and that Stop types the

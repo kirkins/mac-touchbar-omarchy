@@ -13,8 +13,8 @@ Keys = [
     { Icon = "play_pause", Action = "PlayPause" },
     { Text = "F1-F12", Action = { Layer = "function" } },
     { Text = "Media", Action = { Layer = "media" } },
+    { Text = "More", Action = { Layer = "more" } },
     { Battery = "both", Stretch = 2 },
-    { Time = "%H:%M", Stretch = 2 },
     { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } },
 ]
 
@@ -89,8 +89,26 @@ Keys = [
     { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
 ]
 
+# Custom quick keys: the home bar's More button opens this bar, a parking
+# lot for one-press commands with room for as many entries as you like.
+# Each quick key is one entry: a Text label or an Icon glyph, and an Action
+# table with the Command to run. Add Layer = "home" to return to the home
+# bar after the press - as the shipped Screenshot key does - or leave Layer
+# off to stay here and fire several keys in a row; the Home button always
+# leaves without running anything. Labels, glyphs, accents, and Stretch
+# work as on any bar, and commands run through /bin/sh like any command
+# button (see the notes above and the README).
+[[Layers]]
+Name = "more"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "Screenshot", Action = { Command = "omarchy capture screenshot", Layer = "home" } },
+]
+
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,
 # then add a button with Action = { Layer = "that-name" } to a reachable bar.
+# For one-press commands, add entries to the "more" bar's Keys above instead;
+# the home bar's More button already opens it.
 # A Home button is inserted automatically on sub-bars that lack a visible
 # button targeting DefaultLayer; a button can also run a shell command on
 # touch-down with Action = { Command = "..." }, optionally combined with a
