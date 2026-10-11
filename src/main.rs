@@ -52,6 +52,7 @@ mod daycycle;
 mod display;
 mod fonts;
 mod level_control;
+mod now_playing;
 mod pet;
 mod pixel_shift;
 mod slider;
@@ -68,6 +69,7 @@ use display::DrmBackend;
 #[cfg(test)]
 use level_control::Request as LevelRequest;
 use level_control::{LevelControl, State as LevelState};
+use now_playing::{Feed, NowPlaying, NowPlayingWidget};
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use slider::{Geometry, Kind, MuteWatch, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
@@ -281,6 +283,7 @@ enum ButtonImage {
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryWidget, BatteryIconMode, BatteryImages),
     Waveform(WaveformWidget),
+    NowPlaying(NowPlayingWidget),
     Spacer,
 }
 
@@ -513,6 +516,8 @@ impl Button {
                 cfg.visualizer_smoothing,
                 cfg.visualizer_lag,
             )
+        } else if cfg.now_playing.unwrap_or(false) {
+            Button::new_now_playing(cfg.action)
         } else {
             Button::new_spacer()
         };
@@ -672,6 +677,24 @@ impl Button {
             image: ButtonImage::Waveform(
                 WaveformWidget::new_music(style).with_motion(smoothing, lag),
             ),
+            icon_width: 0.0,
+            icon_height: 0.0,
+            accent: None,
+            muted: false,
+        }
+    }
+
+    /// The media bar's now-playing row: display-only, fed by the
+    /// desktop now-playing receiver at the slow metadata cadence. No
+    /// keys ever fire from it and it carries no session state - every
+    /// poll replaces the whole label, so the row can never outlive the
+    /// track it names.
+    fn new_now_playing(action: ButtonAction) -> Button {
+        Button {
+            action,
+            active: false,
+            changed: false,
+            image: ButtonImage::NowPlaying(NowPlayingWidget::default()),
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
@@ -896,6 +919,9 @@ impl Button {
             ButtonImage::Waveform(wave) => {
                 wave.render(c, height, button_left_edge, button_width as f64, y_shift);
             }
+            ButtonImage::NowPlaying(widget) => {
+                widget.render(c, height, button_left_edge, button_width as f64, y_shift);
+            }
             ButtonImage::Spacer => (),
         }
         if self.muted && matches!(self.action, ButtonAction::VolumeSlider) {
@@ -974,6 +1000,9 @@ pub struct FunctionLayer {
     // deck's full-bar view, and inside that view the graph button that
     // draws it.
     visualizer: Option<usize>,
+    // The button index of this bar's now-playing row, if it carries one;
+    // only a displayed now-playing bar arms its metadata poller.
+    now_playing: Option<usize>,
     // Whether this layer is a synthesized full-bar visualizer view rather
     // than a configured bar: its visualizer button draws the graph and its
     // one remaining button exits back to the bar that opened the view.
@@ -1011,6 +1040,9 @@ impl FunctionLayer {
         let visualizer = buttons
             .iter()
             .position(|(_, b)| matches!(&b.image, ButtonImage::Waveform(wave) if wave.is_music()));
+        let now_playing = buttons
+            .iter()
+            .position(|(_, b)| matches!(&b.image, ButtonImage::NowPlaying(_)));
         FunctionLayer {
             displays_time,
             buttons,
@@ -1018,6 +1050,7 @@ impl FunctionLayer {
             faster_refresh,
             waveform,
             visualizer,
+            now_playing,
             viz_view: false,
             slider_region_drawn: None,
         }
@@ -1067,6 +1100,7 @@ impl FunctionLayer {
             faster_refresh: false,
             waveform: None,
             visualizer: Some(0),
+            now_playing: None,
             viz_view: true,
             slider_region_drawn: None,
         }
@@ -1487,6 +1521,45 @@ impl LayerDeck {
     /// sticky and its capture never outlives the view.
     fn viz_active(&self) -> bool {
         self.current().viz_view && self.current().visualizer.is_some()
+    }
+
+    /// Whether the displayed layer carries a now-playing row; only that
+    /// arms its metadata poller, so the session-bus reads exist exactly
+    /// while a bar displays the row to keep current.
+    fn now_playing_active(&self) -> bool {
+        self.current().now_playing.is_some()
+    }
+
+    /// Feed one now-playing poll result, when the poller produced one,
+    /// into the displayed layer's now-playing row. Every poll replaces
+    /// the whole label, so a track change lands live and a paused or
+    /// stopped player clears the row instead of leaving the last song
+    /// behind. On any other layer every now-playing widget resets to the
+    /// empty state, so a return starts from the next poll, never from an
+    /// old track. Returns whether the bar needs an incremental repaint.
+    fn now_playing_tick(&mut self, feed: Option<Feed>) -> bool {
+        let Some(index) = self.layers[self.active].now_playing else {
+            for layer in &mut self.layers {
+                if let Some(i) = layer.now_playing {
+                    if let ButtonImage::NowPlaying(widget) = &mut layer.buttons[i].1.image {
+                        widget.reset();
+                    }
+                }
+            }
+            return false;
+        };
+        let Some(feed) = feed else {
+            return false;
+        };
+        let button = &mut self.layers[self.active].buttons[index].1;
+        let ButtonImage::NowPlaying(widget) = &mut button.image else {
+            return false;
+        };
+        if widget.apply(&feed) {
+            button.changed = true;
+            return true;
+        }
+        false
     }
 
     /// Toggle the visualizer on a touch-down of its button: the press
@@ -2142,6 +2215,9 @@ fn real_main(drm: &mut DrmBackend) {
     // Live output-monitor levels for the media layer's visualizer, which
     // exist only while the visualizer is on and its layer is displayed.
     let mut viz_levels = MonitorLevels::visualizer();
+    // Now-playing metadata for the media bar's text row, polled only at
+    // its slow cadence while a now-playing layer is displayed.
+    let mut now_playing = NowPlaying::client();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -2193,6 +2269,9 @@ fn real_main(drm: &mut DrmBackend) {
         .unwrap();
     epoll
         .add(&viz_levels.wake, EpollEvent::new(EpollFlags::EPOLLIN, 8))
+        .unwrap();
+    epoll
+        .add(&now_playing.wake, EpollEvent::new(EpollFlags::EPOLLIN, 9))
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
@@ -2305,6 +2384,14 @@ fn real_main(drm: &mut DrmBackend) {
         viz_levels.set_armed(layers.viz_active());
         let (_, visualizer_timeout_ms) = layers.visualizer_tick(viz_sample, Instant::now());
         next_timeout_ms = min(next_timeout_ms, visualizer_timeout_ms);
+
+        // The now-playing row polls the desktop receiver at its slow
+        // metadata cadence only while a now-playing layer is displayed;
+        // elsewhere the poller sleeps and every row holds the empty state
+        // until its layer returns.
+        let now_playing_feed = now_playing.update();
+        now_playing.set_armed(layers.now_playing_active());
+        layers.now_playing_tick(now_playing_feed);
 
         // The shared slider collapses on its own after a moment.
         layers.slider_refresh(Instant::now());
@@ -3333,6 +3420,98 @@ mod tests {
             None,
             false,
         )
+    }
+
+    /// A deck shaped like the shipped media bar's now-playing row: the
+    /// media bar carries the row after the transport, before the opt-in
+    /// visualizer button.
+    fn now_playing_deck() -> LayerDeck {
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![
+                        keys("Combo", &[Key::LeftCtrl, Key::F1]),
+                        nav("Media", "media"),
+                    ]),
+                ),
+                (
+                    "media".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        keys("Play", &[Key::PlayPause]),
+                        ButtonConfig {
+                            now_playing: Some(true),
+                            stretch: Some(2),
+                            ..ButtonConfig::default()
+                        },
+                        ButtonConfig {
+                            visualizer: Some(true),
+                            stretch: Some(2),
+                            ..ButtonConfig::default()
+                        },
+                    ]),
+                ),
+            ],
+            0,
+            Some(1),
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn the_now_playing_row_replaces_its_label_and_never_holds_a_stale_track() {
+        use now_playing::Track;
+        let mut deck = now_playing_deck();
+        let track = |title: &str| {
+            Feed::Playing(Track {
+                title: title.into(),
+                artist: Some("Artist".into()),
+            })
+        };
+
+        // On the home bar the poller is disarmed and no row changes.
+        assert!(!deck.now_playing_active());
+        assert!(!deck.now_playing_tick(Some(track("Elsewhere"))));
+
+        // Enter the media bar: the row is present and its layer arms.
+        deck.switch_named("media", &mut |_, _| {});
+        assert!(deck.now_playing_active());
+        let index = deck.current().now_playing.unwrap();
+
+        // The first track lands and marks the button for repaint.
+        assert!(deck.now_playing_tick(Some(track("First"))));
+        assert!(deck.current().buttons[index].1.changed);
+        deck.current_mut().buttons[index].1.changed = false;
+        // The same track again adds no repaint.
+        assert!(!deck.now_playing_tick(Some(track("First"))));
+        // A track change lands live.
+        assert!(deck.now_playing_tick(Some(track("Second"))));
+        deck.current_mut().buttons[index].1.changed = false;
+
+        // Pausing clears the row: the empty state, never the stale
+        // track; repeated empty polls stay quiet.
+        assert!(deck.now_playing_tick(Some(Feed::Idle)));
+        assert!(deck.current().buttons[index].1.changed);
+        deck.current_mut().buttons[index].1.changed = false;
+        assert!(!deck.now_playing_tick(Some(Feed::Idle)));
+        // The clear was real: the same track the row had before pausing
+        // repaints on reapplied arrival instead of matching on glass.
+        assert!(deck.now_playing_tick(Some(track("Second"))));
+        deck.current_mut().buttons[index].1.changed = false;
+
+        // Leaving the media bar resets every row, so a later return
+        // starts from the next poll instead of an old track; ticks on
+        // other layers change nothing.
+        assert!(deck.now_playing_tick(Some(track("Third"))));
+        deck.switch_named("home", &mut |_, _| {});
+        assert!(!deck.now_playing_active());
+        assert!(!deck.now_playing_tick(None));
+        // The leave was a real reset: "Third" was already applied before
+        // it, and its reappearance back on the media bar repaints.
+        deck.switch_named("media", &mut |_, _| {});
+        assert!(deck.now_playing_tick(Some(track("Third"))));
     }
 
     #[test]

@@ -167,6 +167,7 @@ pub struct ButtonConfig {
     pub visualizer_style: Option<String>,
     pub visualizer_smoothing: Option<u32>,
     pub visualizer_lag: Option<u32>,
+    pub now_playing: Option<bool>,
     pub locale: Option<String>,
     #[serde(default)]
     pub action: ButtonAction,
@@ -774,6 +775,40 @@ Keys = [{ Text = "F1", Action = "F1" }]
     }
 
     #[test]
+    fn now_playing_buttons_parse_and_coexist_with_their_neighbors() {
+        // The knob lands on the button that declares it.
+        let candidate = NAMED.replace("Text = \"F1\"", "NowPlaying = true, Text = \"F1\"");
+        let (_, styled) = parse_config(BASE, Some(&candidate), 2008).unwrap();
+        let key = styled.layers[1].keys.last().unwrap();
+        assert_eq!(key.now_playing, Some(true));
+        assert_eq!(key.visualizer, None);
+        // Buttons without the knob stay inert.
+        let (_, styled) = parse_config(BASE, Some(NAMED), 2008).unwrap();
+        assert_eq!(styled.layers[1].keys.last().unwrap().now_playing, None);
+        // A now-playing row and a visualizer button coexist on one bar
+        // as distinct widgets, each display-only, alongside transport:
+        // the shipped media bar's shape. The synthesized Home button
+        // leads the sub-bar as usual.
+        let media = "\n[[Layers]]\nName = \"media\"\nKeys = [{ Icon = \"play_pause\", Action = \"PlayPause\" }, \
+            { NowPlaying = true, Stretch = 2 }, { Visualizer = true }]\n";
+        let (_, styled) = parse_config(BASE, Some(&(NAMED.to_owned() + media)), 2008).unwrap();
+        let media = styled
+            .layers
+            .iter()
+            .find(|layer| layer.name == "media")
+            .unwrap();
+        assert_eq!(media.keys.len(), 4);
+        assert_eq!(media.keys[0].text.as_deref(), Some("Home"));
+        assert_eq!(
+            media.keys[1].action,
+            ButtonAction::Keys(vec![Key::PlayPause])
+        );
+        assert_eq!(media.keys[2].now_playing, Some(true));
+        assert_eq!(media.keys[2].stretch, Some(2));
+        assert_eq!(media.keys[3].visualizer, Some(true));
+    }
+
+    #[test]
     fn approved_multibar_preserves_voice_dispatch_and_renders_offline() {
         use chrono::Timelike;
         let tmp = TempDir::new();
@@ -908,6 +943,23 @@ Keys = [{ Text = "F1", Action = "F1" }]
         }
         deck.switch_to(deck.names["media"], &mut |_, _| {});
         render(&mut deck, "implemented-media.png");
+        // The now-playing row doing its job on the same bar: a playing
+        // track's title - a long one, truncated to the row's budget and
+        // fitted - above its artist caption, then the graceful empty
+        // state again: nothing playing, nothing stale. Without the
+        // desktop receiver every poll is empty, so the shipped frame is
+        // the dim `Nothing playing` state exactly as a missing helper
+        // leaves it.
+        assert!(
+            deck.now_playing_tick(Some(crate::now_playing::Feed::Playing(
+                crate::now_playing::Track {
+                    title: "Lucky Star Episode 1 [English Dubbed]".into(),
+                    artist: Some("Weaban".into()),
+                },
+            )))
+        );
+        render(&mut deck, "implemented-media-playing.png");
+        assert!(deck.now_playing_tick(Some(crate::now_playing::Feed::Idle)));
         // The media bar's visualizer button: off by default with only its
         // glyph-and-Viz label group, then expanded into the full-bar view
         // with live monitor levels, then Off returning the plain media
@@ -1316,20 +1368,27 @@ DoublePressSwitchLayers = 200
             })
             .collect();
         assert_eq!(positions, vec![3, 4, 5, 6]);
-        // The media bar keeps its existing controls and gains exactly one
-        // new button at the end: the opt-in music visualizer, off by
-        // default every time.
+        // The media bar keeps its existing controls and gains two
+        // buttons: the now-playing row after the transport cluster, and
+        // the opt-in music visualizer at the end, off by default every
+        // time.
         let media = layout
             .layers
             .iter()
             .find(|layer| layer.name == "media")
             .unwrap();
-        assert_eq!(media.keys.len(), 6);
+        assert_eq!(media.keys.len(), 7);
         assert_eq!(media.keys[1].icon.as_deref(), Some("fast_rewind"));
         assert_eq!(media.keys[2].icon.as_deref(), Some("play_pause"));
         assert_eq!(media.keys[3].icon.as_deref(), Some("fast_forward"));
-        assert_eq!(media.keys[4].action, ButtonAction::VolumeSlider);
-        assert_eq!(media.keys[4].stretch, Some(3));
+        let now_playing = &media.keys[4];
+        assert_eq!(now_playing.now_playing, Some(true));
+        assert_eq!(now_playing.stretch, Some(2));
+        assert_eq!(now_playing.action, ButtonAction::Keys(vec![]));
+        assert_eq!(now_playing.text, None);
+        assert_eq!(now_playing.icon, None);
+        assert_eq!(media.keys[5].action, ButtonAction::VolumeSlider);
+        assert_eq!(media.keys[5].stretch, Some(3));
         let viz = media.keys.last().unwrap();
         assert_eq!(viz.visualizer, Some(true));
         assert_eq!(viz.waveform, None);

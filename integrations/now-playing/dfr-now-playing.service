@@ -1,0 +1,15 @@
+[Unit]
+Description=Touch Bar desktop-session now-playing feed
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+ExecStart=%h/.local/bin/dfr-now-playing
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/share/omarchy/bin
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

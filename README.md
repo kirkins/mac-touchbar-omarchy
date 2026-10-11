@@ -35,7 +35,10 @@ with the closed-slider mute mark on the volume button),
 `implemented-recording-idle.png` in that directory, plus the quick-keys frame
 `implemented-more.png` (the More bar), the visualizer
 frames `implemented-media-viz.png` (the expanded full-bar view) and
-`implemented-media-off.png` (the restored plain media bar),
+`implemented-media-off.png` (the restored plain media bar), the
+now-playing frame `implemented-media-playing.png` (the same media bar
+with a playing track's title and artist caption; without the desktop
+receiver the row ships its dim `Nothing playing` state),
 and the per-band frames
 `implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
 `implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
@@ -394,6 +397,41 @@ level feed reuses the landed waveform line renderer and frame clock unchanged,
 needs no FFT dependency in the narrow desktop helper, and keeps the wire
 protocol a single `ok <level>` - a spectrum would have needed a new renderer,
 a larger protocol, and a math dependency for marginal gain at Touch Bar size.
+
+### Now playing text
+
+The media bar also shows what is actually sounding: a `NowPlaying = true`
+button between the transport controls and the volume slider renders the
+playing track's title, and the artist as a small caption beneath it when
+the player reports one. Long text is truncated to the row's budgets (32
+characters for the title, 24 for the artist, each with an ellipsis) and
+then fitted to the button like every other label, so an epic title never
+overflows the row or shrinks past reading. The button is display-only:
+taps are consumed without firing any key.
+
+```toml
+{ NowPlaying = true, Stretch = 2 }  # on the media bar
+```
+
+Every poll replaces the whole row, so it can never hold a stale track: a
+track change lands within about a second, and a player that pauses or
+stops clears the row instead of leaving the last song behind. When
+nothing is playing, or metadata is unavailable, the row rests on a dim
+`Nothing playing` label - never a broken row. The feed is the optional
+[desktop-session receiver](integrations/now-playing/README.md):
+`dfr-now-playing` reads the session bus's MPRIS players (preferring one
+that reports `Playing`), strips control and format characters from the
+metadata, and answers one-shot requests over the same abstract AF_UNIX
+and kernel peer-UID boundary as the volume, brightness, voice, and
+visualizer receivers. Without it the row stays in its empty state and
+the daemon logs one line per arm
+(`now-playing receiver unavailable; install and enable
+integrations/now-playing/dfr-now-playing`), so a missing install is
+diagnosable from the journal like every other helper. The poll runs at
+one request per second and only while a now-playing bar is displayed -
+metadata changes on the scale of songs, not frames - so the cost is a
+handful of session-bus property reads, no stream, capture, or
+subprocess.
 
 ## Time-of-day background
 

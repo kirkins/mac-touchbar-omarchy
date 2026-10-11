@@ -1,0 +1,156 @@
+#!/usr/bin/python3
+"""Narrow desktop-session receiver for the Touch Bar now-playing row."""
+
+import os
+import re
+import signal
+import socket
+import struct
+import sys
+import threading
+
+import dbus
+
+ACTIONS = frozenset(("get",))
+MPRIS_PREFIX = "org.mpris.MediaPlayer2"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+PLAYER_IFACE = MPRIS_PREFIX + ".Player"
+# Display text caps shared with the daemon's parser: long enough for any
+# real title, short enough that the row never sees absurd text.
+MAX_FIELD_CHARS = 120
+# Characters with no place in display text: control characters, the
+# protocol's field separator, and format characters a real library
+# sometimes ships (a soft hyphen arrived inside an artist name).
+STRIPPED = re.compile(r"[\x00-\x1f\x7f\u00ad\u200b-\u200f\u2028\u2029\ufeff]")
+
+
+def sanitize(text, cap=MAX_FIELD_CHARS):
+    """Reduce arbitrary metadata to single-line display text."""
+    cleaned = STRIPPED.sub("", str(text))
+    collapsed = " ".join(cleaned.split())
+    return collapsed[:cap]
+
+
+def session_bus():
+    return dbus.SessionBus()
+
+
+def metadata_field(meta, key):
+    """One metadata entry as display text: lists join, scalars stringify,
+    and anything missing comes back empty."""
+    value = meta.get(key)
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(sanitize(part) for part in value if str(part)).strip(", ")
+    return sanitize(value)
+
+
+def player_state(bus, name):
+    """One MPRIS player's (status, title, artist), or None when the
+    player cannot be read - a dying player is skipped, never fatal."""
+    try:
+        proxy = bus.get_object(name, MPRIS_PATH)
+        props = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+        status = str(props.Get(PLAYER_IFACE, "PlaybackStatus"))
+        meta = props.Get(PLAYER_IFACE, "Metadata") or {}
+        return status, metadata_field(meta, "xesam:title"), \
+            metadata_field(meta, "xesam:artist")
+    except (dbus.DBusException, ValueError, TypeError):
+        return None
+
+
+def current_track(bus):
+    """The track to show as (state, title, artist), or None when no
+    MPRIS player offers a usable title.
+
+    A player that reports Playing wins; otherwise the first player with
+    usable metadata stands, so its paused or stopped state is exactly
+    what the daemon sees - the row's empty state, never a stale track.
+    A bus failure raises; a dying player is only ever skipped.
+    """
+    manager = bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+    names = list(manager.ListNames())
+    players = (player_state(bus, name) for name in names
+               if name.startswith(MPRIS_PREFIX))
+    candidates = [player for player in players if player and player[1]]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda player: player[0] != "Playing")
+    status, title, artist = candidates[0]
+    return status.lower(), title, artist
+
+
+def reply(request, bus):
+    """The one-shot wire answer for one request line."""
+    if request not in ACTIONS:
+        return "error"
+    try:
+        track = current_track(bus)
+    except (dbus.DBusException, OSError, ValueError, TypeError, AttributeError):
+        # Any per-request failure answers error: never a stale or half
+        # reply, and the daemon's next poll simply tries again.
+        return "error"
+    if track is None:
+        return "idle"
+    state, title, artist = track
+    if state not in ("playing", "paused", "stopped"):
+        return "idle"
+    return "ok " + state + "\x1f" + title + "\x1f" + artist
+
+
+def handle(connection, allowed_uids):
+    with connection:
+        connection.settimeout(3)
+        try:
+            _, uid, _ = struct.unpack(
+                "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid not in allowed_uids:
+                raise OSError("Caller UID is not permitted")
+            request = bytearray()
+            while len(request) <= 32:
+                chunk = connection.recv(33 - len(request))
+                if not chunk:
+                    break
+                request.extend(chunk)
+            # One bus connection per request: python-dbus connections are
+            # not thread-safe to share, and a stateless read needs no
+            # shared state to go stale.
+            answer = reply(request.decode("ascii", "replace").strip(), session_bus())
+        except (OSError, ValueError, AttributeError, dbus.DBusException) as error:
+            print(str(error), file=sys.stderr, flush=True)
+            answer = "error"
+        try:
+            connection.sendall(answer.encode("ascii"))
+        except OSError:
+            pass
+
+
+def serve(address=None, allowed_uids=None):
+    address = address or "\0dfr-now-playing-" + str(os.getuid())
+    allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(address)
+        listener.listen(8)
+        print("Now-playing receiver ready", flush=True)
+        while True:
+            connection, _ = listener.accept()
+            threading.Thread(target=handle, args=(connection, allowed_uids),
+                             daemon=True).start()
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    # Fail fast when the session bus is unreachable: the receiver has no
+    # purpose there, and systemd restarts it alongside the session.
+    try:
+        session_bus()
+    except dbus.DBusException as error:
+        print(str(error), file=sys.stderr, flush=True)
+        return 1
+    serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

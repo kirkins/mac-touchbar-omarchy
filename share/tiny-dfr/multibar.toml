@@ -46,9 +46,27 @@ Keys = [
     { Icon = "fast_rewind", Action = "PreviousSong" },
     { Icon = "play_pause", Action = "PlayPause" },
     { Icon = "fast_forward", Action = "NextSong" },
+    { NowPlaying = true, Stretch = 2 },
     { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
     { Visualizer = true, Accent = "blue", Stretch = 2 },
 ]
+
+# Now playing: the media bar shows what is actually sounding - the playing
+# track's title, and the artist as a small caption beneath it when the
+# player reports one - with long text truncated to the row's budgets and
+# then fitted, so an epic title never overflows the row or shrinks past
+# reading. Every
+# poll replaces the whole row: a track change lands within about a second,
+# and a player that pauses or stops clears the row instead of leaving the
+# last song behind. When nothing is playing, or metadata is unavailable,
+# the row rests on a dim `Nothing playing` label - never a stale track,
+# never a broken row. The feed is the optional desktop-session helper in
+# integrations/now-playing (see README): it reads the session bus's MPRIS
+# players and answers one-shot requests over the same abstract AF_UNIX and
+# peer-UID boundary as the volume, brightness, voice, and visualizer
+# receivers; without it the row stays in its empty state and the daemon
+# logs one line per arm so the missing install stays diagnosable. The
+# button is display-only: taps are consumed without firing any key.
 
 # Music visualizer: the media bar's last button is off by default - it
 # shows a small waveform glyph beside a centered Viz label until tapped.
