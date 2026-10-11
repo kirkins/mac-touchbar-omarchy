@@ -1,0 +1,13 @@
+[Unit]
+Description=Touch Bar desktop-session screenshot receiver
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/touchbar-capture serve
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

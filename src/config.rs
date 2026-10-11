@@ -1259,7 +1259,7 @@ DoublePressSwitchLayers = 200
         assert_eq!(
             more.keys[1].action,
             ButtonAction::CommandLayer {
-                command: "omarchy capture screenshot".into(),
+                command: "touchbar-capture-user screenshot".into(),
                 layer: "home".into()
             }
         );
@@ -1418,7 +1418,7 @@ Keys = [\n\
         assert_eq!(
             screenshot.action,
             ButtonAction::CommandLayer {
-                command: "omarchy capture screenshot".into(),
+                command: "touchbar-capture-user screenshot".into(),
                 layer: "home".into()
             }
         );
@@ -1429,9 +1429,9 @@ Keys = [\n\
         // without a Layer switch stay on the bar, and the visible
         // home-targeting buttons keep the synthesized Home button from
         // duplicating the explicit one.
-        let screenshot_line = "    { Text = \"Screenshot\", Action = { Command = \"omarchy capture screenshot\", Layer = \"home\" } },\n";
+        let screenshot_line = "    { Text = \"Screenshot\", Action = { Command = \"touchbar-capture-user screenshot\", Layer = \"home\" } },\n";
         let with_own_keys = concat!(
-            "    { Text = \"Screenshot\", Action = { Command = \"omarchy capture screenshot\", Layer = \"home\" } },\n",
+            "    { Text = \"Screenshot\", Action = { Command = \"touchbar-capture-user screenshot\", Layer = \"home\" } },\n",
             "    { Icon = \"search\", Action = { Command = \"my-quick-tool\" } },\n",
             "    { Text = \"Lock\", Accent = \"amber\", Action = { Command = \"loginctl lock-session\" } },\n",
         );

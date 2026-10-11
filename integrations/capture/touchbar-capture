@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+"""Desktop-session screenshot receiver for the Touch Bar's quick keys.
+
+Runs in the graphical session, where the Omarchy capture flow needs to run:
+the daemon's quick keys execute as its unprivileged sandboxed user, which
+cannot reach the compositor, Wayland, or the session bus at all. Requests
+select a fixed action; no bytes from the wire are ever executed.
+"""
+
+import argparse
+import json
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+ACTIONS = frozenset(("screenshot",))
+
+
+class CaptureError(Exception):
+    pass
+
+
+def notify(message):
+    try:
+        subprocess.run(["notify-send", "-t", "2500", "Touch Bar capture", message],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+class Capture:
+    """Runs the session's own screenshot flow, one at a time.
+
+    The picker is interactive and can stay open for minutes, so the flow is
+    launched detached (its own session) and the receiver only watches for an
+    immediate nonzero exit - the observable signature of a broken session
+    launcher rather than a cancelled or ongoing capture.
+    """
+
+    def __init__(self, launcher=None):
+        self.launcher = list(launcher or ["omarchy", "capture", "screenshot"])
+        self.capture = None
+
+    def dispatch(self, action):
+        if action not in ACTIONS:
+            raise CaptureError("Invalid action")
+        if self.capture is not None and self.capture.poll() is None:
+            raise CaptureError("A capture is already running")
+        try:
+            self.capture = subprocess.Popen(
+                self.launcher,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            self.capture = None
+            raise CaptureError("Cannot launch " + " ".join(self.launcher))
+        # A launcher that dies nonzero within the grace window never showed
+        # the picker; report it instead of acknowledging a dead capture.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if self.capture.poll() is not None:
+                if self.capture.returncode != 0:
+                    raise CaptureError(
+                        f"Capture exited immediately ({self.capture.returncode})")
+                break
+            time.sleep(0.05)
+
+
+class Receiver:
+    def __init__(self, handler, address=None, allowed_uids=None):
+        self.handler = handler
+        self.address = address or "\0dfr-capture-" + str(os.getuid())
+        self.allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+        self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(4)
+
+    def handle(self, connection):
+        with connection:
+            connection.settimeout(2)
+            try:
+                _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if uid not in self.allowed_uids:
+                    raise CaptureError("Caller UID is not permitted")
+                request = bytearray()
+                while len(request) < 32:
+                    chunk = connection.recv(32 - len(request))
+                    if not chunk:
+                        break
+                    request.extend(chunk)
+                action = request.decode("ascii")
+                if action not in ACTIONS:
+                    raise CaptureError("Invalid action")
+                if not self.lock.acquire(blocking=False):
+                    raise CaptureError("Capture is busy")
+                try:
+                    self.handler(action)
+                finally:
+                    self.lock.release()
+                reply = {"ok": True}
+            except (CaptureError, OSError, ValueError) as error:
+                message = str(error) if isinstance(error, CaptureError) else "Capture operation failed"
+                print(message, file=sys.stderr, flush=True)
+                notify(message)
+                reply = {"ok": False, "error": message}
+            try:
+                connection.sendall(json.dumps(reply).encode())
+            except OSError:
+                pass
+
+    def serve(self):
+        def worker(connection):
+            try:
+                self.handle(connection)
+            finally:
+                self.slots.release()
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(self.address)
+            server.listen(4)
+            print("Capture receiver ready", flush=True)
+            while True:
+                connection, _ = server.accept()
+                if not self.slots.acquire(blocking=False):
+                    connection.close()
+                    continue
+                threading.Thread(target=worker, args=(connection,), daemon=True).start()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("serve",))
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    Receiver(Capture().dispatch).serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

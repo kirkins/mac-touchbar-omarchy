@@ -97,12 +97,15 @@ Keys = [
 # off to stay here and fire several keys in a row; the Home button always
 # leaves without running anything. Labels, glyphs, accents, and Stretch
 # work as on any bar, and commands run through /bin/sh like any command
-# button (see the notes above and the README).
+# button (see the notes above and the README). Commands that need the
+# desktop session - like the shipped Screenshot key - must go through a
+# session receiver client such as touchbar-capture-user, because the
+# daemon's unprivileged sandbox cannot reach the compositor itself.
 [[Layers]]
 Name = "more"
 Keys = [
     { Text = "Home", Action = { Layer = "home" } },
-    { Text = "Screenshot", Action = { Command = "omarchy capture screenshot", Layer = "home" } },
+    { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
 ]
 
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,

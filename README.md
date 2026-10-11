@@ -250,17 +250,29 @@ action runs a shell command:
 Name = "more"
 Keys = [
     { Text = "Home", Action = { Layer = "home" } },
-    { Text = "Screenshot", Action = { Command = "omarchy capture screenshot", Layer = "home" } },
+    { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
 ]
 ```
 
-The shipped example fires the Omarchy screenshot flow and returns home in
-one press. An entry without `Layer` stays on the bar so several keys can run
-in a row, and the leading `Home` button always leaves without running
-anything. Adding a quick key is a config edit, not a code change; labels,
-glyphs, accents, and `Stretch` work as on any bar, and command execution
-follows the command-button rules above (detached, at most one invocation per
-command string, failures journalled).
+The shipped example opens the Omarchy screenshot picker and returns home in
+one press. It cannot run the capture flow directly: the daemon's unprivileged
+sandbox has no session environment and cannot reach the compositor's Wayland
+socket, so the flow would silently no-op there (the flow's own failure path
+exits 0, so not even the journal would show it). Instead the key calls a thin
+client that hands the request to a small receiver running in the desktop
+session, which runs the real `omarchy capture screenshot` there - the same
+pattern as the voice integration below, with the command fixed on the
+session side and never taken from the wire. The optional private
+[desktop-session capture integration](integrations/capture/README.md)
+supplies that client and receiver; without it the press still returns home
+and the failed command is journalled. An entry without `Layer` stays on the
+bar so several keys can run in a row, and the leading `Home` button always
+leaves without running anything. Adding a quick key is a config edit, not a
+code change; labels, glyphs, accents, and `Stretch` work as on any bar, and
+command execution follows the command-button rules above (detached, at most
+one invocation per command string, failures journalled). A quick key that
+needs the desktop session must go through a session receiver client like
+this one.
 
 ### Live recording waveform
 
