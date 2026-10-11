@@ -3,6 +3,15 @@ use cairo::Context;
 use input_linux::Key;
 use serde::Deserialize;
 
+/// The bar's one primary label size, in pixels: every single-line button
+/// label - Text and clock buttons, `Battery N/A`, the waveform widgets'
+/// `Viz` and `No feed` labels - renders at this size, shrunk only where
+/// the established fit logic already shrinks. One size for same-class
+/// labels keeps the bar coherent; any smaller rendering is deliberate
+/// hierarchy and documented at its own site (the battery's caption and
+/// percent pair, the recording timer's readout).
+pub const LABEL_FONT: f64 = 28.0;
+
 /// Semantic accents keep the deck readable without depending on color alone.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

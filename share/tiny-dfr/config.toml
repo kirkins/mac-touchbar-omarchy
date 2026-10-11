@@ -196,7 +196,8 @@ PrimaryLayerKeys = [
     # Example of the media bar's opt-in music visualizer (see the media
     # layer in share/tiny-dfr/multibar.toml):
     # { Visualizer = true, Stretch = 2 }
-    # This displays a centered Viz label until tapped; a tap expands it
+    # This displays a small waveform glyph beside a centered Viz label
+    # until tapped; a tap expands it
     # into a dedicated full-bar view - the drawn line rippling with the
     # music playing on the default output, spanning the whole bar except
     # one Off button that returns this exact bar. Off by default every

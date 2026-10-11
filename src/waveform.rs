@@ -31,7 +31,8 @@
 //!
 //! The same widget, in [`Mode::Music`], is the media bar's opt-in music
 //! visualizer: it drops the recording dot and duration timer, draws the
-//! graph across the whole button, and shows a centered `Viz` label while
+//! graph across the whole button, and shows a small waveform glyph
+//! beside a centered `Viz` label while
 //! its bar's visualizer is off - the visualizer never shows by default.
 //! Tapping that button expands it into the deck's full-bar visualizer
 //! view - the graph spanning the whole Touch Bar except one Off button -
@@ -83,6 +84,15 @@ const DOT_R_BASE: f64 = 3.5;
 const DOT_R_SPAN: f64 = 3.0;
 /// Centered label the music visualizer shows while its session is off.
 const VIZ_LABEL: &str = "Viz";
+/// The idle `Viz` button's small waveform glyph: five round-capped bars
+/// symmetric about the button's vertical center, tallest in the middle,
+/// drawn in the deck's line stroke beside the label. A glanceable mark
+/// of what the button opens; purely visual, no behavior change.
+const VIZ_GLYPH_BARS: [f64; 5] = [7.0, 13.0, 17.0, 13.0, 7.0];
+/// Center-to-center spacing of the glyph's bars.
+const VIZ_GLYPH_STEP: f64 = 6.0;
+/// Gap between the glyph's right ink edge and the label's pen origin.
+const VIZ_GLYPH_GAP: f64 = 9.0;
 /// Label the widget paints while its feed is dead, in the deck's red
 /// warning accent: a source that cannot be observed must never read as
 /// mere silence.
@@ -95,6 +105,10 @@ const DEAD_GLYPH_R: f64 = 8.5;
 const TEXT_GAP: f64 = 12.0;
 /// Width reserved on the left for dot plus duration label.
 const TIMER_BLOCK: f64 = 86.0;
+/// The recording timer's readout size, deliberately below the bar's
+/// primary label size ([`crate::appearance::LABEL_FONT`]): the duration
+/// shares a reserved block with the pulsing dot and the always-drawn
+/// graph, so a full-size label would collide with the wave beside it.
 const TIMER_FONT: f64 = 22.0;
 /// Bars and line keep this much clearance from the button's inset edges.
 const BARS_MARGIN: f64 = 10.0;
@@ -200,7 +214,8 @@ pub enum Style {
 /// What a [`WaveformWidget`] visualizes: the microphone on the recording
 /// layer, or the media layer's music visualizer. The music mode drops
 /// the recording dot and duration timer, spans the whole button with the
-/// graph, and shows a centered `Viz` label while its session is off.
+/// graph, and shows a small waveform glyph beside a centered `Viz`
+/// label while its session is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Mic,
@@ -353,6 +368,16 @@ pub fn layout_music(width: f64, height: f64) -> Layout {
         bar_max_half: (height / 2.0 - BARS_MARGIN).max(MIN_BAR),
         slot_w: bars_width / HISTORY as f64,
     }
+}
+
+/// Button-local x positions of the idle `Viz` button's parts: the first
+/// glyph bar's stroke center and the label's pen origin, laid out as one
+/// horizontally centered group - glyph ink width, gap, label width.
+/// Kept pure so the group's centering is testable without a context.
+fn viz_idle_layout(width: f64, text_width: f64) -> (f64, f64) {
+    let glyph_w = (VIZ_GLYPH_BARS.len() - 1) as f64 * VIZ_GLYPH_STEP + LINE_WIDTH;
+    let left = ((width - (glyph_w + VIZ_GLYPH_GAP + text_width)) / 2.0).max(0.0);
+    (left + LINE_WIDTH / 2.0, left + glyph_w + VIZ_GLYPH_GAP)
 }
 
 /// The mirrored bar one history sample draws: `(x, y, width, height)`.
@@ -807,11 +832,13 @@ impl WaveformWidget {
     /// The red `No feed` dead-feed label, vertically centered on `cy`:
     /// left-aligned at `x` for the microphone widget, or centered across
     /// `width` - mirroring the `Viz` label's placement - for the music
-    /// visualizer.
+    /// visualizer, both at the bar's primary label size.
     fn draw_dead_label(c: &Context, x: f64, width: f64, cy: f64, center: bool) {
         let (r, g, b) = ButtonAccent::Red.rgb();
         c.set_source_rgb(r, g, b);
-        c.set_font_size(TIMER_FONT);
+        // The dead state's alert label is a primary button label: the
+        // bar's shared label size, not the timer's smaller readout size.
+        c.set_font_size(crate::appearance::LABEL_FONT);
         let extents = c.text_extents(DEAD_LABEL).unwrap();
         let x = if center {
             x + (width - extents.width()) / 2.0 - extents.x_bearing()
@@ -825,9 +852,11 @@ impl WaveformWidget {
     /// The music visualizer's chrome-free rendering: the same line or bar
     /// graph across the whole button while a session runs and the feed is
     /// live, a dim flat baseline while on against a quiet healthy feed, a
-    /// red `No feed` label while the feed is dead, and a centered `Viz`
-    /// label while off - the visualizer is opt-in every time its layer is
-    /// entered, and the label keeps the control discoverable.
+    /// red `No feed` label while the feed is dead, and - while off - a
+    /// small waveform glyph beside the centered `Viz` label, the pair one
+    /// centered group at the bar's primary label size. The visualizer is
+    /// opt-in every time its layer is entered, and the label keeps the
+    /// control discoverable.
     fn render_music(
         &self,
         c: &Context,
@@ -840,11 +869,23 @@ impl WaveformWidget {
         let layout = layout_music(width, height as f64);
         let cy = y_shift + layout.mid_y;
         if self.started.is_none() {
+            // Off: a small waveform glyph beside the `Viz` label, the pair
+            // centered as one group - the graph's purpose at a glance, at
+            // the same primary label size as the bar's text buttons.
             c.set_source_rgb(1.0, 1.0, 1.0);
-            c.set_font_size(TIMER_FONT);
+            c.set_font_size(crate::appearance::LABEL_FONT);
             let extents = c.text_extents(VIZ_LABEL).unwrap();
+            let (first_bar, text_x) = viz_idle_layout(width, extents.width());
+            c.set_line_width(LINE_WIDTH);
+            c.set_line_cap(LineCap::Round);
+            for (i, bar) in VIZ_GLYPH_BARS.iter().enumerate() {
+                let x = left + first_bar + VIZ_GLYPH_STEP * i as f64;
+                c.move_to(x, cy - bar / 2.0);
+                c.line_to(x, cy + bar / 2.0);
+            }
+            c.stroke().unwrap();
             c.move_to(
-                left + (width - extents.width()) / 2.0 - extents.x_bearing(),
+                left + text_x - extents.x_bearing(),
                 cy - extents.y_bearing() - extents.height() / 2.0,
             );
             c.show_text(VIZ_LABEL).unwrap();
@@ -2319,6 +2360,35 @@ mod tests {
     }
 
     #[test]
+    fn the_idle_viz_group_centers_glyph_and_label_as_one() {
+        // The group math is symmetric: the left margin before the glyph
+        // equals the right margin after the label, and the label follows
+        // the glyph by the configured gap.
+        let text_width = 47.5;
+        let glyph_w = (VIZ_GLYPH_BARS.len() - 1) as f64 * VIZ_GLYPH_STEP + LINE_WIDTH;
+        let (first_bar, text_x) = viz_idle_layout(570.0, text_width);
+        let left_margin = first_bar - LINE_WIDTH / 2.0;
+        let right_margin = 570.0 - (text_x + text_width);
+        assert!(
+            (left_margin - right_margin).abs() < 0.5,
+            "the idle group is not centered: {left_margin} vs {right_margin}"
+        );
+        assert!(
+            (text_x - (first_bar - LINE_WIDTH / 2.0 + glyph_w) - VIZ_GLYPH_GAP).abs() < 0.001,
+            "the label does not follow the glyph by the configured gap"
+        );
+        // The bars are symmetric about the tallest middle bar.
+        let half = VIZ_GLYPH_BARS.len() / 2;
+        for i in 0..half {
+            assert_eq!(
+                VIZ_GLYPH_BARS[i],
+                VIZ_GLYPH_BARS[VIZ_GLYPH_BARS.len() - 1 - i]
+            );
+        }
+        assert_eq!(VIZ_GLYPH_BARS[half], 17.0);
+    }
+
+    #[test]
     fn the_music_visualizer_shows_its_off_label_and_spans_the_whole_button() {
         let render = |viz: &WaveformWidget, now: Instant| {
             let mut surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
@@ -2342,15 +2412,83 @@ mod tests {
             }
             columns
         };
+        let ink_bounds = |data: &[u8], x_range: (usize, usize)| {
+            let stride = 570 * 4;
+            let mut rows = (60usize, 0usize);
+            for y in 0..60usize {
+                if (x_range.0..x_range.1).any(|x| {
+                    let i = y * stride + x * 4;
+                    data[i].max(data[i + 1]).max(data[i + 2]) > 40
+                }) {
+                    rows = (rows.0.min(y), rows.1.max(y + 1));
+                }
+            }
+            rows
+        };
         let now = Instant::now();
 
-        // Off: a centered Viz label - ink clustered mid-button, nowhere
-        // near the edges, and visibly fewer lit columns than any live line.
+        // Off: a small waveform glyph beside the centered Viz label, the
+        // pair one centered group - ink clustered mid-button, nowhere
+        // near the edges, and visibly fewer lit columns than any live
+        // line.
         let off = WaveformWidget::new_music(Style::Line);
         let off_frame = render(&off, now);
         assert!(off_frame.iter().any(|b| *b != 0), "off label drew nothing");
         let lit = lit_columns(&off_frame);
         assert!(lit < 120, "the off label must be a small centered label");
+        // The label rides the bar's shared primary label size, not the
+        // timer's smaller readout size: in the label's own columns the
+        // ink band is a full-size text height.
+        {
+            let surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
+            let c = Context::new(&surface).unwrap();
+            c.set_font_size(crate::appearance::LABEL_FONT);
+            let extents = c.text_extents(VIZ_LABEL).unwrap();
+            let (_, text_x) = viz_idle_layout(570.0, extents.width());
+            let text_left = (text_x + extents.x_bearing()).floor() as usize;
+            let text_right = (text_x + extents.width()).ceil() as usize;
+            let (top, bottom) = ink_bounds(&off_frame, (text_left, text_right));
+            let cap_height = 0.72 * crate::appearance::LABEL_FONT;
+            assert!(
+                (bottom - top) as f64 >= cap_height - 2.0,
+                "the Viz label renders smaller than the bar's label size: {} rows",
+                bottom - top
+            );
+            // The glyph sits left of the label with its gap: ink starts
+            // at the group's first bar, not at the label.
+            let leftmost = {
+                let stride = 570 * 4;
+                (0..570usize)
+                    .find(|x| {
+                        (0..60usize).any(|y| {
+                            let i = y * stride + x * 4;
+                            off_frame[i].max(off_frame[i + 1]).max(off_frame[i + 2]) > 40
+                        })
+                    })
+                    .unwrap()
+            };
+            let (first_bar, _) = viz_idle_layout(570.0, extents.width());
+            let bar_left = first_bar - LINE_WIDTH / 2.0;
+            assert!(
+                leftmost as f64 >= bar_left - 1.0 && leftmost as f64 <= bar_left + 2.0,
+                "off-button ink does not start at the glyph's first bar: {leftmost}"
+            );
+            assert!(
+                (text_left as f64) - leftmost as f64
+                    > VIZ_GLYPH_STEP * (VIZ_GLYPH_BARS.len() - 1) as f64,
+                "no glyph room left of the label"
+            );
+        }
+        // The glyph and label share the vertical center: the off group's
+        // ink band straddles the button's middle line.
+        {
+            let (top, bottom) = ink_bounds(&off_frame, (0, 570));
+            let midline = (top + bottom) as f64 / 2.0;
+            assert!(
+                (midline - 30.0).abs() <= 4.0,
+                "the idle glyph+label group is off the button's vertical center: {midline}"
+            );
+        }
 
         // On with live music: the line spans the whole button, including
         // the left third where the microphone widget reserves its timer.

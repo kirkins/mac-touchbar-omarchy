@@ -909,9 +909,9 @@ Keys = [{ Text = "F1", Action = "F1" }]
         deck.switch_to(deck.names["media"], &mut |_, _| {});
         render(&mut deck, "implemented-media.png");
         // The media bar's visualizer button: off by default with only its
-        // centered Viz label, then expanded into the full-bar view with
-        // live monitor levels, then Off returning the plain media bar -
-        // each exported for review.
+        // glyph-and-Viz label group, then expanded into the full-bar view
+        // with live monitor levels, then Off returning the plain media
+        // bar - each exported for review.
         let viz_index = deck.current().visualizer.unwrap();
         let spans = deck.current().layout_spans(2008, 0);
         let viz_x = (spans[viz_index].left + spans[viz_index].right) / 2.0;

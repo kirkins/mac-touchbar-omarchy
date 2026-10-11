@@ -51,7 +51,8 @@ Keys = [
 ]
 
 # Music visualizer: the media bar's last button is off by default - it
-# shows only a centered Viz label until tapped. A tap expands it into a
+# shows a small waveform glyph beside a centered Viz label until tapped.
+# A tap expands it into a
 # dedicated full-bar view: the same drawn line the recording layer uses,
 # rippling with the music actually playing on the default output, filling
 # the whole bar except one Off button at the end that toggles back to this

@@ -795,6 +795,12 @@ impl Button {
                 let (capacity, state) = (source.capacity, source.state);
                 c.save().unwrap();
                 let label = battery.label();
+                // A device label turns this button deliberately two-tier,
+                // smaller than the bar's primary label size: the 12 px
+                // caption names the battery up top, and the 24 px percent
+                // pairs with a 32 px icon below. Without a label the
+                // percent alone rides at the battery composition's own
+                // size beside the same icon.
                 let icon_size = if label.is_some() {
                     32.0
                 } else {
@@ -806,7 +812,7 @@ impl Button {
                     height as f64 / 2.0
                 };
                 if let Some(label) = label {
-                    c.set_font_size(12.0);
+                    c.set_font_size(12.0); // The caption tier.
                     let extents = c.text_extents(label).unwrap();
                     let scale = ((button_width as f64 - 8.0).max(1.0) / extents.width()).min(1.0);
                     c.set_font_size(12.0 * scale);
@@ -1100,7 +1106,7 @@ impl FunctionLayer {
             c.paint().unwrap();
         }
         c.set_font_face(&config.font_face);
-        c.set_font_size(28.0);
+        c.set_font_size(appearance::LABEL_FONT);
 
         // The slider no longer covers a span it was drawn over: either it
         // collapsed, or it moved to another cluster. Erase that whole column

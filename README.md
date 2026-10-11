@@ -348,8 +348,9 @@ feed repaints nothing but the once-a-second timer tick.
 
 ### Media visualizer
 
-The media bar ends with an opt-in music visualizer: a button that shows only a
-centered `Viz` label until tapped. A tap expands it into a dedicated full-bar
+The media bar ends with an opt-in music visualizer: a button that shows a
+small waveform glyph beside a centered `Viz` label until tapped. A tap
+expands it into a dedicated full-bar
 view - the same drawn line the recording layer uses, flat at rest, rippling
 into a smooth wave with the music actually playing on the default output -
 spanning the whole Touch Bar except one `Off` button at the end that toggles
