@@ -16,6 +16,14 @@
 //! layer's buttons - drops one kibble the pet walks over and munches, while
 //! taps on buttons pass through untouched. The pet pauses while
 //! any other layer is displayed and resumes with its state intact.
+//!
+//! The pet also lives in the time of day, mirroring the hour bands of the
+//! time-of-day background tint: mornings bring zoomies (short idles, long
+//! roams, few naps) over a pale sky with a low climbing sun, evenings wind
+//! down (longer idles, likelier naps) under a warm dusk with the sun
+//! sinking low, and at night a well-fed pet mostly sleeps beneath a moon
+//! and stars where the sun stood by day. Hunger still overrides any
+//! sleepiness, exactly as by day.
 
 use cairo::Context;
 use rand::Rng;
@@ -48,12 +56,15 @@ const BRIEF_IDLE_MS: u64 = 700;
 /// Flee distance after a startle.
 const FLEE_PX: f64 = 140.0;
 
-/// Bar geometry and visibility for one tick. `active` gates the pet to its
-/// own layer, the only place it is allowed to wander and drawn.
+/// Bar geometry, visibility, and local hour for one tick. `active` gates
+/// the pet to its own layer, the only place it is allowed to wander and
+/// drawn; `hour` (local, 0-23) selects the part of the day the pet's mood
+/// and scene follow.
 pub struct Bar {
     pub width: f64,
     pub height: f64,
     pub active: bool,
+    pub hour: u32,
 }
 
 /// An occupied horizontal span of the bar in layout coordinates mirroring
@@ -128,15 +139,97 @@ impl PetEnergy {
     }
 }
 
-/// Movement and metabolism parameters per energy dial position.
+/// The part of the day the pet is living in, following the same local-hour
+/// boundaries as the shipped default time-of-day background bands (morning
+/// from 5, day from 12, evening from 17, night from 21) so the pet's mood
+/// and scene complement the strip's tint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DayPart {
+    Morning,
+    #[default]
+    Day,
+    Evening,
+    Night,
+}
+
+impl DayPart {
+    /// Map a local hour (0-23) onto the day part covering it, wrapping
+    /// past midnight into night.
+    pub fn from_hour(hour: u32) -> Self {
+        match hour {
+            5..=11 => Self::Morning,
+            12..=16 => Self::Day,
+            17..=20 => Self::Evening,
+            _ => Self::Night,
+        }
+    }
+
+    /// How this part bends the pet's rhythm on top of the energy dial:
+    /// mornings are frisky, evenings wind down, nights are for sleeping.
+    fn mood(self) -> Mood {
+        match self {
+            Self::Morning => Mood {
+                idle: 0.6,
+                nap: 0.7,
+                nap_chance: 0.5,
+                wander: 1.15,
+            },
+            Self::Day => Mood::EVEN,
+            Self::Evening => Mood {
+                idle: 1.5,
+                nap: 1.4,
+                nap_chance: 1.7,
+                wander: 0.7,
+            },
+            Self::Night => Mood {
+                idle: 2.5,
+                nap: 3.0,
+                nap_chance: 4.0,
+                wander: 0.25,
+            },
+        }
+    }
+}
+
+/// Per-part multipliers bending the cadence: how long idles and naps run,
+/// how likely a nap is, and how readily the pet wanders.
+struct Mood {
+    idle: f64,
+    nap: f64,
+    nap_chance: f64,
+    wander: f64,
+}
+
+impl Mood {
+    /// The neutral midday tempo: the cadence exactly as configured.
+    const EVEN: Mood = Mood {
+        idle: 1.0,
+        nap: 1.0,
+        nap_chance: 1.0,
+        wander: 1.0,
+    };
+}
+
+/// Movement and metabolism parameters per energy dial position; the part
+/// of the day scales the tempo fields on top of these.
+#[derive(Clone, Copy)]
 struct Cadence {
     step_ms: u64,
     px_per_step: f64,
     idle_ms: (u64, u64),
     nap_ms: (u64, u64),
     nap_chance: f64,
+    /// Chance an idle pet sets out wandering rather than sitting.
+    wander_chance: f64,
     /// Satiety lost per millisecond; rowdy pets burn through meals faster.
     decay_per_ms: f64,
+}
+
+/// Scale both ends of a duration range by `by`, capped at a quarter hour
+/// so no mood can park the pet for good.
+fn scale_range(range: (u64, u64), by: f64) -> (u64, u64) {
+    let scale = |ms: u64| ((ms as f64 * by).round() as u64).min(15 * 60_000);
+    (scale(range.0), scale(range.1))
 }
 
 const CALM: Cadence = Cadence {
@@ -145,6 +238,7 @@ const CALM: Cadence = Cadence {
     idle_ms: (900, 3200),
     nap_ms: (9000, 20000),
     nap_chance: 0.25,
+    wander_chance: 0.85,
     decay_per_ms: 1.0 / 3_600_000.0, // full to hungry in about an hour
 };
 
@@ -154,6 +248,7 @@ const ROWDY: Cadence = Cadence {
     idle_ms: (300, 1200),
     nap_ms: (6000, 12000),
     nap_chance: 0.12,
+    wander_chance: 0.85,
     decay_per_ms: 1.0 / 2_400_000.0,
 };
 
@@ -322,17 +417,33 @@ const OVERLAY_HEART: (f64, f64, f64) = (0.98, 0.35, 0.5);
 
 // The pet layer's backdrop: a blue sky above a green ground strip, with a
 // sun and clouds, painted only across the layer's open ground so the Home
-// button keeps its normal deck look.
+// button keeps its normal deck look. The scene follows the part of the
+// day: a pale morning sky with the sun climbing low on the left, the
+// plain day look, a warm dusk with the sun sinking low on the right, and
+// a dark night sky with a moon and stars instead of the sun.
 const CLOUD: &[&str] = &["..CCCC..", ".CCCCCC.", "CCCCCCCC"];
 const SUN: &[&str] = &["..YY..", ".YYYY.", "YYYYYY", "YYYYYY", ".YYYY.", "..YY.."];
+const MOON: &[&str] = &[".MMMM.", "MM....", "M.....", "M.....", "MM....", ".MMMM."];
+const STAR: &[&str] = &[".S.", "SSS", ".S."];
 const CLOUD_RGB: (f64, f64, f64) = (0.97, 0.99, 1.0);
 const SUN_RGB: (f64, f64, f64) = (1.0, 0.85, 0.25);
+const CLOUD_DUSK_RGB: (f64, f64, f64) = (0.98, 0.80, 0.68);
+const SUNSET_RGB: (f64, f64, f64) = (1.0, 0.58, 0.18);
+const MOON_RGB: (f64, f64, f64) = (0.90, 0.93, 0.99);
+const STAR_RGB: (f64, f64, f64) = (0.95, 0.96, 1.0);
 /// Fraction of the bar height where the ground strip begins; the pet's
 /// feet rest inside it.
 const GROUND_TOP: f64 = 0.80;
 const SKY_RGB: (f64, f64, f64) = (0.47, 0.72, 0.96);
 const GROUND_RGB: (f64, f64, f64) = (0.35, 0.68, 0.32);
 const GRASS_RGB: (f64, f64, f64) = (0.22, 0.50, 0.22);
+const MORNING_SKY_RGB: (f64, f64, f64) = (0.66, 0.80, 0.94);
+const EVENING_SKY_RGB: (f64, f64, f64) = (0.84, 0.60, 0.42);
+const EVENING_GROUND_RGB: (f64, f64, f64) = (0.30, 0.52, 0.27);
+const EVENING_GRASS_RGB: (f64, f64, f64) = (0.20, 0.38, 0.19);
+const NIGHT_SKY_RGB: (f64, f64, f64) = (0.07, 0.10, 0.21);
+const NIGHT_GROUND_RGB: (f64, f64, f64) = (0.12, 0.20, 0.14);
+const NIGHT_GRASS_RGB: (f64, f64, f64) = (0.08, 0.13, 0.09);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PetState {
@@ -377,6 +488,9 @@ pub struct PetManager {
     enabled: bool,
     variant: PetVariant,
     energy: PetEnergy,
+    /// The part of the day the pet is living in, taken from the bar's
+    /// local hour each tick; bends the cadence and picks the scene's look.
+    day_part: DayPart,
     visible: bool,
     placed: bool,
     state: PetState,
@@ -406,6 +520,7 @@ impl PetManager {
             enabled,
             variant,
             energy,
+            day_part: DayPart::default(),
             visible: false,
             placed: false,
             state: PetState::Idle {
@@ -448,10 +563,22 @@ impl PetManager {
         self.pos
     }
 
-    fn cadence(&self) -> &'static Cadence {
-        match self.energy {
-            PetEnergy::Calm => &CALM,
-            PetEnergy::Rowdy => &ROWDY,
+    fn cadence(&self) -> Cadence {
+        let base = match self.energy {
+            PetEnergy::Calm => CALM,
+            PetEnergy::Rowdy => ROWDY,
+        };
+        // The part of the day bends the tempo of life on top of the energy
+        // dial; the stride and the metabolism stay the pet's own.
+        let mood = self.day_part.mood();
+        Cadence {
+            step_ms: base.step_ms,
+            px_per_step: base.px_per_step,
+            idle_ms: scale_range(base.idle_ms, mood.idle),
+            nap_ms: scale_range(base.nap_ms, mood.nap),
+            nap_chance: (base.nap_chance * mood.nap_chance).clamp(0.0, 1.0),
+            wander_chance: (base.wander_chance * mood.wander).clamp(0.0, 1.0),
+            decay_per_ms: base.decay_per_ms,
         }
     }
 
@@ -492,6 +619,14 @@ impl PetManager {
         self.width = bar.width;
         self.height = bar.height;
         self.spans = spans.to_vec();
+
+        // The mood and scene track the wall clock alongside the background
+        // tint; a new part of the day repaints the scene once.
+        let day_part = DayPart::from_hour(bar.hour);
+        if self.visible && day_part != self.day_part {
+            redraw = true;
+        }
+        self.day_part = day_part;
 
         let dt_ms = now.saturating_duration_since(self.last_tick).as_secs_f64() * 1000.0;
         self.last_tick = now;
@@ -761,10 +896,13 @@ impl PetManager {
         }
     }
 
-    /// The pet layer's backdrop: blue sky above a green ground strip in
-    /// every open stretch of the layer, plus a sun and clouds in the sky.
-    /// Button columns are left untouched so widgets keep their deck look.
+    /// The pet layer's backdrop: a sky above a ground strip in every open
+    /// stretch of the layer, dressed for the part of the day - the sun
+    /// high by day and hanging low at dawn and dusk, the moon and stars at
+    /// night. Button columns are left untouched so widgets keep their
+    /// deck look.
     fn draw_scene(&self, c: &Context, height: f64, shift: (f64, f64)) {
+        let (sky, ground, grass) = scene_palette(self.day_part);
         let ground_top = height * GROUND_TOP;
         let overdraw = 16.0;
         for (a, b, reaches_right_edge) in free_intervals(&self.spans, self.width) {
@@ -772,7 +910,7 @@ impl PetManager {
             if reaches_right_edge {
                 b += overdraw;
             }
-            c.set_source_rgb(SKY_RGB.0, SKY_RGB.1, SKY_RGB.2);
+            c.set_source_rgb(sky.0, sky.1, sky.2);
             c.rectangle(
                 a,
                 shift.1 - overdraw,
@@ -780,7 +918,7 @@ impl PetManager {
                 ground_top - shift.1 + overdraw,
             );
             c.fill().unwrap();
-            c.set_source_rgb(GROUND_RGB.0, GROUND_RGB.1, GROUND_RGB.2);
+            c.set_source_rgb(ground.0, ground.1, ground.2);
             c.rectangle(
                 a,
                 ground_top + shift.1,
@@ -788,11 +926,11 @@ impl PetManager {
                 height - ground_top + overdraw,
             );
             c.fill().unwrap();
-            c.set_source_rgb(GRASS_RGB.0, GRASS_RGB.1, GRASS_RGB.2);
+            c.set_source_rgb(grass.0, grass.1, grass.2);
             c.rectangle(a, ground_top + shift.1, b - a, 2.5);
             c.fill().unwrap();
         }
-        // The sun and clouds float over the widest stretch of open sky.
+        // The celestial bodies float over the widest stretch of open sky.
         let Some((a, b, _)) = free_intervals(&self.spans, self.width)
             .into_iter()
             .max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
@@ -801,30 +939,54 @@ impl PetManager {
             return;
         };
         let span = b - a;
+        // Where the sun rides, and what hangs there instead at night: low
+        // and climbing on the left in the morning, high on the right by
+        // day, low and sinking on the right in the evening.
+        let (body, ink, rgb, x, y) = match self.day_part {
+            DayPart::Morning => (SUN, 'Y', SUN_RGB, a + span * 0.16, 42.0),
+            DayPart::Day => (SUN, 'Y', SUN_RGB, a + span * 0.86, 30.0),
+            DayPart::Evening => (SUN, 'Y', SUNSET_RGB, a + span * 0.84, 42.0),
+            DayPart::Night => (MOON, 'M', MOON_RGB, a + span * 0.85, 26.0),
+        };
         draw_grid(
             c,
-            SUN,
-            a + span * 0.86 + shift.0,
-            30.0 + shift.1,
-            |ch| (ch == 'Y').then_some(SUN_RGB),
+            body,
+            x + shift.0,
+            y + shift.1,
+            move |ch| (ch == ink).then_some(rgb),
             false,
         );
-        draw_grid(
-            c,
-            CLOUD,
-            a + span * 0.22 + shift.0,
-            20.0 + shift.1,
-            |ch| (ch == 'C').then_some(CLOUD_RGB),
-            false,
-        );
-        draw_grid(
-            c,
-            CLOUD,
-            a + span * 0.52 + shift.0,
-            26.0 + shift.1,
-            |ch| (ch == 'C').then_some(CLOUD_RGB),
-            false,
-        );
+        if self.day_part == DayPart::Night {
+            for (frac, y) in [(0.18, 12.0), (0.55, 20.0)] {
+                draw_grid(
+                    c,
+                    STAR,
+                    a + span * frac + shift.0,
+                    y + shift.1,
+                    |ch| (ch == 'S').then_some(STAR_RGB),
+                    false,
+                );
+            }
+            return;
+        }
+        let cloud_rgb = match self.day_part {
+            DayPart::Evening => CLOUD_DUSK_RGB,
+            _ => CLOUD_RGB,
+        };
+        let clouds: [(f64, f64); 2] = match self.day_part {
+            DayPart::Morning => [(0.50, 16.0), (0.78, 24.0)],
+            _ => [(0.22, 20.0), (0.52, 26.0)],
+        };
+        for (frac, y) in clouds {
+            draw_grid(
+                c,
+                CLOUD,
+                a + span * frac + shift.0,
+                y + shift.1,
+                |ch| (ch == 'C').then_some(cloud_rgb),
+                false,
+            );
+        }
     }
 
     fn current_grid(&self) -> (&'static [&'static str], bool) {
@@ -889,7 +1051,7 @@ impl PetManager {
                 };
                 self.next_step = Some(now);
             }
-        } else if rng.gen_bool(0.85) {
+        } else if rng.gen_bool(cadence.wander_chance) {
             let away = if rng.gen_bool(0.5) { -1.0 } else { 1.0 };
             let target = clamp_outside(
                 (self.pos + away * rng.gen_range(120.0..=420.0)).clamp(self.min_x(), self.max_x()),
@@ -1027,6 +1189,19 @@ fn frame_pair(
         a
     } else {
         b
+    }
+}
+
+/// One cairo source color in unit RGB.
+type Rgb = (f64, f64, f64);
+
+/// The scene's sky, ground, and grass colors for one part of the day.
+fn scene_palette(part: DayPart) -> (Rgb, Rgb, Rgb) {
+    match part {
+        DayPart::Morning => (MORNING_SKY_RGB, GROUND_RGB, GRASS_RGB),
+        DayPart::Day => (SKY_RGB, GROUND_RGB, GRASS_RGB),
+        DayPart::Evening => (EVENING_SKY_RGB, EVENING_GROUND_RGB, EVENING_GRASS_RGB),
+        DayPart::Night => (NIGHT_SKY_RGB, NIGHT_GROUND_RGB, NIGHT_GRASS_RGB),
     }
 }
 
@@ -1240,6 +1415,9 @@ mod tests {
             width: WIDTH,
             height: HEIGHT,
             active,
+            // Midday: the neutral tempo and the plain day scene, so the
+            // pre-existing assertions keep their meaning.
+            hour: 14,
         }
     }
 
@@ -2209,7 +2387,13 @@ mod tests {
                 .flat_map(|row| row.chars())
                 .all(|ch| matches!(ch, '.' | 'B' | 'S' | 'D' | 'W' | 'N' | 'P' | 'E')));
         }
-        for (grid, ink) in [(CLOUD, 'C'), (SUN, 'Y'), (KIBBLE, 'K')] {
+        for (grid, ink) in [
+            (CLOUD, 'C'),
+            (SUN, 'Y'),
+            (MOON, 'M'),
+            (STAR, 'S'),
+            (KIBBLE, 'K'),
+        ] {
             assert!(grid
                 .iter()
                 .flat_map(|row| row.chars())
@@ -2274,6 +2458,261 @@ mod tests {
             any(1600, 2008, 4, 30, &|p| p.0 > 220 && p.1 > 170 && p.2 < 120),
             "the sun must shine in the sky"
         );
+    }
+
+    #[test]
+    fn day_parts_follow_the_default_band_hours() {
+        // The pet's day mirrors the background tint's default bands:
+        // morning from 5, day from 12, evening from 17, night from 21
+        // wrapping past midnight.
+        for (hour, part) in [
+            (0, DayPart::Night),
+            (4, DayPart::Night),
+            (5, DayPart::Morning),
+            (11, DayPart::Morning),
+            (12, DayPart::Day),
+            (16, DayPart::Day),
+            (17, DayPart::Evening),
+            (20, DayPart::Evening),
+            (21, DayPart::Night),
+            (23, DayPart::Night),
+        ] {
+            assert_eq!(DayPart::from_hour(hour), part, "hour {hour}");
+        }
+    }
+
+    #[test]
+    fn the_mood_bends_with_the_part_of_day() {
+        let mut p = pet();
+        let cadence = |p: &mut PetManager, part: DayPart| {
+            p.day_part = part;
+            p.cadence()
+        };
+        let morning = cadence(&mut p, DayPart::Morning);
+        let day = cadence(&mut p, DayPart::Day);
+        let evening = cadence(&mut p, DayPart::Evening);
+        let night = cadence(&mut p, DayPart::Night);
+        // Idles and naps stretch from morning to night, naps grow likelier
+        // (capping at certainty), and the urge to wander fades.
+        assert!(morning.idle_ms.1 < day.idle_ms.1, "morning idles shrink");
+        assert!(day.idle_ms.1 < evening.idle_ms.1, "evening idles grow");
+        assert!(evening.idle_ms.1 < night.idle_ms.1, "night idles linger");
+        assert!(morning.nap_ms.1 < day.nap_ms.1 && day.nap_ms.1 < night.nap_ms.1);
+        assert!(morning.nap_chance < day.nap_chance);
+        assert!(day.nap_chance < evening.nap_chance);
+        assert_eq!(night.nap_chance, 1.0, "night naps cap at certainty");
+        assert!(morning.wander_chance > day.wander_chance);
+        assert!(day.wander_chance > evening.wander_chance);
+        assert!(evening.wander_chance > night.wander_chance);
+        // The stride and the metabolism are the pet's own, not the clock's.
+        assert_eq!(morning.step_ms, day.step_ms);
+        assert_eq!(night.step_ms, day.step_ms);
+        assert_eq!(night.px_per_step, day.px_per_step);
+        assert_eq!(night.decay_per_ms, day.decay_per_ms);
+    }
+
+    #[test]
+    fn morning_pets_roam_more_and_evenings_wind_down() {
+        // Naps out of the picture (satiety under the nap threshold, well
+        // above hungry), so the only difference left is the wander urge.
+        let mut p = pet();
+        p.satiety = 0.45;
+        let now = Instant::now();
+        let walks = |p: &mut PetManager, part: DayPart| {
+            p.day_part = part;
+            let mut walks = 0;
+            for _ in 0..1000 {
+                p.decide(now);
+                walks += matches!(p.state, PetState::Walk { .. }) as u32;
+            }
+            walks
+        };
+        let morning = walks(&mut p, DayPart::Morning);
+        let day = walks(&mut p, DayPart::Day);
+        let evening = walks(&mut p, DayPart::Evening);
+        assert!(
+            morning > day + 20,
+            "mornings bring zoomies, got {morning} vs {day}"
+        );
+        assert!(
+            day > evening + 60,
+            "evenings wind down, got {day} vs {evening}"
+        );
+    }
+
+    #[test]
+    fn night_pets_sleep_it_off_until_hunger_wins() {
+        let mut p = pet();
+        p.satiety = 0.9;
+        p.day_part = DayPart::Night;
+        let now = Instant::now();
+        for _ in 0..100 {
+            p.decide(now);
+            assert!(
+                matches!(p.state, PetState::Nap { .. })
+                    || matches!(
+                        p.state,
+                        PetState::Walk {
+                            after: After::Nap,
+                            ..
+                        }
+                    ),
+                "a well-fed night pet heads for bed, got {:?}",
+                p.state
+            );
+        }
+        // The night's naps also run longer than the day's.
+        p.day_part = DayPart::Day;
+        let day = p.cadence();
+        p.day_part = DayPart::Night;
+        let night = p.cadence();
+        assert!(night.nap_ms.0 > day.nap_ms.1);
+        // Hunger overrides sleepiness, exactly as by day.
+        p.satiety = 0.1;
+        for _ in 0..50 {
+            p.decide(now);
+            assert!(!matches!(p.state, PetState::Nap { .. }));
+        }
+    }
+
+    #[test]
+    fn the_scene_follows_the_time_of_day() {
+        // The backdrop complements the background tint: a pale morning sky
+        // with a low sun climbing on the left, the day look, a warm dusk
+        // with the sun sinking low on the right, and a dark night with a
+        // moon and stars where the sun stood. Under DFR_DECK_REVIEW_OUTPUT
+        // the four scenes land as horizontal PNGs for offline visual
+        // review, alongside the feeding frames.
+        let spans = vec![Span {
+            left: 11.0,
+            right: 248.0,
+            clock: false,
+        }];
+        let render = |hour: u32, name: &str| -> Vec<u8> {
+            let mut p = PetManager::new(true, PetVariant::Cat, PetEnergy::Calm);
+            p.update(
+                Instant::now(),
+                &Bar {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    active: true,
+                    hour,
+                },
+                &spans,
+            );
+            // Park the cat, clear of every band sampled below.
+            p.pos = 1500.0;
+            p.state = PetState::Idle {
+                until: Instant::now() + Duration::from_secs(60),
+            };
+            let mut portrait =
+                ImageSurface::create(Format::ARgb32, HEIGHT as i32, WIDTH as i32).unwrap();
+            {
+                let c = Context::new(&portrait).unwrap();
+                c.translate(HEIGHT, 0.0);
+                c.rotate((90.0f64).to_radians());
+                p.draw(&c, HEIGHT as i32, (0.0, 0.0), Instant::now());
+            }
+            if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
+                let horizontal =
+                    ImageSurface::create(Format::ARgb32, WIDTH as i32, HEIGHT as i32).unwrap();
+                let c = Context::new(&horizontal).unwrap();
+                c.translate(0.0, HEIGHT);
+                c.rotate((-90.0_f64).to_radians());
+                c.set_source_surface(&portrait, 0.0, 0.0).unwrap();
+                c.paint().unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
+                horizontal
+                    .write_to_png(
+                        &mut std::fs::File::create(std::path::Path::new(&dir).join(name)).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let pixels = portrait.data().unwrap().to_vec();
+            pixels
+        };
+        let stride = {
+            let probe = ImageSurface::create(Format::ARgb32, HEIGHT as i32, WIDTH as i32).unwrap();
+            probe.stride() as usize
+        };
+        // Layout (x, y) lands at device (HEIGHT - y, x) under the transform.
+        let pixel = |data: &[u8], x: i32, y: i32| -> (u8, u8, u8) {
+            let i = x as usize * stride + (HEIGHT as usize - y as usize) * 4;
+            (data[i + 2], data[i + 1], data[i])
+        };
+        let any = |data: &[u8],
+                   x0: i32,
+                   x1: i32,
+                   y0: i32,
+                   y1: i32,
+                   pred: &dyn Fn((u8, u8, u8)) -> bool| {
+            (x0..x1)
+                .step_by(4)
+                .any(|x| (y0..y1).step_by(2).any(|y| pred(pixel(data, x, y))))
+        };
+
+        let morning = render(6, "pet-scene-morning.png");
+        let morning_sky = pixel(&morning, 1200, 10);
+        assert!(
+            morning_sky.2 > 200 && morning_sky.2 > morning_sky.0,
+            "morning sky must be pale blue, got {morning_sky:?}"
+        );
+        assert!(
+            any(&morning, 380, 1000, 14, 44, &|p| p.0 > 230
+                && p.1 > 170
+                && p.2 < 120),
+            "the morning sun must climb low on the left"
+        );
+
+        let day = render(14, "pet-scene-day.png");
+        let day_sky = pixel(&day, 1200, 10);
+        assert!(
+            day_sky.2 > 200 && day_sky.2 > day_sky.0 && day_sky.0 < 160,
+            "the day sky stays blue, got {day_sky:?}"
+        );
+
+        let evening = render(18, "pet-scene-evening.png");
+        let evening_sky = pixel(&evening, 1200, 10);
+        assert!(
+            evening_sky.0 > 180 && evening_sky.0 > evening_sky.2,
+            "the evening sky must turn warm, got {evening_sky:?}"
+        );
+        assert!(
+            any(&evening, 1650, 1990, 14, 46, &|p| p.0 > 220
+                && (120..190).contains(&p.1)
+                && p.2 < 120),
+            "the sunset sun must sink low on the right"
+        );
+
+        let night = render(22, "pet-scene-night.png");
+        let night_sky = pixel(&night, 1200, 10);
+        assert!(
+            night_sky.2 > night_sky.0 && night_sky.0 < 80,
+            "the night sky must be dark and cool, got {night_sky:?}"
+        );
+        assert!(
+            any(&night, 1650, 1990, 0, 30, &|p| p.0 > 200
+                && p.1 > 200
+                && p.2 > 200),
+            "the moon must hang where the sun stood"
+        );
+        assert!(
+            any(&night, 500, 1250, 4, 30, &|p| p.0 > 200
+                && p.1 > 200
+                && p.2 > 200),
+            "stars must twinkle in the night sky"
+        );
+        assert!(
+            !any(&night, 250, 2008, 0, 46, &|p| p.0 > 220
+                && p.1 > 170
+                && p.2 < 120),
+            "no sun may shine at night"
+        );
+
+        assert_ne!(morning, day);
+        assert_ne!(day, evening);
+        assert_ne!(evening, night);
+        assert_ne!(morning, night);
     }
 
     #[test]

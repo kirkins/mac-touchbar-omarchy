@@ -2473,6 +2473,9 @@ fn real_main(drm: &mut DrmBackend) {
             width: width as f64,
             height: height as f64,
             active: pet_active,
+            // The pet's mood and scene follow the same local hour as the
+            // time-of-day background tint.
+            hour: now.hour(),
         };
         let pet_pixel_shift_width = if cfg.enable_pixel_shift {
             PIXEL_SHIFT_WIDTH_PX
@@ -4005,6 +4008,7 @@ mod tests {
             width: 2008.0,
             height: 60.0,
             active,
+            hour: 14,
         };
         let spans_of = |deck: &LayerDeck| {
             if deck.pet_active() {

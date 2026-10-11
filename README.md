@@ -47,7 +47,9 @@ These frames use the configured font and icon search paths; their battery
 display is illustrative and they do not prove physical touch or dictation.
 Running the full test suite with the variable set also exports the pet's
 feeding frames `pet-food-drop.png`, `pet-food-walk.png`, and
-`pet-food-munch.png` from its unit tests.
+`pet-food-munch.png`, and its time-of-day scene frames
+`pet-scene-morning.png`, `pet-scene-day.png`, `pet-scene-evening.png`, and
+`pet-scene-night.png`, from its unit tests.
 
 The unit tests run without a Touch Bar, DRM device, or virtual keyboard. They
 cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
@@ -71,7 +73,8 @@ reply parsing, and peer-UID boundary against fake receivers), and the virtual
 pet (pet-layer wiring and button toggle, wander bounds,
 pause and resume across layer switches, nap gating and placement, satiety decay
 and feeding, food drops on open ground and walk-to-food bounds, startle, tap
-consumption and hit-test precedence, and reload transitions), and the
+consumption and hit-test precedence, reload transitions, and the time-of-day
+mood and scene), and the
 time-of-day background (band selection across the hours with boundaries and
 the midnight wrap, unit-RGB conversion, configuration defaults, overrides, and
 rejections, the disabled static background, the strip behind widgets and the
@@ -453,8 +456,10 @@ The strip behind every bar follows the local time of day: a warm dawn gray in
 the morning, a brighter neutral slate at midday, warm amber toward evening,
 and a dark cool blue overnight. The band color shows through the 16-pixel gaps
 and behind every widget on every named layer, including the pet layer's open
-ground beneath its painted sky and grass scene. Key fills, accents, the shared
-slider, and the pet itself keep their existing design on top of the band
+ground beneath its painted sky and grass scene - a scene that itself follows
+the same hours, with the sun riding low at dawn and dusk and a moon and stars
+overnight. Key fills, accents, the shared
+slider, and the pet sprites keep their existing design on top of the band
 color, and nothing about touch behavior changes. The daemon repaints once
 when the band changes, on the same wake cadence it already keeps for the
 clock and battery widgets; there is no per-frame animation and no extra
@@ -519,6 +524,17 @@ and never nap, well-fed pets nap and wander. A direct tap on the pet is
 always consumed and never fires the button underneath; food drops land
 only on open ground and never steal taps aimed at the layer's buttons,
 whether the pet is hungry or not.
+
+The pet also lives in the time of day, mirroring the same local-hour bands
+as the time-of-day background tint. Mornings bring zoomies - short pauses,
+long roams, few naps - under a pale sky with the sun climbing low on the
+left; midday keeps the plain tempo; evenings wind down with longer pauses
+and likelier, longer naps under a warm dusk with the sun sinking low on the
+right; and overnight a well-fed pet mostly sleeps beneath a moon and stars
+where the sun stood, waking for the odd stroll or a midnight snack, since
+hunger still overrides sleepiness exactly as by day. The stride and the
+metabolism never change with the clock - only the tempo of life does - and
+the scene repaints on the wake cadence the daemon already keeps.
 
 ```toml
 PetEnabled = true   # set false to remove the Pet button and pet layer
