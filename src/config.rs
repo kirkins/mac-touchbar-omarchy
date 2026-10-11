@@ -1349,6 +1349,43 @@ DoublePressSwitchLayers = 200
     }
 
     #[test]
+    fn shipped_home_slider_pair_sizes_identically() {
+        // The volume and brightness sliders are one pair of equal twins:
+        // the sizing knob is the per-button Stretch, and the shipped home
+        // bar must give both the same explicit value so they render the
+        // same width.
+        let (_, layout) = parse_config(
+            BASE,
+            Some(include_str!("../share/tiny-dfr/multibar.toml")),
+            2008,
+        )
+        .unwrap();
+        let home = &layout.layers[layout.home];
+        for action in [ButtonAction::VolumeSlider, ButtonAction::BrightnessSlider] {
+            assert_eq!(
+                home.keys.iter().filter(|key| key.action == action).count(),
+                1
+            );
+        }
+        let volume = home
+            .keys
+            .iter()
+            .position(|key| key.action == ButtonAction::VolumeSlider)
+            .unwrap();
+        let brightness = home
+            .keys
+            .iter()
+            .position(|key| key.action == ButtonAction::BrightnessSlider)
+            .unwrap();
+        // Adjacent icon buttons sharing one explicit width.
+        assert_eq!(brightness, volume + 1);
+        assert!(home.keys[volume].icon.is_some());
+        assert!(home.keys[brightness].icon.is_some());
+        assert_eq!(home.keys[volume].stretch, home.keys[brightness].stretch);
+        assert!(home.keys[volume].stretch.is_some());
+    }
+
+    #[test]
     fn command_actions_parse_alone_and_combined_with_layer_switches() {
         let config = format!(
             "{NAMED}\n\

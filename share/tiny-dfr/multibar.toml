@@ -8,7 +8,10 @@ FnLayer = "function"
 [[Layers]]
 Name = "home"
 Keys = [
-    { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
+    # The volume and brightness sliders are one pair of equal twins: give
+    # them the same Stretch so both buttons render the same width. Pressing
+    # either expands both spans, gap included, into the one shared slider.
+    { Icon = "volume_up", Stretch = 2, Action = "VolumeSlider" },
     { Icon = "brightness_high", Stretch = 2, Action = "BrightnessSlider" },
     { Icon = "play_pause", Action = "PlayPause" },
     { Text = "F1-F12", Action = { Layer = "function" } },

@@ -157,7 +157,9 @@ discard existing touches; fingers already down must lift before pressing again.
 ### Shared volume and brightness slider
 
 The named-bar home has one cyan `VolumeSlider` button and one amber
-`BrightnessSlider` button. Pressing either reads its current hardware level and
+`BrightnessSlider` button. They are one pair: size them with equal `Stretch`
+values - the shipped example gives each 2 - so the two buttons render
+identically. Pressing either reads its current hardware level and
 replaces their entire combined region, including the gap, with one slider for
 that control. Other controls stay accessible, with Mic at the far right.
 Adjacent slider actions share their span on any bar; a standalone action uses

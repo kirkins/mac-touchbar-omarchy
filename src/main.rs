@@ -4121,6 +4121,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn equal_stretch_slider_pair_draws_equal_width_buttons() {
+        // The layout engine has one width path: a button spans exactly its
+        // Stretch in unit widths. Whatever equal value the shipped pair is
+        // given, the volume and brightness sliders must come out
+        // pixel-identical in width.
+        for stretch in [1, 2, 3, 5] {
+            let slider = |label: &str, action: ButtonAction| ButtonConfig {
+                text: Some(label.into()),
+                stretch: Some(stretch),
+                action,
+                ..ButtonConfig::default()
+            };
+            let layer = FunctionLayer::with_config(vec![
+                slider("Volume", ButtonAction::VolumeSlider),
+                slider("Brightness", ButtonAction::BrightnessSlider),
+                keys("Play", &[Key::PlayPause]),
+                nav("Functions", "function"),
+            ]);
+            let spans = layer.layout_spans(2008, 0);
+            let width = |span: &PetSpan| span.right - span.left;
+            // Equal Stretch runs the identical width formula for both
+            // buttons; recover each width from its own left edge, which can
+            // drift one float ULP, far below a drawn pixel.
+            assert!(
+                (width(&spans[0]) - width(&spans[1])).abs() < 1e-6,
+                "equal Stretch must draw equal widths at stretch {stretch}"
+            );
+            assert!(width(&spans[0]) > 0.0);
+        }
+    }
+
     fn shared_slider_deck() -> LayerDeck {
         let mut volume = slider_button("Volume");
         volume.stretch = Some(3);
