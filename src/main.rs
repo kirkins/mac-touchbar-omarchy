@@ -81,11 +81,13 @@ const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 40;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
+/// Charging is the only state that changes how a battery renders: charging
+/// sources draw the charging icons and keep the charging green, every other
+/// state draws the plain icons and escalates by its charge fraction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BatteryState {
     NotCharging,
     Charging,
-    Low,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +109,52 @@ struct BatteryWidget {
     timeout: Duration,
 }
 
+/// How far the displayed battery has fallen, resolved against the
+/// configured thresholds. Strictly-below semantics keep the historical
+/// reading at the shipped defaults: a battery exactly at a threshold
+/// still shows the milder tier, and the old hardcoded `capacity < 10`
+/// critical red stays the critical default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatteryAlert {
+    Healthy,
+    Warning,
+    Critical,
+}
+
+/// The battery widget's escalation knobs, resolved once per config load:
+/// where the warning and critical tiers start and the accent each tier
+/// paints. The tiers are evaluated against the currently displayed
+/// battery, so a cycled device battery escalates independently of the
+/// system battery whenever it is the one on show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatteryEscalation {
+    warning_threshold: u32,
+    critical_threshold: u32,
+    warning_accent: ButtonAccent,
+    critical_accent: ButtonAccent,
+}
+
+impl BatteryEscalation {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            warning_threshold: config.battery_warning_threshold,
+            critical_threshold: config.battery_critical_threshold,
+            warning_accent: config.battery_warning_color,
+            critical_accent: config.battery_critical_color,
+        }
+    }
+
+    fn alert(&self, capacity: u32) -> BatteryAlert {
+        if capacity < self.critical_threshold {
+            BatteryAlert::Critical
+        } else if capacity < self.warning_threshold {
+            BatteryAlert::Warning
+        } else {
+            BatteryAlert::Healthy
+        }
+    }
+}
+
 impl BatteryWidget {
     fn source(&self) -> Option<&BatterySource> {
         self.sources.iter().find(|source| match &self.selected {
@@ -114,7 +162,6 @@ impl BatteryWidget {
             None => !source.device,
         })
     }
-
     fn can_cycle(&self) -> bool {
         self.cycling && self.sources.iter().any(|source| source.device)
     }
@@ -439,7 +486,6 @@ fn read_battery_sources(root: &Path) -> Vec<BatterySource> {
         let capacity = capacity.min(100);
         let state = match read("status").as_deref().map(str::trim) {
             Some("Charging" | "Full") => BatteryState::Charging,
-            Some("Discharging") if capacity < 10 => BatteryState::Low,
             _ => BatteryState::NotCharging,
         };
         let label: String = read("model_name")
@@ -953,20 +999,27 @@ impl Button {
             }
         }
     }
-    fn effective_accent(&self) -> ButtonAccent {
+    fn effective_accent(&self, escalation: &BatteryEscalation) -> ButtonAccent {
+        let fallback = self
+            .accent
+            .unwrap_or_else(|| ButtonAccent::for_action(&self.action));
         if let ButtonImage::Battery(battery, _, _) = &self.image {
-            match battery
-                .source()
-                .map(|source| source.state)
-                .unwrap_or(BatteryState::NotCharging)
-            {
-                BatteryState::Charging => return ButtonAccent::Green,
-                BatteryState::Low => return ButtonAccent::Red,
-                BatteryState::NotCharging => (),
+            // The displayed source alone decides the tier: a cycled device
+            // battery escalates independently whenever it is the one shown.
+            // A charging battery keeps the charging green at every level,
+            // and no source ("Battery N/A") stays on the widget's accent.
+            if let Some(source) = battery.source() {
+                if source.state == BatteryState::Charging {
+                    return ButtonAccent::Green;
+                }
+                return match escalation.alert(source.capacity) {
+                    BatteryAlert::Critical => escalation.critical_accent,
+                    BatteryAlert::Warning => escalation.warning_accent,
+                    BatteryAlert::Healthy => fallback,
+                };
             }
         }
-        self.accent
-            .unwrap_or_else(|| ButtonAccent::for_action(&self.action))
+        fallback
     }
 }
 
@@ -1178,6 +1231,9 @@ impl FunctionLayer {
             }
         }
 
+        // One resolved set of escalation knobs per frame; the tiers are
+        // evaluated per displayed battery inside the loop.
+        let escalation = BatteryEscalation::from_config(config);
         for i in 0..self.buttons.len() {
             let end = if i + 1 < self.buttons.len() {
                 self.buttons[i + 1].0
@@ -1218,7 +1274,7 @@ impl FunctionLayer {
             if !matches!(button.image, ButtonImage::Spacer)
                 && (button.active || config.show_button_outlines)
             {
-                let accent = button.effective_accent();
+                let accent = button.effective_accent(&escalation);
                 accent.surface(&c, button.active, button.action.command().is_some());
                 // Visual inset only: layout, spacing and hit targets stay the same.
                 rounded_rect(
@@ -2658,11 +2714,7 @@ mod tests {
             label: id.into(),
             device,
             capacity,
-            state: if capacity < 10 {
-                BatteryState::Low
-            } else {
-                BatteryState::NotCharging
-            },
+            state: BatteryState::NotCharging,
         })
         .collect()
     }
@@ -2777,11 +2829,126 @@ mod tests {
         assert!(sources[1].device);
         assert_eq!(sources[1].capacity, 80); // Capacity-only peripherals work on x86_64 too.
         assert_eq!(sources[1].label, "MX Master 1");
-        assert_eq!(sources[2].state, BatteryState::Low);
+        assert_eq!(sources[2].state, BatteryState::NotCharging);
         fs::remove_dir_all(fixture.0.join("hidpp_mouse")).unwrap();
         fs::write(fixture.0.join("keyboard/present"), "0").unwrap();
         assert_eq!(read_battery_sources(&fixture.0).len(), 1);
         assert!(read_battery_sources(&fixture.0.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn battery_alert_steps_through_the_configured_thresholds() {
+        let escalation = BatteryEscalation {
+            warning_threshold: 25,
+            critical_threshold: 10,
+            warning_accent: ButtonAccent::Orange,
+            critical_accent: ButtonAccent::Red,
+        };
+        // Healthy at and above the warning point, warning strictly below it.
+        for healthy in [100, 26, 25] {
+            assert_eq!(escalation.alert(healthy), BatteryAlert::Healthy);
+        }
+        for warning in [24, 11, 10] {
+            assert_eq!(escalation.alert(warning), BatteryAlert::Warning);
+        }
+        // Critical strictly below the critical point, boundary included.
+        for critical in [9, 1, 0] {
+            assert_eq!(escalation.alert(critical), BatteryAlert::Critical);
+        }
+        // Equal tiers collapse into a single critical step...
+        let collapsed = BatteryEscalation {
+            warning_threshold: 40,
+            critical_threshold: 40,
+            ..escalation
+        };
+        assert_eq!(collapsed.alert(40), BatteryAlert::Healthy);
+        assert_eq!(collapsed.alert(39), BatteryAlert::Critical);
+        // ...and zero thresholds silence the escalation entirely.
+        let disabled = BatteryEscalation {
+            warning_threshold: 0,
+            critical_threshold: 0,
+            ..escalation
+        };
+        for capacity in [0, 10, 100] {
+            assert_eq!(disabled.alert(capacity), BatteryAlert::Healthy);
+        }
+    }
+
+    #[test]
+    fn battery_accent_escalates_only_the_displayed_battery() {
+        let escalation = BatteryEscalation::from_config(&outline_config());
+        assert_eq!(escalation.warning_threshold, 25);
+        assert_eq!(escalation.critical_threshold, 10);
+        let now = Instant::now();
+        let timeout = Duration::from_secs(15);
+        let mut button = battery_button(ButtonAction::Keys(vec![Key::Battery]));
+        let battery_neutral = ButtonAccent::for_action(&button.action);
+        let source_at = |id: &str, device: bool, capacity: u32| BatterySource {
+            id: id.into(),
+            label: id.into(),
+            device,
+            capacity,
+            state: BatteryState::NotCharging,
+        };
+        let refresh = |button: &mut Button, sources: &[BatterySource]| {
+            let ButtonImage::Battery(battery, _, _) = &mut button.image else {
+                panic!()
+            };
+            battery.refresh(sources, true, timeout, now);
+        };
+        let cycle = |button: &mut Button| {
+            let ButtonImage::Battery(battery, _, _) = &mut button.image else {
+                panic!()
+            };
+            battery.cycle(now)
+        };
+        let accent = |button: &Button| button.effective_accent(&escalation);
+
+        // A healthy system battery renders exactly as before: the widget's
+        // own accent, escalations silent above the warning point.
+        refresh(&mut button, &[source_at("BAT0", false, 80)]);
+        assert_eq!(accent(&button), battery_neutral);
+        // Below the warning point the displayed battery turns the warning
+        // color; below the critical point, the critical color.
+        refresh(&mut button, &[source_at("BAT0", false, 20)]);
+        assert_eq!(accent(&button), ButtonAccent::Orange);
+        refresh(&mut button, &[source_at("BAT0", false, 5)]);
+        assert_eq!(accent(&button), ButtonAccent::Red);
+
+        // The tier follows whichever battery is on show: the system stays
+        // healthy while the cycled device battery reads warning on its own.
+        refresh(
+            &mut button,
+            &[
+                source_at("BAT0", false, 80),
+                source_at("hidpp_mouse", true, 20),
+            ],
+        );
+        assert_eq!(accent(&button), battery_neutral);
+        assert!(cycle(&mut button));
+        assert_eq!(accent(&button), ButtonAccent::Orange);
+
+        // A charging battery keeps the charging green at every level.
+        let mut charging = source_at("BAT0", false, 5);
+        charging.state = BatteryState::Charging;
+        refresh(&mut button, &[charging]);
+        assert_eq!(accent(&button), ButtonAccent::Green);
+
+        // The configured escalation colors replace the shipped defaults.
+        let custom = BatteryEscalation {
+            warning_accent: ButtonAccent::Violet,
+            critical_accent: ButtonAccent::Blue,
+            ..escalation
+        };
+        refresh(&mut button, &[source_at("BAT0", false, 20)]);
+        assert_eq!(button.effective_accent(&custom), ButtonAccent::Violet);
+        refresh(&mut button, &[source_at("BAT0", false, 5)]);
+        assert_eq!(button.effective_accent(&custom), ButtonAccent::Blue);
+
+        // With no displayed battery ("Battery N/A") the accent is the
+        // widget's own, as before.
+        refresh(&mut button, &[]);
+        assert_eq!(accent(&button), battery_neutral);
     }
 
     #[test]
@@ -3900,6 +4067,10 @@ mod tests {
             double_press_switch_layers: 0,
             battery_cycle_enabled: true,
             battery_cycle_timeout_secs: 15,
+            battery_warning_threshold: 25,
+            battery_critical_threshold: 10,
+            battery_warning_color: ButtonAccent::Orange,
+            battery_critical_color: ButtonAccent::Red,
             pet_enabled: false,
             pet_variant: Default::default(),
             pet_energy: Default::default(),
@@ -5014,6 +5185,10 @@ mod tests {
             double_press_switch_layers: 0,
             battery_cycle_enabled: true,
             battery_cycle_timeout_secs: 15,
+            battery_warning_threshold: 25,
+            battery_critical_threshold: 10,
+            battery_warning_color: ButtonAccent::Orange,
+            battery_critical_color: ButtonAccent::Red,
             pet_enabled: false,
             pet_variant: Default::default(),
             pet_energy: Default::default(),

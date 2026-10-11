@@ -4,6 +4,18 @@ DefaultLayer = "home"
 # Optional: holding Fn temporarily shows this bar; releasing Fn returns to the
 # previous bar. Tapping a navigation button during Fn keeps the chosen bar open.
 FnLayer = "function"
+# The battery widget warns at a glance as its displayed charge runs low:
+# while not charging, below BatteryWarningThreshold percent it paints the
+# BatteryWarningColor accent, and below the lower BatteryCriticalThreshold
+# it paints BatteryCriticalColor. Colors use the accent names; thresholds
+# are percentages 0-100 with the critical one at or below the warning one.
+# Above the warning point the widget keeps its configured accent, and a
+# charging battery stays green at every level. Each displayed battery -
+# system or cycled device - escalates independently while it is shown.
+BatteryWarningThreshold = 25
+BatteryCriticalThreshold = 10
+BatteryWarningColor = "orange"
+BatteryCriticalColor = "red"
 
 [[Layers]]
 Name = "home"

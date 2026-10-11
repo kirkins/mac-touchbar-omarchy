@@ -22,6 +22,7 @@ pub enum ButtonAccent {
     Amber,
     Blue,
     Violet,
+    Orange,
     Red,
     Green,
 }
@@ -57,6 +58,10 @@ impl ButtonAccent {
             Self::Amber => (1.0, 0.72, 0.27),
             Self::Blue => (0.36, 0.60, 1.0),
             Self::Violet => (0.67, 0.53, 1.0),
+            // A clear warning orange: visibly redder than the amber knob
+            // accent and visibly yellower than the critical red, so the two
+            // escalation tiers never read as the same hue on the strip.
+            Self::Orange => (1.0, 0.52, 0.13),
             Self::Red => (1.0, 0.32, 0.42),
             Self::Green => (0.27, 0.88, 0.57),
         }

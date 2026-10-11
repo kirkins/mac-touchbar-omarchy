@@ -47,6 +47,20 @@ BatteryCycleEnabled = true
 # Must be greater than zero; defaults to 15 even with older base configs.
 BatteryCycleTimeoutSecs = 15
 
+# The battery widget warns at a glance as its displayed charge runs low:
+# while not charging, below BatteryWarningThreshold percent it paints the
+# BatteryWarningColor accent, and below the lower BatteryCriticalThreshold
+# it paints BatteryCriticalColor. Colors use the accent names (here the
+# shipped clear orange and red); thresholds are percentages 0-100 with the
+# critical one at or below the warning one. Above the warning point the
+# widget keeps its configured accent exactly as before, and a charging
+# battery stays green at every level. Each displayed battery - system or
+# cycled device - escalates independently while it is the one shown.
+BatteryWarningThreshold = 25
+BatteryCriticalThreshold = 10
+BatteryWarningColor = "orange"
+BatteryCriticalColor = "red"
+
 # A small virtual pet lives on its own pet layer: with this enabled the
 # home bar gains a Pet button beside the other navigation buttons that opens
 # a little scene - blue sky with sun and clouds over a green ground strip -
@@ -178,7 +192,11 @@ PrimaryLayerKeys = [
     # (Amount of energy currently available / Amount of energy in the battery when it’s considered full) * 100
     # 2. On Apple Silicon Macs:
     # Get the value reported by the SMC in /sys/class/power_supply.
-    # Button will turn green if battery is charging, and red if charge is <10% and is not charging.
+    # Button will turn green if battery is charging. While not charging it
+    # escalates by charge: below BatteryWarningThreshold (default 25) it
+    # paints BatteryWarningColor (default orange), and below the lower
+    # BatteryCriticalThreshold (default 10) it paints BatteryCriticalColor
+    # (default red); above the warning point it keeps its configured accent.
 
     # Example of the live recording waveform (see the recording layer in
     # share/tiny-dfr/multibar.toml):

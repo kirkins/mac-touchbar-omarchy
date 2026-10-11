@@ -39,6 +39,10 @@ pub struct Config {
     pub double_press_switch_layers: u32,
     pub battery_cycle_enabled: bool,
     pub battery_cycle_timeout_secs: u32,
+    pub battery_warning_threshold: u32,
+    pub battery_critical_threshold: u32,
+    pub battery_warning_color: ButtonAccent,
+    pub battery_critical_color: ButtonAccent,
     pub pet_enabled: bool,
     pub pet_variant: PetVariant,
     pub pet_energy: PetEnergy,
@@ -57,6 +61,10 @@ struct ConfigProxy {
     double_press_switch_layers: Option<u32>,
     battery_cycle_enabled: Option<bool>,
     battery_cycle_timeout_secs: Option<u32>,
+    battery_warning_threshold: Option<u32>,
+    battery_critical_threshold: Option<u32>,
+    battery_warning_color: Option<ButtonAccent>,
+    battery_critical_color: Option<ButtonAccent>,
     pet_enabled: Option<bool>,
     pet_variant: Option<String>,
     pet_energy: Option<String>,
@@ -216,6 +224,10 @@ impl ConfigProxy {
             double_press_switch_layers,
             battery_cycle_enabled,
             battery_cycle_timeout_secs,
+            battery_warning_threshold,
+            battery_critical_threshold,
+            battery_warning_color,
+            battery_critical_color,
             pet_enabled,
             pet_variant,
             pet_energy,
@@ -446,6 +458,22 @@ fn parse_config(base: &str, user: Option<&str>, width: u16) -> Result<(ConfigPro
     if base.battery_cycle_timeout_secs == Some(0) {
         bail!("BatteryCycleTimeoutSecs must be greater than zero");
     }
+    if base
+        .battery_warning_threshold
+        .is_some_and(|value| value > 100)
+    {
+        bail!("BatteryWarningThreshold must be at most 100");
+    }
+    if base
+        .battery_critical_threshold
+        .is_some_and(|value| value > 100)
+    {
+        bail!("BatteryCriticalThreshold must be at most 100");
+    }
+    if base.battery_critical_threshold.unwrap_or(10) > base.battery_warning_threshold.unwrap_or(25)
+    {
+        bail!("BatteryCriticalThreshold must not exceed BatteryWarningThreshold");
+    }
     base.pet_variant
         .as_deref()
         .map(PetVariant::parse)
@@ -518,6 +546,10 @@ fn load_config(
         double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
         battery_cycle_enabled: base.battery_cycle_enabled.unwrap_or(true),
         battery_cycle_timeout_secs: base.battery_cycle_timeout_secs.unwrap_or(15),
+        battery_warning_threshold: base.battery_warning_threshold.unwrap_or(25),
+        battery_critical_threshold: base.battery_critical_threshold.unwrap_or(10),
+        battery_warning_color: base.battery_warning_color.unwrap_or(ButtonAccent::Orange),
+        battery_critical_color: base.battery_critical_color.unwrap_or(ButtonAccent::Red),
         pet_enabled,
         pet_variant: base
             .pet_variant
@@ -688,6 +720,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
             ("amber", ButtonAccent::Amber),
             ("blue", ButtonAccent::Blue),
             ("violet", ButtonAccent::Violet),
+            ("orange", ButtonAccent::Orange),
             ("red", ButtonAccent::Red),
             ("green", ButtonAccent::Green),
         ] {
@@ -1699,6 +1732,56 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             "BatteryCycleEnabled = 'false'",
         ] {
             assert!(parse_config(BASE, Some(invalid), 2008).is_err());
+        }
+    }
+
+    #[test]
+    fn battery_escalation_settings_merge_and_legacy_configs_have_defaults() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        let user_path = tmp.0.join("config.toml");
+        // A base config predating the escalation keeps working with defaults.
+        let mut legacy: toml::Value = toml::from_str(&text_only_base()).unwrap();
+        for key in [
+            "BatteryWarningThreshold",
+            "BatteryCriticalThreshold",
+            "BatteryWarningColor",
+            "BatteryCriticalColor",
+        ] {
+            legacy.as_table_mut().unwrap().remove(key);
+        }
+        fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
+        let (config, _) = load_config(2008, &base_path, None).unwrap();
+        assert_eq!(config.battery_warning_threshold, 25);
+        assert_eq!(config.battery_critical_threshold, 10);
+        assert_eq!(config.battery_warning_color, ButtonAccent::Orange);
+        assert_eq!(config.battery_critical_color, ButtonAccent::Red);
+        // User overrides win over the base defaults, keys may be set singly.
+        fs::write(
+            &user_path,
+            "BatteryWarningThreshold = 30\nBatteryCriticalColor = \"violet\"",
+        )
+        .unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        assert_eq!(config.battery_warning_threshold, 30);
+        assert_eq!(config.battery_critical_threshold, 10);
+        assert_eq!(config.battery_warning_color, ButtonAccent::Orange);
+        assert_eq!(config.battery_critical_color, ButtonAccent::Violet);
+        // Thresholds above 100 can never trigger and inverted tiers only
+        // surprise, so both are rejected like the other invalid knobs.
+        for invalid in [
+            "BatteryWarningThreshold = 101",
+            "BatteryCriticalThreshold = 101",
+            "BatteryCriticalThreshold = 30\nBatteryWarningThreshold = 25",
+            "BatteryCriticalThreshold = 30",
+            "BatteryWarningThreshold = '25'",
+            "BatteryWarningColor = \"mauve\"",
+            "BatteryCriticalColor = 42",
+        ] {
+            assert!(
+                parse_config(BASE, Some(invalid), 2008).is_err(),
+                "accepted invalid battery escalation configuration: {invalid}"
+            );
         }
     }
 

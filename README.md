@@ -144,7 +144,7 @@ their control. `ShowButtonOutlines = false` hides the idle fills and borders
 while preserving pressed feedback.
 
 An optional per-button `Accent` overrides the automatic color: `"neutral"`,
-`"cyan"`, `"amber"`, `"violet"`, `"red"`, or `"green"`. For example,
+`"cyan"`, `"amber"`, `"violet"`, `"orange"`, `"red"`, or `"green"`. For example,
 `{ Text = "Home", Accent = "violet", Action = { Layer = "home" } }`.
 Battery charging and low-charge colors take precedence over this override.
 The shared slider uses cyan for volume (with a subdued muted fill) and amber
@@ -164,6 +164,20 @@ return delay after the last cycling tap; it must be greater than zero. Both
 settings have these defaults when absent from older configurations. Cycling,
 automatic return, and removal of a selected source release held virtual keys and
 discard existing touches; fingers already down must lift before pressing again.
+
+The battery widget warns at a glance as its displayed charge runs low. While
+the battery is not charging, below `BatteryWarningThreshold` percent (default
+25) it paints the `BatteryWarningColor` accent, and below the lower
+`BatteryCriticalThreshold` (default 10) it paints `BatteryCriticalColor`.
+Both colors take the accent names, defaulting to the shipped clear orange and
+red; thresholds are percentages 0-100 with the critical one at or below the
+warning one. A battery exactly at a threshold still shows the milder tier, so
+the escalation mirrors the historical hardcoded red below 10. Above the
+warning point the widget renders exactly as before, with its configured
+accent, and a charging battery stays green at every level. The tier is
+resolved against the currently displayed battery, so system and cycled device
+batteries escalate independently while each is the one shown. All four
+settings have these defaults when absent from older configurations.
 
 ### Shared volume and brightness slider
 
