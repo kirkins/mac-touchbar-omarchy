@@ -904,7 +904,14 @@ Keys = [{ Text = "F1", Action = "F1" }]
             12, 38, 8, 61, 84, 30, 55, 72, 21, 47, 66, 15, 52, 33, 70, 44,
         ] {
             viz_now += Duration::from_millis(50);
-            deck.visualizer_tick(Some(crate::MicSample { level, live: true }), viz_now);
+            deck.visualizer_tick(
+                Some(crate::MicSample {
+                    level,
+                    live: true,
+                    dead: false,
+                }),
+                viz_now,
+            );
         }
         render(&mut deck, "implemented-media-viz.png");
         // The view's single control is its Off button; tapping it restores
@@ -919,6 +926,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
             Some(crate::MicSample {
                 level: 90,
                 live: true,
+                dead: false,
             }),
             viz_now,
         );
@@ -1018,7 +1026,14 @@ Keys = [{ Text = "F1", Action = "F1" }]
             8, 24, 12, 40, 66, 88, 35, 19, 57, 74, 28, 90, 46, 61, 33, 15, 52, 70,
         ] {
             feed_now += Duration::from_millis(50);
-            deck.waveform_tick(Some(crate::MicSample { level, live: true }), feed_now);
+            deck.waveform_tick(
+                Some(crate::MicSample {
+                    level,
+                    live: true,
+                    dead: false,
+                }),
+                feed_now,
+            );
         }
         // Mid-period frame: the graph is caught halfway between two samples,
         // with the newest level eased to half its measured value and the
@@ -1028,6 +1043,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
             Some(crate::MicSample {
                 level: 88,
                 live: true,
+                dead: false,
             }),
             mid,
         );
@@ -1039,18 +1055,21 @@ Keys = [{ Text = "F1", Action = "F1" }]
             Some(crate::MicSample {
                 level: 70,
                 live: true,
+                dead: false,
             }),
             settled,
         );
         feed_now += Duration::from_secs(73);
         deck.waveform_tick(None, feed_now);
         render(&mut deck, "implemented-recording-live.png");
-        // Without the desktop level feed the widget keeps its idle look.
+        // Without the desktop level feed every poll fails: the widget shows
+        // the dead-feed state - the red slashed dot and the `No feed` label
+        // - never the calm idle look of a merely quiet feed.
         for _ in 0..4 {
             feed_now += Duration::from_millis(50);
-            deck.waveform_tick(Some(crate::MicSample::default()), feed_now);
+            deck.waveform_tick(Some(crate::MicSample::dead()), feed_now);
         }
-        render(&mut deck, "implemented-recording-idle.png");
+        render(&mut deck, "implemented-recording-dead.png");
         tap(&mut deck, "Stop", &mut commands);
         assert_eq!(deck.active, deck.home);
         tap(&mut deck, "Mic", &mut commands);

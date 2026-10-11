@@ -3070,7 +3070,14 @@ mod tests {
 
         // Live samples stream into the graph while the layer is displayed.
         for level in [10, 45, 80, 22] {
-            let (changed, _) = deck.waveform_tick(Some(MicSample { level, live: true }), now);
+            let (changed, _) = deck.waveform_tick(
+                Some(MicSample {
+                    level,
+                    live: true,
+                    dead: false,
+                }),
+                now,
+            );
             assert!(changed);
         }
         let ButtonImage::Waveform(wave) = &deck.current().buttons[1].1.image else {
@@ -3104,6 +3111,7 @@ mod tests {
             Some(MicSample {
                 level: 90,
                 live: true,
+                dead: false,
             }),
             later,
         );
@@ -3123,6 +3131,74 @@ mod tests {
         };
         assert!(wave.history().is_empty());
         assert_eq!(wave.elapsed(later), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_dead_feed_marks_its_button_once_and_rests_at_the_timer_cadence() {
+        let mut deck = waveform_deck();
+        let now = Instant::now();
+        // The mic press opens the recording layer and its widget session.
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert_eq!(deck.active, deck.names["recording"]);
+        let (changed, _) = deck.waveform_tick(None, now);
+        assert!(changed); // the first activation frame
+        deck.current_mut().buttons[1].1.changed = false;
+
+        // A live sample, then the feed dies: the flip requests exactly one
+        // repaint of the waveform button, so the dead state reaches glass.
+        let (changed, _) = deck.waveform_tick(
+            Some(MicSample {
+                level: 60,
+                live: true,
+                dead: false,
+            }),
+            now,
+        );
+        assert!(changed);
+        deck.current_mut().buttons[1].1.changed = false;
+        let dead_at = now + Duration::from_millis(50);
+        let (changed, timeout) = deck.waveform_tick(Some(MicSample::dead()), dead_at);
+        assert!(changed, "the dead flip must repaint the button");
+        // The inherited pulse is still settling, so the frame clock runs
+        // on; the dead state itself animates nothing.
+        assert_eq!(timeout, waveform::FRAME_INTERVAL_MS);
+        deck.current_mut().buttons[1].1.changed = false;
+
+        // A repeated dead poll at the same instant adds no repaint of its
+        // own - the state is already on glass.
+        let (changed, _) = deck.waveform_tick(Some(MicSample::dead()), dead_at);
+        assert!(!changed);
+
+        // A dead feed is a state, not an animation: past the inherited
+        // pulse decay nothing moves, and repeated dead polls change
+        // nothing further.
+        let mut settle = dead_at + Duration::from_millis(waveform::FRAME_INTERVAL_MS as u64);
+        let mut settling = 0;
+        while deck.waveform_tick(None, settle).0 {
+            settle += Duration::from_millis(waveform::FRAME_INTERVAL_MS as u64);
+            settling += 1;
+            assert!(settling < 100, "dead widget never settled");
+        }
+        // The last settling frame left its repaint queued; consume it, and
+        // a settled dead widget then requests nothing further.
+        deck.current_mut().buttons[1].1.changed = false;
+        let (changed, _) = deck.waveform_tick(Some(MicSample::dead()), settle);
+        assert!(!changed);
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
+
+        // Recovery flips the state back with one repaint.
+        let (changed, _) = deck.waveform_tick(
+            Some(MicSample {
+                level: 40,
+                live: true,
+                dead: false,
+            }),
+            settle + Duration::from_millis(50),
+        );
+        assert!(changed);
     }
 
     /// A deck shaped like the multibar example's media flow: the media bar
@@ -3213,8 +3289,14 @@ mod tests {
         // Live monitor samples stream into the full-bar graph at the
         // frame cadence, filling everything but the Off button.
         for level in [12, 47, 78, 33] {
-            let (changed, timeout) =
-                deck.visualizer_tick(Some(MicSample { level, live: true }), now);
+            let (changed, timeout) = deck.visualizer_tick(
+                Some(MicSample {
+                    level,
+                    live: true,
+                    dead: false,
+                }),
+                now,
+            );
             assert!(changed);
             assert_eq!(timeout, waveform::FRAME_INTERVAL_MS);
         }
@@ -3250,6 +3332,7 @@ mod tests {
             Some(MicSample {
                 level: 90,
                 live: true,
+                dead: false,
             }),
             later,
         );
@@ -3274,6 +3357,7 @@ mod tests {
             Some(MicSample {
                 level: 90,
                 live: true,
+                dead: false,
             }),
             later,
         );
@@ -3338,6 +3422,7 @@ mod tests {
             Some(MicSample {
                 level: 50,
                 live: true,
+                dead: false,
             }),
             Instant::now(),
         );
@@ -3387,7 +3472,8 @@ mod tests {
         assert!(wave.sample(
             MicSample {
                 level: 77,
-                live: true
+                live: true,
+                dead: false
             },
             now - Duration::from_millis(60)
         ));

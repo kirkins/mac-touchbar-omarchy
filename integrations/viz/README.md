@@ -7,11 +7,13 @@ same session, same abstract AF_UNIX boundary, different source - without
 connecting to its socket or modifying its files.
 
 **Install and enable this receiver before expecting the visualizer to
-work.** A missing receiver is the number-one silent failure: the Touch Bar
-shows only a calm dim baseline and, since v2, the daemon logs one line per
-enable (`visualizer receiver unavailable; install and enable
-integrations/viz/dfr-viz`) - check `journalctl -u tiny-dfr` if the view
-stays flat.
+work.** A missing receiver is the number-one silent failure - which is
+exactly why it no longer shows as silence: since the dead-feed indicator,
+an enabled view paints an unmissable red `No feed` marker instead of the
+calm dim baseline a quiet healthy feed rests on, and, since v2, the daemon
+logs one line per enable (`visualizer receiver unavailable; install and
+enable integrations/viz/dfr-viz`) - check `journalctl -u tiny-dfr` if the
+marker stays up.
 
 ## What it captures
 

@@ -57,9 +57,10 @@ Keys = [
 # the Off button, any navigation away, or reloading the configuration
 # leaves the view and stops the capture. The feed is the optional
 # desktop-session helper in integrations/viz (see README) - it must be
-# installed and its service enabled; without it the view rests on a calm
-# dim baseline and the daemon logs one line per enable. The line reuses
-# the recording waveform's motion knobs: VisualizerStyle = "bars" keeps
+# installed and its service enabled; a dead or missing helper shows an
+# unmissable red `No feed` marker where a quiet healthy feed would rest on
+# the calm dim baseline, and the daemon logs one line per enable. The line
+# reuses the recording waveform's motion knobs: VisualizerStyle = "bars" keeps
 # the bar graph. The line follows the level directly, unsmoothed; opt into a
 # calmer motion with VisualizerSmoothing (ms decay, attack a third of it) and
 # VisualizerLag (ms of visual delay, capped at 500).
@@ -70,8 +71,10 @@ Keys = [
 # drawn line that rests flat while silent and ripples while speaking, a
 # recording dot that pulses with live level, and a duration timer counting
 # from entering the layer, all driven by the optional desktop-session level
-# feed (see README; without it the widget shows a calm idle baseline and the
-# timer). The line follows the level directly, unsmoothed. Set
+# feed (see README; a dead or missing feed shows an unmissable red slashed
+# dot and a `No feed` label, never the calm idle baseline of a quiet feed,
+# while the timer keeps counting). The line follows the level directly,
+# unsmoothed. Set
 # WaveformStyle = "bars" on the button to keep the previous scrolling bar
 # graph instead of the line, or opt into a calmer motion with
 # WaveformSmoothing (ms decay, attack a third of it) and WaveformLag (ms of

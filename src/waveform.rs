@@ -10,9 +10,13 @@
 //! AF_UNIX and kernel peer-UID boundary as the volume and brightness
 //! receivers - and repaints only that button at the poll cadence. Everywhere
 //! else the widget sleeps: the poller is disarmed, no sockets are dialed,
-//! and the shared epoll keeps its existing low-cadence timeouts. The widget
-//! also has a visually distinct idle state (dim dot, flat baseline) for a
-//! missing helper, so a layer switch alone never fakes live input.
+//! and the shared epoll keeps its existing low-cadence timeouts. Feed
+//! health is a visible state of its own, distinct from loudness: a quiet
+//! but healthy feed rests on the calm idle look (dim dot, flat baseline),
+//! while a dead feed - a missing, rejecting, timing-out, or garbling
+//! receiver - is unmissable, a red slashed circle around the dot plus a
+//! red `No feed` label, so a dead source never reads as mere silence. A
+//! layer switch alone never fakes live input.
 //!
 //! Samples land at the poll cadence (one level every [`POLL_INTERVAL`]),
 //! but motion does not step at that cadence: between two samples the
@@ -79,6 +83,14 @@ const DOT_R_BASE: f64 = 3.5;
 const DOT_R_SPAN: f64 = 3.0;
 /// Centered label the music visualizer shows while its session is off.
 const VIZ_LABEL: &str = "Viz";
+/// Label the widget paints while its feed is dead, in the deck's red
+/// warning accent: a source that cannot be observed must never read as
+/// mere silence.
+const DEAD_LABEL: &str = "No feed";
+/// Radius of the slashed-circle glyph drawn around the recording dot
+/// while the feed is dead - several times the idle dot, so the dead
+/// state is legible at a glance.
+const DEAD_GLYPH_R: f64 = 8.5;
 /// Gap between the pulsing dot and the duration label.
 const TEXT_GAP: f64 = 12.0;
 /// Width reserved on the left for dot plus duration label.
@@ -208,12 +220,27 @@ impl Style {
 
 /// One live microphone observation from the desktop receiver: `level` is
 /// 0-100 (latest capture peak) and `live` reports whether a recording was
-/// actually in progress. A missing, rejecting, or garbling receiver yields
-/// `level 0, live false` rather than an error.
+/// actually in progress. `dead` reports a feed that could not be observed
+/// at all - a missing, rejecting, timing-out, or garbling receiver - so
+/// the widget can tell a dead source from a merely quiet one. Dead
+/// samples carry `level 0, live false`; the default is a healthy, quiet
+/// feed, the state before any poll has spoken.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
     pub level: u8,
     pub live: bool,
+    pub dead: bool,
+}
+
+impl Sample {
+    /// The sample a failed poll produces: the feed could not be observed.
+    pub fn dead() -> Self {
+        Self {
+            level: 0,
+            live: false,
+            dead: true,
+        }
+    }
 }
 
 /// Fixed-capacity ring of the most recent input levels, oldest dropped
@@ -439,6 +466,9 @@ pub struct WaveformWidget {
     history: LevelHistory,
     started: Option<Instant>,
     live: bool,
+    /// Whether the feed itself could not be observed on the newest poll:
+    /// the dead state, distinct from a merely quiet healthy feed.
+    dead: bool,
     /// Peak-following pulse driver for the recording dot.
     smoothed: f32,
     /// The pulse as it was last painted, to gate decay-only repaints.
@@ -468,6 +498,7 @@ impl WaveformWidget {
             history: LevelHistory::new(),
             started: None,
             live: false,
+            dead: false,
             smoothed: 0.0,
             shown_pulse: 0.0,
             shown_second: 0,
@@ -514,6 +545,7 @@ impl WaveformWidget {
         self.started = Some(now);
         self.history.clear();
         self.live = false;
+        self.dead = false;
         self.smoothed = 0.0;
         self.shown_pulse = 0.0;
         self.shown_second = 0;
@@ -530,11 +562,17 @@ impl WaveformWidget {
     pub fn deactivate(&mut self) {
         self.started = None;
         self.live = false;
+        self.dead = false;
     }
 
     #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.started.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     /// Fold one poll result in. Returns whether the sample itself changed
@@ -545,10 +583,10 @@ impl WaveformWidget {
         if self.started.is_none() {
             return false;
         }
-        let before = (self.history.newest(), self.live);
+        let before = (self.history.newest(), self.live, self.dead);
         self.pending.push_back((now, sample));
         self.drain(now);
-        self.history.newest() != before.0 || self.live != before.1
+        self.history.newest() != before.0 || self.live != before.1 || self.dead != before.2
     }
 
     /// Release every lagged sample whose wait has elapsed. The lag is
@@ -573,6 +611,7 @@ impl WaveformWidget {
     fn apply(&mut self, sample: Sample, measured_at: Instant) {
         self.previous_level = self.displayed_level;
         self.live = sample.live;
+        self.dead = sample.dead;
         self.displayed_level = self
             .motion
             .advance(self.displayed_level, f64::from(sample.level));
@@ -726,15 +765,38 @@ impl WaveformWidget {
         );
         c.show_text(&label).unwrap();
         // The live input visualization - the newest level eases in at the
-        // right edge while older history glides left between samples, or a
-        // flat dim baseline while idle. The fractional phase keeps positions
-        // continuous across sample boundaries: a feature one slot right at
-        // phase 0 is exactly where its predecessor ended at phase 1.
+        // right edge while older history glides left between samples, a
+        // flat dim baseline while idle, and the red dead-feed marker when
+        // the feed could not be observed. The fractional phase keeps
+        // positions continuous across sample boundaries: a feature one
+        // slot right at phase 0 is exactly where its predecessor ended at
+        // phase 1.
         if self.live {
             match self.style {
                 Style::Line => self.render_line(c, &layout, left, cy, now),
                 Style::Bars => self.render_bars(c, &layout, left, y_shift, now),
             }
+        } else if self.dead {
+            // Dead feed: a red slashed circle around the dim dot plus the
+            // red `No feed` label where the wave would live. Deliberately
+            // loud - a dead source must never be mistaken for the calm
+            // idle baseline of a merely quiet feed.
+            let (r, g, b) = ButtonAccent::Red.rgb();
+            c.set_source_rgb(r, g, b);
+            c.set_line_width(2.0);
+            c.arc(
+                left + layout.dot.0,
+                cy,
+                DEAD_GLYPH_R,
+                0.0,
+                2.0 * std::f64::consts::PI,
+            );
+            c.stroke().unwrap();
+            let corner = DEAD_GLYPH_R * std::f64::consts::FRAC_1_SQRT_2;
+            c.move_to(left + layout.dot.0 - corner, cy + corner);
+            c.line_to(left + layout.dot.0 + corner, cy - corner);
+            c.stroke().unwrap();
+            Self::draw_dead_label(c, left + layout.bars.0, 0.0, cy, false);
         } else {
             c.set_source_rgb(0.42, 0.42, 0.42);
             c.rectangle(left + layout.bars.0, cy - 0.5, layout.bars.1, 1.0);
@@ -742,11 +804,30 @@ impl WaveformWidget {
         }
     }
 
+    /// The red `No feed` dead-feed label, vertically centered on `cy`:
+    /// left-aligned at `x` for the microphone widget, or centered across
+    /// `width` - mirroring the `Viz` label's placement - for the music
+    /// visualizer.
+    fn draw_dead_label(c: &Context, x: f64, width: f64, cy: f64, center: bool) {
+        let (r, g, b) = ButtonAccent::Red.rgb();
+        c.set_source_rgb(r, g, b);
+        c.set_font_size(TIMER_FONT);
+        let extents = c.text_extents(DEAD_LABEL).unwrap();
+        let x = if center {
+            x + (width - extents.width()) / 2.0 - extents.x_bearing()
+        } else {
+            x
+        };
+        c.move_to(x, cy - extents.y_bearing() - extents.height() / 2.0);
+        c.show_text(DEAD_LABEL).unwrap();
+    }
+
     /// The music visualizer's chrome-free rendering: the same line or bar
     /// graph across the whole button while a session runs and the feed is
-    /// live, a dim flat baseline while on without a feed, and a centered
-    /// `Viz` label while off - the visualizer is opt-in every time its
-    /// layer is entered, and the label keeps the control discoverable.
+    /// live, a dim flat baseline while on against a quiet healthy feed, a
+    /// red `No feed` label while the feed is dead, and a centered `Viz`
+    /// label while off - the visualizer is opt-in every time its layer is
+    /// entered, and the label keeps the control discoverable.
     fn render_music(
         &self,
         c: &Context,
@@ -774,6 +855,8 @@ impl WaveformWidget {
                 Style::Line => self.render_line(c, &layout, left, cy, now),
                 Style::Bars => self.render_bars(c, &layout, left, y_shift, now),
             }
+        } else if self.dead {
+            Self::draw_dead_label(c, left, width, cy, true);
         } else {
             c.set_source_rgb(0.42, 0.42, 0.42);
             c.rectangle(left + layout.bars.0, cy - 0.5, layout.bars.1, 1.0);
@@ -909,10 +992,12 @@ impl MicLevels {
 }
 
 /// Ask the desktop receiver for one live level observation. Any transport
-/// or validation failure simply means "not live" - a missing helper is the
-/// normal case, not an error worth logging at poll cadence.
+/// or validation failure yields a dead sample rather than an error - a
+/// missing helper is the normal case, not one worth logging at poll
+/// cadence, and the widget paints the dead state so a broken feed is
+/// visible on the glass instead of reading as silence.
 fn fetch_level(address: &SocketAddr, uid: u32) -> Sample {
-    fetch_level_result(address, uid).unwrap_or_default()
+    fetch_level_result(address, uid).unwrap_or_else(|_| Sample::dead())
 }
 
 fn fetch_level_result(address: &SocketAddr, uid: u32) -> io::Result<Sample> {
@@ -983,7 +1068,11 @@ fn parse_level(response: &str) -> io::Result<Sample> {
                 .parse::<u8>()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid level payload"))?;
             if level <= 100 {
-                Ok(Sample { level, live: true })
+                Ok(Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                })
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -994,6 +1083,7 @@ fn parse_level(response: &str) -> io::Result<Sample> {
         ["idle"] => Ok(Sample {
             level: 0,
             live: false,
+            dead: false,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1215,7 +1305,8 @@ mod tests {
         assert!(immediate.sample(
             Sample {
                 level: 70,
-                live: true
+                live: true,
+                dead: false
             },
             now
         ));
@@ -1228,7 +1319,8 @@ mod tests {
         assert!(!wave.sample(
             Sample {
                 level: 70,
-                live: true
+                live: true,
+                dead: false
             },
             now
         ));
@@ -1245,7 +1337,8 @@ mod tests {
         assert!(!wave.sample(
             Sample {
                 level: 70,
-                live: true
+                live: true,
+                dead: false
             },
             now
         ));
@@ -1423,6 +1516,7 @@ mod tests {
             Sample {
                 level: 50,
                 live: true,
+                dead: false,
             },
             now,
         );
@@ -1512,6 +1606,7 @@ mod tests {
                 Sample {
                     level: 0,
                     live: true,
+                    dead: false,
                 },
                 now + Duration::from_millis(50 * step as u64),
             );
@@ -1532,7 +1627,11 @@ mod tests {
             .enumerate()
         {
             wave.sample(
-                Sample { level, live: true },
+                Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                },
                 now + Duration::from_millis(50 * step as u64),
             );
         }
@@ -1557,7 +1656,11 @@ mod tests {
             .enumerate()
         {
             quiet.sample(
-                Sample { level, live: true },
+                Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                },
                 now + Duration::from_millis(50 * step as u64),
             );
         }
@@ -1585,6 +1688,7 @@ mod tests {
             Sample {
                 level: 33,
                 live: true,
+                dead: false,
             },
             now + Duration::from_millis(50 * len as u64),
         );
@@ -1623,7 +1727,11 @@ mod tests {
             wave.activate(now);
             for (step, &level) in levels.iter().enumerate() {
                 wave.sample(
-                    Sample { level, live: true },
+                    Sample {
+                        level,
+                        live: true,
+                        dead: false,
+                    },
                     now + Duration::from_millis(50 * step as u64),
                 );
             }
@@ -1681,6 +1789,7 @@ mod tests {
             Sample {
                 level: 60,
                 live: true,
+                dead: false,
             },
             now,
         );
@@ -1736,7 +1845,8 @@ mod tests {
         assert!(!wave.sample(
             Sample {
                 level: 80,
-                live: true
+                live: true,
+                dead: false
             },
             now
         ));
@@ -1745,7 +1855,8 @@ mod tests {
         assert!(wave.sample(
             Sample {
                 level: 80,
-                live: true
+                live: true,
+                dead: false
             },
             now
         ));
@@ -1763,7 +1874,8 @@ mod tests {
         assert!(!wave.sample(
             Sample {
                 level: 80,
-                live: true
+                live: true,
+                dead: false
             },
             frame_now
         ));
@@ -1775,7 +1887,7 @@ mod tests {
         assert_eq!(wave.history().len(), 2);
         // A lost feed freezes the scroll; the pulse decays out over a few
         // frames, then the widget rests until the timer's next second.
-        assert!(wave.sample(Sample::default(), frame_now + Duration::from_secs(2)));
+        assert!(wave.sample(Sample::dead(), frame_now + Duration::from_secs(2)));
         let mut settling = 0;
         let mut idle_now = frame_now + Duration::from_secs(2);
         while wave.frame(idle_now) {
@@ -1790,18 +1902,19 @@ mod tests {
         let boundary = idle_now + Duration::from_millis(1100);
         assert!(wave.frame(boundary));
         let quiet = boundary + Duration::from_millis(1);
-        assert!(!wave.sample(Sample::default(), quiet));
+        assert!(!wave.sample(Sample::dead(), quiet));
         assert!(!wave.frame(quiet));
     }
 
     #[test]
-    fn level_replies_map_to_samples_and_failures_are_never_live() {
+    fn level_replies_map_to_samples_failures_are_dead_and_idle_stays_healthy() {
         for (reply, expected) in [
             (
                 "ok 42",
                 Sample {
                     level: 42,
                     live: true,
+                    dead: false,
                 },
             ),
             (
@@ -1809,6 +1922,7 @@ mod tests {
                 Sample {
                     level: 100,
                     live: true,
+                    dead: false,
                 },
             ),
             (
@@ -1816,18 +1930,23 @@ mod tests {
                 Sample {
                     level: 0,
                     live: true,
+                    dead: false,
                 },
             ),
+            // A quiet healthy feed: the receiver answers, just idle.
             ("idle", Sample::default()),
-            ("error", Sample::default()),
-            ("ok 101", Sample::default()),
-            ("ok -3", Sample::default()),
-            ("ok", Sample::default()),
-            ("loud", Sample::default()),
-            ("", Sample::default()),
+            // Every failure - rejected, out of range, or garbage - is the
+            // dead state: observable as such, and never live.
+            ("error", Sample::dead()),
+            ("ok 101", Sample::dead()),
+            ("ok -3", Sample::dead()),
+            ("ok", Sample::dead()),
+            ("loud", Sample::dead()),
+            ("", Sample::dead()),
         ] {
-            let parsed = parse_level(reply).unwrap_or_default();
+            let parsed = parse_level(reply).unwrap_or_else(|_| Sample::dead());
             assert_eq!(parsed, expected, "reply {reply:?}");
+            assert!(!parsed.live || !parsed.dead, "live and dead are exclusive");
         }
         let address = address();
         let (server, bound) = script_server(
@@ -1840,12 +1959,13 @@ mod tests {
             Sample {
                 level: 42,
                 live: true,
+                dead: false,
             },
             Sample::default(),
-            Sample::default(),
-            Sample::default(),
-            Sample::default(),
-            Sample::default(),
+            Sample::dead(),
+            Sample::dead(),
+            Sample::dead(),
+            Sample::dead(),
         ] {
             assert_eq!(fetch_level(&address, uid), expected);
         }
@@ -1873,6 +1993,143 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_dead_feed_is_distinct_from_a_quiet_one_and_the_widget_recovers() {
+        let now = Instant::now();
+        let mut wave = WaveformWidget::new(Style::Line);
+        wave.activate(now);
+
+        // A quiet healthy feed: never dead, and repeated idle samples stop
+        // reporting change.
+        assert!(wave.sample(Sample::default(), now));
+        assert!(!wave.is_dead());
+        assert!(!wave.sample(Sample::default(), now + SAMPLE_PERIOD));
+
+        // The feed dies: the flip is one repaint's worth of change, the
+        // dead state shows, and further dead polls stay quiet. Dead is
+        // not live, so nothing animates: past the pulse decay the widget
+        // rests at the timer's second cadence.
+        assert!(wave.sample(Sample::dead(), now + 2 * SAMPLE_PERIOD));
+        assert!(wave.is_dead());
+        assert!(!wave.live);
+        assert!(!wave.sample(Sample::dead(), now + 3 * SAMPLE_PERIOD));
+        let mut settle = now + 3 * SAMPLE_PERIOD;
+        let mut settling = 0;
+        while wave.frame(settle) {
+            settle += Duration::from_millis(FRAME_INTERVAL_MS as u64);
+            settling += 1;
+            assert!(settling < 100, "dead widget never settled");
+        }
+        assert_eq!(
+            wave.next_timeout(settle),
+            1000 - (settle - now).as_millis() as i32 % 1000
+        );
+
+        // The receiver comes back answering idle: the dead state clears
+        // with one repaint and the widget rests on the idle look again.
+        assert!(wave.sample(Sample::default(), settle + SAMPLE_PERIOD));
+        assert!(!wave.is_dead());
+        assert!(!wave.sample(Sample::default(), settle + 2 * SAMPLE_PERIOD));
+
+        // A live sample restarts the graph, and a mid-session death flips
+        // straight from live to dead.
+        assert!(wave.sample(
+            Sample {
+                level: 55,
+                live: true,
+                dead: false
+            },
+            settle + 3 * SAMPLE_PERIOD
+        ));
+        assert!(wave.live);
+        assert!(!wave.is_dead());
+        assert!(wave.sample(Sample::dead(), settle + 4 * SAMPLE_PERIOD));
+        assert!(wave.is_dead());
+        assert!(!wave.live);
+
+        // Re-entering the layer starts a fresh session: healthy-looking
+        // until a poll says otherwise.
+        wave.deactivate();
+        assert!(!wave.is_dead());
+        wave.activate(settle + 5 * SAMPLE_PERIOD);
+        assert!(!wave.is_dead());
+    }
+
+    #[test]
+    fn the_dead_state_paints_a_red_marker_and_leaves_quiet_and_live_calm() {
+        let render = |wave: &WaveformWidget, now: Instant| {
+            let mut surface = ImageSurface::create(Format::ARgb32, 570, 60).unwrap();
+            {
+                let c = Context::new(&surface).unwrap();
+                wave.render_at(&c, 60, 0.0, 570.0, 0.0, now);
+            }
+            let data = surface.data().unwrap().to_vec();
+            data
+        };
+        // Red-dominant ink (ARGB32 bytes are B, G, R, A here): channel
+        // evidence of the deck's red warning accent, which the idle look,
+        // the live wave, and the white chrome never carry.
+        let red_dominant = |data: &[u8]| {
+            (0..data.len())
+                .step_by(4)
+                .any(|i| i32::from(data[i + 2]) > i32::from(data[i]) + 20 && data[i + 2] > 100)
+        };
+        let now = Instant::now();
+
+        // Quiet healthy: the calm idle look, no red anywhere.
+        let mut quiet = WaveformWidget::new(Style::Line);
+        quiet.activate(now);
+        quiet.sample(Sample::default(), now);
+        let quiet_frame = render(&quiet, now);
+        assert!(!quiet_frame.is_empty());
+        assert!(!red_dominant(&quiet_frame), "quiet feed painted red");
+
+        // Dead: red ink appears, and the frame is nothing the quiet look
+        // could be mistaken for.
+        let mut dead = WaveformWidget::new(Style::Line);
+        dead.activate(now);
+        dead.sample(Sample::dead(), now + SAMPLE_PERIOD);
+        let dead_frame = render(&dead, now + SAMPLE_PERIOD);
+        assert!(red_dominant(&dead_frame), "dead feed painted no red marker");
+        assert_ne!(dead_frame, quiet_frame);
+
+        // The marker is style-independent: a dead bars widget shows the
+        // same state, never its graph.
+        let mut dead_bars = WaveformWidget::new(Style::Bars);
+        dead_bars.activate(now);
+        dead_bars.sample(Sample::dead(), now + SAMPLE_PERIOD);
+        assert_eq!(render(&dead_bars, now + SAMPLE_PERIOD), dead_frame);
+
+        // Live: the wave takes the graph, and no red appears - a live
+        // feed must not be disturbed by the dead state's warning color.
+        let mut live = WaveformWidget::new(Style::Line);
+        live.activate(now);
+        for (step, level) in [8, 22, 5, 41, 67, 88, 30].into_iter().enumerate() {
+            live.sample(
+                Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                },
+                now + Duration::from_millis(50 * step as u64),
+            );
+        }
+        let live_frame = render(&live, now + Duration::from_millis(40));
+        assert!(!red_dominant(&live_frame), "live feed disturbed with red");
+        assert_ne!(dead_frame, live_frame);
+
+        // The music visualizer's dead state is the same red marker,
+        // distinct from its off label and from the mic widget's layout.
+        let viz_off = render(&WaveformWidget::new_music(Style::Line), now);
+        let mut viz = WaveformWidget::new_music(Style::Line);
+        viz.activate(now);
+        viz.sample(Sample::dead(), now);
+        let viz_dead = render(&viz, now);
+        assert!(red_dominant(&viz_dead), "dead visualizer painted no red");
+        assert_ne!(viz_dead, viz_off);
+        assert_ne!(viz_dead, dead_frame);
     }
 
     #[test]
@@ -1951,7 +2208,11 @@ mod tests {
             .enumerate()
         {
             wave.sample(
-                Sample { level, live: true },
+                Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                },
                 now + Duration::from_millis(50 * step as u64),
             );
         }
@@ -1972,6 +2233,7 @@ mod tests {
                 Sample {
                     level: 0,
                     live: true,
+                    dead: false,
                 },
                 last + Duration::from_millis(50 + 50 * step as u64),
             );
@@ -1998,6 +2260,7 @@ mod tests {
                 Sample {
                     level: (step * 7 % 101) as u8,
                     live: true,
+                    dead: false,
                 },
                 now + Duration::from_millis(50 * step as u64),
             );
@@ -2032,7 +2295,8 @@ mod tests {
         assert!(viz.sample(
             Sample {
                 level: 50,
-                live: true
+                live: true,
+                dead: false
             },
             now
         ));
@@ -2040,7 +2304,7 @@ mod tests {
         assert!(viz.frame(now + Duration::from_millis(33)));
         // On with a lost feed: no timer boundary keeps it waking; the
         // visualizer rests until the feed returns or it is toggled off.
-        assert!(viz.sample(Sample::default(), now + Duration::from_secs(2)));
+        assert!(viz.sample(Sample::dead(), now + Duration::from_secs(2)));
         let mut idle = now + Duration::from_secs(2);
         while viz.frame(idle) {
             idle += Duration::from_millis(FRAME_INTERVAL_MS as u64);
@@ -2097,7 +2361,11 @@ mod tests {
             .enumerate()
         {
             viz.sample(
-                Sample { level, live: true },
+                Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                },
                 now + Duration::from_millis(50 * step as u64),
             );
         }
@@ -2135,7 +2403,11 @@ mod tests {
             .enumerate()
         {
             bars.sample(
-                Sample { level, live: true },
+                Sample {
+                    level,
+                    live: true,
+                    dead: false,
+                },
                 now + Duration::from_millis(50 * step as u64),
             );
         }
@@ -2188,6 +2460,7 @@ mod tests {
             != Some(Sample {
                 level: 42,
                 live: true,
+                dead: false,
             })
         {
             assert!(Instant::now() < deadline, "armed poller never sampled");

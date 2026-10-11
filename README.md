@@ -313,9 +313,11 @@ file trails the live microphone by only a few milliseconds. Dictation
 mechanics, audio routing, and
 the receiver's existing `start`/`stop`/`cancel` behavior are unchanged. The
 daemon verifies the receiver's kernel peer UID like the volume and brightness
-receivers, and a missing, rejecting, or garbling receiver simply shows the
-widget's idle look - a dim dot, flat baseline, and the timer - never a fake
-signal.
+receivers. Feed health is visible on the glass: a quiet but healthy feed
+shows the widget's idle look - a dim dot, flat baseline, and the timer -
+while a missing, rejecting, or garbling receiver shows an unmissable dead
+state, a red slashed circle around the dot and a red `No feed` label, so a
+dead source never reads as mere silence and never fakes a signal.
 
 The repaint cadence stays bounded: the poller is armed only while the
 recording layer is displayed, polling at 20 Hz, and the widget repaints just
@@ -350,7 +352,8 @@ the speakers, not the microphone, regardless of which player owns it - and
 serves one-shot level requests over the same abstract AF_UNIX and kernel
 peer-UID boundary as the volume, brightness, and voice receivers. **The
 receiver must be installed and its service enabled before the visualizer can
-draw anything**: without it an enabled view rests on a calm dim baseline and
+draw anything**: without it an enabled view shows an unmissable red `No feed`
+marker instead of the calm dim baseline a quiet healthy feed rests on, and
 the daemon logs one line per enable (`visualizer receiver unavailable; install
 and enable integrations/viz/dfr-viz`) so a missing helper is diagnosable from
 the journal instead of failing silently, exactly like the recording waveform
