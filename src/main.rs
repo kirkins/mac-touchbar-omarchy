@@ -70,7 +70,7 @@ use level_control::Request as LevelRequest;
 use level_control::{LevelControl, State as LevelState};
 use pet::{Bar as PetBar, PetManager, Span as PetSpan};
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
-use slider::{Geometry, Kind, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
+use slider::{Geometry, Kind, MuteWatch, Overlay, Render, DRAG_THRESHOLD_PX, LINGER};
 use waveform::{MicLevels, MonitorLevels, Sample as MicSample, Style, WaveformWidget};
 
 const BUTTON_SPACING_PX: i32 = 16;
@@ -292,6 +292,10 @@ struct Button {
     icon_width: f64,
     icon_height: f64,
     accent: Option<ButtonAccent>,
+    // The closed-slider mute mark: set on volume slider buttons from the
+    // deck's mute watch, drawn as a slash over the button's centered
+    // content. Layout and hit targets are never touched by it.
+    muted: bool,
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -524,6 +528,7 @@ impl Button {
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
+            muted: false,
         }
     }
     fn new_text(text: String, action: ButtonAction) -> Button {
@@ -535,6 +540,7 @@ impl Button {
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
+            muted: false,
         }
     }
     fn new_icon(
@@ -554,6 +560,7 @@ impl Button {
             active: false,
             changed: false,
             accent: None,
+            muted: false,
         }
     }
     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
@@ -617,6 +624,7 @@ impl Button {
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
+            muted: false,
         }
     }
 
@@ -643,6 +651,7 @@ impl Button {
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
+            muted: false,
         }
     }
 
@@ -666,6 +675,7 @@ impl Button {
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
+            muted: false,
         }
     }
 
@@ -694,6 +704,7 @@ impl Button {
             icon_width: 0.0,
             icon_height: 0.0,
             accent: None,
+            muted: false,
         }
     }
     fn needs_faster_refresh(&self) -> bool {
@@ -881,6 +892,24 @@ impl Button {
             }
             ButtonImage::Spacer => (),
         }
+        if self.muted && matches!(self.action, ButtonAction::VolumeSlider) {
+            // The closed slider's mute mark: the same black-backed white
+            // slash the drawn slider lays over its speaker glyph, centered
+            // over this button's icon or label. The mark only overdraws;
+            // the button's size and hit target stay exactly as configured.
+            let mid = height as f64 / 2.0 + y_shift;
+            let center = button_left_edge + button_width as f64 / 2.0;
+            let reach = (height as f64 * 0.35)
+                .min(button_width as f64 / 4.0)
+                .max(6.0);
+            for (line_width, color) in [(5.0, 0.0), (2.0, 1.0)] {
+                c.set_line_width(line_width);
+                c.set_source_rgb(color, color, color);
+                c.move_to(center - reach, mid + reach);
+                c.line_to(center + reach, mid - reach);
+                c.stroke().unwrap();
+            }
+        }
     }
     fn set_active(&mut self, active: bool, emit_keys: &mut impl FnMut(&[Key], bool)) {
         if self.active != active {
@@ -1011,6 +1040,7 @@ impl FunctionLayer {
                         icon_width: 0.0,
                         icon_height: 0.0,
                         accent: None,
+                        muted: false,
                     },
                 ),
                 (
@@ -1023,6 +1053,7 @@ impl FunctionLayer {
                         icon_width: 0.0,
                         icon_height: 0.0,
                         accent: None,
+                        muted: false,
                     },
                 ),
             ],
@@ -1350,6 +1381,11 @@ pub struct LayerDeck {
     fn_return: Option<usize>,
     touches: HashMap<u32, TouchState>,
     slider: Overlay,
+    // The closed-slider mute watch: a slow background probe keeps the
+    // volume buttons' mute mark current while no slider is drawn. Armed
+    // only on decks that actually carry a volume slider control.
+    mute: MuteWatch,
+    volume_sliders: bool,
     // For each configured bar carrying a Viz button, the deck index of
     // its synthesized full-bar visualizer view; the map is the toggle's
     // whole routing table.
@@ -1393,6 +1429,12 @@ impl LayerDeck {
             names.insert(name.clone(), layers.len());
             layers.push((name, view));
         }
+        let volume_sliders = layers.iter().any(|(_, layer)| {
+            layer
+                .buttons
+                .iter()
+                .any(|(_, button)| button.action == ButtonAction::VolumeSlider)
+        });
         Self {
             layers: layers.into_iter().map(|(_, layer)| layer).collect(),
             names,
@@ -1406,6 +1448,8 @@ impl LayerDeck {
             fn_return: None,
             touches: HashMap::new(),
             slider: Overlay::default(),
+            mute: MuteWatch::default(),
+            volume_sliders,
         }
     }
 
@@ -1800,6 +1844,48 @@ impl LayerDeck {
     fn slider_collapse(&mut self) {
         if self.slider.collapse() {
             self.mark_slider_changed();
+            // The closed bar is the mute mark's canvas again; re-read the
+            // mixer right away instead of waiting out the probe cadence.
+            self.mute.settle(Instant::now());
+        }
+    }
+
+    /// The due background mute probe, when this deck carries a volume
+    /// slider control and the shared slider is closed.
+    fn mute_probe(&mut self, now: Instant) -> Option<(u64, level_control::Request)> {
+        if !self.volume_sliders {
+            return None;
+        }
+        self.mute.tick(now, self.slider.active)
+    }
+
+    /// Whether this volume reply revision belongs to the mute watch's
+    /// outstanding probe; such replies never reach the overlay.
+    fn mute_owns(&self, revision: u64) -> bool {
+        self.volume_sliders && self.mute.owns(revision)
+    }
+
+    /// Route a volume reply through the mute watch first; the overlay only
+    /// sees replies its own revisions produced.
+    fn mute_reply(&mut self, revision: u64, result: std::io::Result<LevelState>) {
+        if !self.mute.owns(revision) {
+            return;
+        }
+        if self.mute.reply(revision, result, Instant::now()) {
+            self.show_volume_muted(self.mute.muted() == Some(true));
+        }
+    }
+
+    /// Push the closed-slider mute mark onto every volume slider button on
+    /// every layer, repainting only buttons whose mark actually changes.
+    fn show_volume_muted(&mut self, muted: bool) {
+        for layer in &mut self.layers {
+            for (_, button) in &mut layer.buttons {
+                if button.action == ButtonAction::VolumeSlider && button.muted != muted {
+                    button.muted = muted;
+                    button.changed = true;
+                }
+            }
         }
     }
 
@@ -2172,6 +2258,12 @@ fn real_main(drm: &mut DrmBackend) {
             );
         }
 
+        // The closed-slider mute watch probes the volume receiver on a slow
+        // cadence, and re-probes right after a collapse, so the volume
+        // button's mute mark stays current without any slider drawn.
+        if let Some((revision, request)) = layers.mute_probe(Instant::now()) {
+            volume_control.send(revision, request);
+        }
         for (revision, kind, request) in std::mem::take(&mut layers.slider.requests) {
             match kind {
                 Kind::Volume => volume_control.send(revision, request),
@@ -2179,7 +2271,11 @@ fn real_main(drm: &mut DrmBackend) {
             }
         }
         for (revision, result) in volume_control.update() {
-            layers.slider_reply(revision, Kind::Volume, result);
+            if layers.mute_owns(revision) {
+                layers.mute_reply(revision, result);
+            } else {
+                layers.slider_reply(revision, Kind::Volume, result);
+            }
         }
         for (revision, result) in brightness_control.update() {
             layers.slider_reply(revision, Kind::Brightness, result);
@@ -5087,5 +5183,224 @@ mod tests {
         deck.touch_up(0, &mut |_, _| {});
         assert!(!deck.slider.active);
         assert!(!deck.slider_drag_start(1, 500.0, 30.0, 2008, 60, &mut |_, _| {}));
+    }
+
+    /// Answer the deck's due mute probe with the given mixer state.
+    fn answer_mute_probe(deck: &mut LayerDeck, now: Instant, muted: bool) {
+        let (revision, request) = deck
+            .mute_probe(now)
+            .expect("a volume-slider deck owes the mixer a mute read");
+        assert_eq!(request, LevelRequest::Get);
+        deck.mute_reply(revision, Ok(LevelState { percent: 65, muted }));
+    }
+
+    #[test]
+    fn the_closed_slider_wears_a_live_mute_mark_on_its_volume_button() {
+        let mut deck = slider_deck();
+        answer_mute_probe(&mut deck, Instant::now(), true);
+        let buttons = &deck.current().buttons;
+        assert!(buttons[1].1.muted, "the volume button carries the mark");
+        // The mark rides exactly the volume slider controls of the deck:
+        // every button that would open the volume slider shows it, and
+        // nothing else does.
+        assert!(buttons.iter().enumerate().all(|(i, (_, button))| {
+            let is_volume = button.action == ButtonAction::VolumeSlider;
+            button.muted == (is_volume && i != 3) && (!button.muted || is_volume)
+        }));
+        assert!(deck.layers.iter().all(|layer| {
+            layer
+                .buttons
+                .iter()
+                .all(|(_, button)| !button.muted || button.action == ButtonAction::VolumeSlider)
+        }));
+        // One probe per cadence window, and unmuting clears the mark
+        // through the same probe path.
+        let later = Instant::now() + slider::MUTE_PROBE_INTERVAL;
+        assert!(deck.mute_probe(later - Duration::from_millis(1)).is_none());
+        answer_mute_probe(&mut deck, later, false);
+        assert!(deck
+            .current()
+            .buttons
+            .iter()
+            .all(|(_, button)| !button.muted));
+    }
+
+    #[test]
+    fn decks_without_a_volume_slider_never_probe_the_mixer() {
+        let mut deck = named_deck();
+        for _ in 0..3 {
+            assert!(deck.mute_probe(Instant::now()).is_none());
+        }
+        // A stray reply can never invent a mark, either.
+        deck.mute_reply(
+            7,
+            Ok(LevelState {
+                percent: 65,
+                muted: true,
+            }),
+        );
+        assert!(deck
+            .layers
+            .iter()
+            .all(|layer| layer.buttons.iter().all(|(_, button)| !button.muted)));
+    }
+
+    #[test]
+    fn an_outstanding_probe_reply_never_disturbs_a_drawn_slider() {
+        let mut deck = slider_deck();
+        // A probe is outstanding when the user summons the slider.
+        let (probe, _) = deck.mute_probe(Instant::now()).unwrap();
+        let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
+        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        assert!(deck.slider.active);
+        let pending = deck.slider.requests.len();
+        let revision_before = deck.slider.revision;
+        // The probe reply lands mid-read: the watch claims it and the
+        // drawn slider keeps its own read pending.
+        deck.mute_reply(
+            probe,
+            Ok(LevelState {
+                percent: 65,
+                muted: true,
+            }),
+        );
+        assert!(deck.slider.active);
+        assert_eq!(deck.slider.revision, revision_before);
+        assert_eq!(deck.slider.requests.len(), pending);
+        assert!(deck.slider_render().is_none());
+        // With the probe settled, the open slider itself is what pauses
+        // the watch.
+        assert!(deck.mute_probe(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn collapsing_the_slider_hands_the_canvas_back_to_the_mute_mark() {
+        let mut deck = slider_deck();
+        let mut actual = 100;
+        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        apply_mixer_requests(&mut deck, &mut actual);
+        assert!(deck.slider_render().is_some());
+        // While the slider is drawn, the mark's watch stays paused.
+        assert!(deck.mute_probe(Instant::now()).is_none());
+        // Collapsing re-probes immediately, and the reply marks the button.
+        deck.slider_collapse();
+        answer_mute_probe(&mut deck, Instant::now(), true);
+        assert!(deck.current().buttons[1].1.muted);
+        assert!(deck.current().buttons[1].1.changed);
+    }
+
+    #[test]
+    fn mute_mark_renders_in_both_slider_states_and_restores_exactly() {
+        let config = outline_config();
+        let (width, height) = (2008, 60);
+        let mut deck = slider_deck();
+        let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
+        let background = crate::daycycle::BLACK;
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            true,
+            None,
+            background,
+        );
+        let closed_unmuted = surface.data().unwrap().to_vec();
+        let spans_before: Vec<(f64, f64)> = deck
+            .current()
+            .layout_spans(width, 0)
+            .iter()
+            .map(|span| (span.left, span.right))
+            .collect();
+
+        // Muted with the slider closed: the incremental redraw of just the
+        // volume button lays down the mark; the pair's geometry is frozen.
+        answer_mute_probe(&mut deck, Instant::now(), true);
+        let spans_after: Vec<(f64, f64)> = deck
+            .current()
+            .layout_spans(width, 0)
+            .iter()
+            .map(|span| (span.left, span.right))
+            .collect();
+        assert_eq!(spans_before, spans_after);
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            background,
+        );
+        assert_ne!(&*surface.data().unwrap(), closed_unmuted.as_slice());
+        let closed_muted = surface.data().unwrap().to_vec();
+
+        // Muted with the slider open: the drawn track keeps its own muted
+        // look at the same level, distinct from the unmuted draw. A fresh
+        // open queues a fresh read; a replayed revision is stale.
+        let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
+        deck.touch_down_at(0, 1260.0, 30.0, width as u16, 60, &mut emit, &mut |_| {});
+        for (revision, kind, request) in std::mem::take(&mut deck.slider.requests) {
+            assert_eq!(kind, Kind::Volume);
+            assert_eq!(request, LevelRequest::Get);
+            deck.slider_reply(
+                revision,
+                kind,
+                Ok(LevelState {
+                    percent: 65,
+                    muted: false,
+                }),
+            );
+        }
+        let slider = deck.slider_render();
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            slider,
+            background,
+        );
+        let open_unmuted = surface.data().unwrap().to_vec();
+        deck.touch_down(0, 1, 1260.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_up(0, &mut emit);
+        for (revision, kind, request) in std::mem::take(&mut deck.slider.requests) {
+            assert_eq!(kind, Kind::Volume);
+            assert_eq!(request, LevelRequest::Get);
+            deck.slider_reply(
+                revision,
+                kind,
+                Ok(LevelState {
+                    percent: 65,
+                    muted: true,
+                }),
+            );
+        }
+        assert!(deck.slider_render().unwrap().muted);
+        let slider = deck.slider_render();
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            slider,
+            background,
+        );
+        assert_ne!(&*surface.data().unwrap(), open_unmuted.as_slice());
+
+        // Collapsing restores exactly the closed muted bar.
+        deck.slider_collapse();
+        deck.current_mut().draw(
+            &config,
+            (width, height),
+            &surface,
+            (0.0, 0.0),
+            false,
+            None,
+            background,
+        );
+        assert_eq!(&*surface.data().unwrap(), closed_muted.as_slice());
     }
 }

@@ -873,6 +873,28 @@ Keys = [{ Text = "F1", Action = "F1" }]
         );
         assert!(!deck.current().buttons.iter().any(|(_, b)| matches!(&b.action, ButtonAction::Keys(keys) if keys.iter().any(|k| matches!(k, Key::BrightnessDown | Key::BrightnessUp)))));
         render(&mut deck, "implemented-home.png");
+        // The persistent closed-slider mute mark on the same home bar: the
+        // watch's probe read a muted mixer, so the volume button carries
+        // the slash the drawn slider would show; the bar is otherwise the
+        // identical plain frame above, at the same geometry.
+        let (revision, request) = deck
+            .mute_probe(Instant::now())
+            .expect("a volume-slider deck probes the mixer for the closed-bar mute mark");
+        assert_eq!(request, crate::level_control::Request::Get);
+        deck.mute_reply(
+            revision,
+            Ok(crate::level_control::State {
+                percent: 65,
+                muted: true,
+            }),
+        );
+        assert!(deck
+            .current()
+            .buttons
+            .iter()
+            .any(|(_, button)| button.muted && button.action == ButtonAction::VolumeSlider));
+        render(&mut deck, "implemented-home-muted.png");
+        deck.show_volume_muted(false);
         // One review frame per time-of-day band, at an hour inside each
         // default band, showing the strip background behind the same home bar.
         for (hour, name) in [(7, "morning"), (14, "day"), (19, "evening"), (23, "night")] {

@@ -28,7 +28,9 @@ DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
     cargo test --locked approved_multibar_preserves_voice_dispatch_and_renders_offline -- --test-threads=1
 ```
 
-Inspect `implemented-home.png`, `implemented-volume-mid.png`,
+Inspect `implemented-home.png`, `implemented-home-muted.png` (the same bar
+with the closed-slider mute mark on the volume button),
+`implemented-volume-mid.png`,
 `implemented-brightness.png`, `implemented-recording-live.png`, and
 `implemented-recording-idle.png` in that directory, plus the quick-keys frame
 `implemented-more.png` (the More bar), the visualizer
@@ -49,7 +51,13 @@ cover configuration compatibility, navigation, Fn behavior, reloads, emitted key
 presses/releases, battery widget cycling, the shared volume/brightness slider (either
 selection without stepping, combined-region geometry and drag math, safe ranges,
 auto-collapse timing, confirmed readback, failures, stale replies and selection
-isolation), command buttons (parse and
+isolation, and the persistent closed-slider mute mark: a slow background
+mute watch that only arms on bars carrying a volume slider, pauses while the
+slider does its own reads, is claimed before the slider when a probe reply
+lands mid-read, re-probes the moment the slider collapses, keeps the last
+confirmed state on a failed read, and lays a slash over the volume button
+that renders identically in both slider states without moving any button),
+command buttons (parse and
 combined layer dispatch, detached execution, the one-invocation-per-command
 cap, and the More bar's quick-key entries and shipped screenshot flow), the
 recording waveform (level-history ring behavior, line and bar
@@ -178,6 +186,15 @@ the far right reaches 130%, and intermediate percentages remain reachable.
 Absolute writes clear mute. The [desktop audio receiver](integrations/audio/README.md)
 resolves the current output using the existing Omarchy sink resolver and returns
 mixer readback.
+
+While the slider is closed, a muted mixer is still visible: the volume button
+wears the same slash the drawn slider lays over its speaker glyph. A slow
+background mute watch feeds the mark - it probes the audio receiver every few
+seconds, pauses while the slider performs its own reads, re-probes the moment
+the slider collapses, and shows nothing until its first confirmed read, so a
+missing receiver never invents a state. The mark overdraws the button's icon
+or label only; button sizes, the brightness twin, and every hit target stay
+exactly as configured.
 
 Brightness uses the [display receiver](integrations/brightness/README.md) and
 the working desktop `brightnessctl` interface for `apple-panel-bl`, with the

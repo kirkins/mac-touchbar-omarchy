@@ -14,6 +14,11 @@ use std::{
 pub const LINGER: Duration = Duration::from_millis(2500);
 pub const DRAG_THRESHOLD_PX: f64 = 8.0;
 const GLYPH_ZONE_PX: f64 = 28.0;
+/// How often the closed slider's mute watch re-reads the mixer. The desktop
+/// receiver answers one request per connection with real mixer work behind
+/// it, so the watch polls slowly and refreshes promptly only on the events
+/// that change what the closed bar shows: startup and the slider's collapse.
+pub const MUTE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
@@ -323,5 +328,162 @@ impl Geometry {
             c.line_to(glyph_x + 14.0, mid - 9.0);
             c.stroke().unwrap();
         }
+    }
+}
+
+/// Persistent mute state for the closed slider. The shared overlay tracks
+/// mute only while it is open, so without the watch nothing on the bar
+/// would show a mute toggle that happens with the slider closed. The watch
+/// probes the volume receiver on a slow cadence, pauses while the slider
+/// performs its own reads, and re-probes right after the collapse. Its
+/// request revisions come from their own counter: the main loop routes
+/// every volume reply by exact revision, to the watch first and into the
+/// overlay only when the watch does not own it.
+pub struct MuteWatch {
+    muted: Option<bool>,
+    revision: u64,
+    outstanding: Option<u64>,
+    next_at: Instant,
+}
+
+impl Default for MuteWatch {
+    fn default() -> Self {
+        Self {
+            muted: None,
+            revision: rand::random(),
+            outstanding: None,
+            next_at: Instant::now(),
+        }
+    }
+}
+
+impl MuteWatch {
+    /// The last confirmed mute state; `None` before the first read.
+    pub fn muted(&self) -> Option<bool> {
+        self.muted
+    }
+
+    /// Whether this revision belongs to the outstanding probe.
+    pub fn owns(&self, revision: u64) -> bool {
+        self.outstanding == Some(revision)
+    }
+
+    /// The due probe request, when the slider is closed, no probe is
+    /// outstanding, and the cadence allows one.
+    pub fn tick(&mut self, now: Instant, slider_open: bool) -> Option<(u64, Request)> {
+        if slider_open || self.outstanding.is_some() || now < self.next_at {
+            return None;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.outstanding = Some(self.revision);
+        Some((self.revision, Request::Get))
+    }
+
+    /// Ask for a fresh read as soon as possible; used when the slider
+    /// collapses and the closed bar becomes the mute mark's canvas again.
+    pub fn settle(&mut self, now: Instant) {
+        self.next_at = now;
+    }
+
+    /// Consume the reply to the outstanding probe; other revisions pass
+    /// through untouched. Returns whether the confirmed mute state
+    /// changed. A failed read keeps the last confirmed state and only
+    /// schedules the next probe, so a dead receiver never invents a state.
+    pub fn reply(&mut self, revision: u64, result: io::Result<State>, now: Instant) -> bool {
+        if !self.owns(revision) {
+            return false;
+        }
+        self.outstanding = None;
+        self.next_at = now + MUTE_PROBE_INTERVAL;
+        match result {
+            Ok(state) => {
+                let changed = self.muted != Some(state.muted);
+                self.muted = Some(state.muted);
+                changed
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn state(percent: u8, muted: bool) -> io::Result<State> {
+        Ok(State { percent, muted })
+    }
+
+    #[test]
+    fn watch_probes_on_cadence_only_while_the_slider_is_closed() {
+        let mut watch = MuteWatch::default();
+        let start = Instant::now();
+        let (revision, request) = watch.tick(start, false).unwrap();
+        assert_eq!(request, Request::Get);
+        assert!(watch.owns(revision));
+        // One outstanding probe: nothing further until it is answered.
+        assert!(watch.tick(start, false).is_none());
+        assert!(watch.reply(revision, state(40, false), start));
+        // An open slider pauses the watch entirely.
+        assert!(watch.tick(start, true).is_none());
+        assert!(watch.tick(start + MUTE_PROBE_INTERVAL, true).is_none());
+        // The next probe waits out the interval from the reply.
+        assert!(watch
+            .tick(
+                start + MUTE_PROBE_INTERVAL - Duration::from_millis(1),
+                false
+            )
+            .is_none());
+        let (next, _) = watch
+            .tick(start + MUTE_PROBE_INTERVAL, false)
+            .expect("interval elapsed without a due probe");
+        assert_ne!(next, revision);
+        assert!(watch.owns(next));
+        assert!(watch.tick(start + MUTE_PROBE_INTERVAL, false).is_none());
+    }
+
+    #[test]
+    fn watch_reports_only_real_mute_changes_and_keeps_state_on_errors() {
+        let mut watch = MuteWatch::default();
+        let start = Instant::now();
+        let (revision, _) = watch.tick(start, false).unwrap();
+        // The first confirmed read changes the watch's knowledge from
+        // unknown to unmuted; the deck dedupes what the buttons show.
+        assert!(watch.reply(revision, state(40, false), start));
+        assert_eq!(watch.muted(), Some(false));
+        // An unknown or already-answered revision is never consumed.
+        assert!(!watch.reply(revision, state(40, true), start));
+        assert_eq!(watch.muted(), Some(false));
+        let (revision, _) = watch.tick(start + MUTE_PROBE_INTERVAL, false).unwrap();
+        assert!(!watch.reply(revision, state(40, false), start));
+        assert_eq!(watch.muted(), Some(false));
+        let (revision, _) = watch.tick(start + MUTE_PROBE_INTERVAL, false).unwrap();
+        assert!(watch.reply(revision, state(40, true), start));
+        assert_eq!(watch.muted(), Some(true));
+        // A failed read keeps the last confirmed state and still schedules
+        // the next probe.
+        let (revision, _) = watch.tick(start + MUTE_PROBE_INTERVAL, false).unwrap();
+        assert!(!watch.reply(
+            revision,
+            Err(io::Error::other("receiver unavailable")),
+            start
+        ));
+        assert_eq!(watch.muted(), Some(true));
+        assert!(watch.tick(start + MUTE_PROBE_INTERVAL, false).is_some());
+    }
+
+    #[test]
+    fn collapse_settles_the_watch_into_an_immediate_probe() {
+        let mut watch = MuteWatch::default();
+        let start = Instant::now();
+        let (revision, _) = watch.tick(start, false).unwrap();
+        watch.reply(revision, state(40, false), start);
+        assert!(watch.tick(start, false).is_none());
+        watch.settle(start);
+        let (revision, request) = watch.tick(start, false).unwrap();
+        assert_eq!(request, Request::Get);
+        watch.reply(revision, state(40, true), start);
+        assert_eq!(watch.muted(), Some(true));
     }
 }
