@@ -40,6 +40,8 @@ if name == "omarchy":
     if os.environ.get("FAKE_CAPTURE_EXIT"):
         sys.exit(int(os.environ["FAKE_CAPTURE_EXIT"]))
     time.sleep(float(os.environ.get("FAKE_CAPTURE_SLEEP", "600")))
+if name == "systemd-run" and os.environ.get("FAKE_SYSTEMD_RUN_EXIT"):
+    sys.exit(int(os.environ["FAKE_SYSTEMD_RUN_EXIT"]))
 '''
 
 
@@ -51,13 +53,14 @@ class Fixture:
         self.root = Path(self.temporary.name)
         binary = self.root / "bin"
         binary.mkdir()
-        for name in ("omarchy", "notify-send"):
+        for name in ("omarchy", "notify-send", "systemd-run"):
             path = binary / name
             path.write_text(ADAPTER)
             path.chmod(0o755)
         self.environment = patch.dict(os.environ, {
             "PATH": str(binary), "FIXTURE_ROOT": str(self.root),
             "FAKE_CAPTURE_SLEEP": "600", "FAKE_CAPTURE_EXIT": "",
+            "FAKE_SYSTEMD_RUN_EXIT": "",
         })
         self.environment.start()
         self.engine = capture.Capture()
@@ -121,9 +124,23 @@ class CaptureTests(Fixture, unittest.TestCase):
         self.assertEqual(self.calls("omarchy"), [])
 
     def test_missing_launcher_is_an_error(self):
-        engine = capture.Capture(launcher=["/nonexistent-dir/omarchy", "capture", "screenshot"])
+        engine = capture.Capture(launchers={
+            "screenshot": ["/nonexistent-dir/omarchy", "capture", "screenshot"],
+            "settings": ["systemd-run", "--user", "--collect", "--quiet",
+                         "/usr/local/bin/dfr-configurator"],
+        })
         with self.assertRaisesRegex(capture.CaptureError, "Cannot launch"):
             engine.dispatch("screenshot")
+
+    def test_settings_runs_only_the_fixed_session_launcher(self):
+        self.engine.dispatch("settings")
+        self.assertEqual(self.calls("systemd-run"), [[
+            "--user", "--collect", "--quiet", "/usr/local/bin/dfr-configurator"]])
+
+    def test_settings_launcher_failure_is_reported(self):
+        os.environ["FAKE_SYSTEMD_RUN_EXIT"] = "1"
+        with self.assertRaisesRegex(capture.CaptureError, "exit status: 1"):
+            self.engine.dispatch("settings")
 
 
 class ReceiverTests(Fixture, unittest.TestCase):
@@ -177,6 +194,15 @@ class ReceiverTests(Fixture, unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("Invalid action", result["error"])
         self.assertEqual(len(self.calls("omarchy")), before)
+
+    def test_real_socket_routes_settings_and_rejects_unknown_actions(self):
+        self.exchange("settings")
+        self.assertEqual(self.calls("systemd-run"), [[
+            "--user", "--collect", "--quiet", "/usr/local/bin/dfr-configurator"]])
+        result = self.raw_exchange(b"arbitrary")
+        self.assertFalse(result["ok"])
+        self.assertIn("Invalid action", result["error"])
+        self.assertEqual(len(self.calls("systemd-run")), 1)
 
     @unittest.skipIf(os.getuid() == 0, "Run as an unprivileged desktop user")
     def test_non_root_child_without_session_environment_reaches_receiver(self):
@@ -237,6 +263,11 @@ client.request('screenshot', os.getuid(), '\\0' + sys.argv[2])
                                  "screenshot;echo unsafe"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid choice", result.stderr)
+
+    def test_client_action_validation_accepts_settings_and_rejects_unknown(self):
+        with self.assertRaisesRegex(ValueError, "Invalid action"):
+            client.request("arbitrary", os.getuid(), "\0missing")
+        self.exchange("settings")
 
 
 if __name__ == "__main__":

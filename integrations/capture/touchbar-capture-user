@@ -9,14 +9,14 @@ import sys
 
 
 def request(action, uid=1000, address=None):
-    if action not in ("screenshot",):
+    if action not in ("screenshot", "settings"):
         raise ValueError("Invalid action")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(30)
         connection.connect(address or "\0dfr-capture-" + str(uid))
         _, peer_uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if peer_uid != uid:
-            raise ValueError("Unexpected capture receiver UID")
+            raise ValueError("Unexpected desktop receiver UID")
         connection.sendall(action.encode("ascii"))
         connection.shutdown(socket.SHUT_WR)
         response = bytearray()
@@ -32,7 +32,7 @@ def request(action, uid=1000, address=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("screenshot",))
+    parser.add_argument("action", choices=("screenshot", "settings"))
     args = parser.parse_args()
     try:
         request(args.action)

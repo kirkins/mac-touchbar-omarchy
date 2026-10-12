@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Desktop-session screenshot receiver for the Touch Bar's quick keys.
+"""Desktop-session receiver for the Touch Bar's quick keys.
 
 Runs in the graphical session, where the Omarchy capture flow needs to run:
 the daemon's quick keys execute as its unprivileged sandboxed user, which
@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 
-ACTIONS = frozenset(("screenshot",))
+ACTIONS = frozenset(("screenshot", "settings"))
 
 
 class CaptureError(Exception):
@@ -34,7 +34,7 @@ def notify(message):
 
 
 class Capture:
-    """Runs the session's own screenshot flow, one at a time.
+    """Runs fixed session actions for the Touch Bar's quick keys.
 
     The picker is interactive and can stay open for minutes, so the flow is
     launched detached (its own session) and the receiver only watches for an
@@ -42,23 +42,39 @@ class Capture:
     launcher rather than a cancelled or ongoing capture.
     """
 
-    def __init__(self, launcher=None):
-        self.launcher = list(launcher or ["omarchy", "capture", "screenshot"])
+    def __init__(self, launchers=None):
+        self.launchers = launchers or {
+            "screenshot": ["omarchy", "capture", "screenshot"],
+            "settings": ["systemd-run", "--user", "--collect", "--quiet",
+                         "/usr/local/bin/dfr-configurator"],
+        }
         self.capture = None
 
     def dispatch(self, action):
         if action not in ACTIONS:
             raise CaptureError("Invalid action")
+        launcher = self.launchers[action]
+        if action == "settings":
+            try:
+                result = subprocess.run(
+                    launcher, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise CaptureError("Cannot launch settings configurator") from error
+            if result.returncode != 0:
+                raise CaptureError(
+                    f"Settings launcher failed (exit status: {result.returncode})")
+            return
         if self.capture is not None and self.capture.poll() is None:
             raise CaptureError("A capture is already running")
         try:
             self.capture = subprocess.Popen(
-                self.launcher,
+                launcher,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
             self.capture = None
-            raise CaptureError("Cannot launch " + " ".join(self.launcher))
+            raise CaptureError("Cannot launch " + " ".join(launcher))
         # A launcher that dies nonzero within the grace window never showed
         # the picker; report it instead of acknowledging a dead capture.
         deadline = time.monotonic() + 1.0

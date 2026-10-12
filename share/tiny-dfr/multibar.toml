@@ -135,14 +135,15 @@ Keys = [
 # leaves without running anything. Labels, glyphs, accents, and Stretch
 # work as on any bar, and commands run through /bin/sh like any command
 # button (see the notes above and the README). Commands that need the
-# desktop session - like the shipped Screenshot key - must go through a
-# session receiver client such as touchbar-capture-user, because the
-# daemon's unprivileged sandbox cannot reach the compositor itself.
+# desktop session - like the shipped Screenshot and Settings keys - must go
+# through a session receiver client such as touchbar-capture-user, because
+# the daemon's unprivileged sandbox cannot reach the compositor or user manager.
 [[Layers]]
 Name = "more"
 Keys = [
     { Text = "Home", Action = { Layer = "home" } },
     { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
+    { Text = "Settings", Action = { Command = "touchbar-capture-user settings", Layer = "home" } },
     # Lock: emits the compositor's lock bind - Omarchy's default
     # SUPER+CTRL+L (omarchy-system-lock) - as a pure key chord, so it
     # works inside the daemon's unprivileged sandbox with no shell and

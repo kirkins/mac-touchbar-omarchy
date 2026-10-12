@@ -1,15 +1,15 @@
-# Local Touch Bar screenshots
+# Touch Bar desktop-session actions
 
 This optional integration is maintained in this private repository. Install it
 separately from the Touch Bar daemon. Python 3.11+ and the Omarchy capture
 flow (`omarchy capture screenshot`, with `grim`, `slurp`, `hyprpicker`,
 `wl-copy`, and `hyprctl`) must be available in the desktop session.
 
-## Why the shipped quick key needs it
+## Why the quick keys need it
 
-The More bar's Screenshot key is an ordinary command button. Command buttons
-run inside the daemon's sandbox: the daemon keeps its internal privilege drop
-to `nobody` (`src/main.rs`), and the child inherits `ProtectHome`,
+The More bar's Screenshot and Settings keys are ordinary command buttons.
+Command buttons run inside the daemon's sandbox: the daemon keeps its internal
+privilege drop to `nobody` (`src/main.rs`), and the child inherits `ProtectHome`,
 `PrivateTmp`, `NoNewPrivileges`, and the restricted address families. Running
 `omarchy capture screenshot` there does not fail loudly - it silently no-ops.
 Reproduced on this machine (`sudo -u nobody env -i PATH=... /bin/sh -c
@@ -35,19 +35,22 @@ unprivileged client.
 
 ## Boundary
 
-The Mic command calls `/usr/local/bin/touchbar-capture-user screenshot`. The
-client uses a Linux abstract AF_UNIX socket named `dfr-capture-<desktop UID>`
-to reach `touchbar-capture.service` in the desktop user's graphical session.
+The quick keys call `/usr/local/bin/touchbar-capture-user screenshot` or
+`/usr/local/bin/touchbar-capture-user settings`. The client uses a Linux
+abstract AF_UNIX socket named `dfr-capture-<desktop UID>` to reach
+`touchbar-capture.service` in the desktop user's graphical session.
 The abstract socket crosses the daemon's private mount and IPC namespaces
 without making the desktop runtime directory public; only AF_UNIX is needed,
 which the daemon already allows.
 
-The receiver accepts exactly `screenshot`, authenticates `SO_PEERCRED`
-against the desktop UID and UID 65534 (`nobody`), and never executes bytes
-from the wire: the command line is fixed on the session side (`omarchy
-capture screenshot`). Other processes with either allowed UID can invoke
-this one action; this is the same explicit local trust boundary as the voice
-receiver. The client checks the receiver's UID. The daemon keeps its
+The receiver accepts exactly the named actions `screenshot` and `settings`,
+authenticates `SO_PEERCRED` against the desktop UID and UID 65534 (`nobody`),
+and never executes bytes from the wire. Each action selects a fixed argv on
+the session side: `omarchy capture screenshot`, or
+`systemd-run --user --collect --quiet /usr/local/bin/dfr-configurator`.
+There is no arbitrary command or argument channel. Other processes with
+either allowed UID can invoke these two actions; this is the explicit local
+trust boundary. The client checks the receiver's UID. The daemon keeps its
 privilege drop, `NoNewPrivileges`, and AF_UNIX / AF_NETLINK restriction.
 Neither `runuser`, a privileged launcher, nor a grant of home or runtime
 directory access is involved.
@@ -74,17 +77,19 @@ systemctl --user daemon-reload
 systemctl --user enable --now touchbar-capture.service
 ```
 
-Then point the Screenshot quick key at the client. The shipped
+Then point the Screenshot and Settings quick keys at the client. The shipped
 [`multibar.toml`](../../share/tiny-dfr/multibar.toml) already reads:
 
 ```toml
 { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
+{ Text = "Settings", Action = { Command = "touchbar-capture-user settings", Layer = "home" } },
 ```
 
 so after `sudo install -m644 share/tiny-dfr/multibar.toml
 /etc/tiny-dfr/config.toml` (or the same edit by hand, preserving other
-customizations) run `sudo systemctl restart tiny-dfr.service`. The client
-targets desktop UID 1000. The receiver derives its socket name from its own
+customizations) run `sudo systemctl restart tiny-dfr.service`. The example's
+Settings key uses the `settings` verb and returns to Home after handing off.
+The client targets desktop UID 1000. The receiver derives its socket name from its own
 UID. If the daemon uses a different UID, adapt the receiver's allowed UID
 set after reviewing that boundary.
 
@@ -103,8 +108,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/capture -
 systemd-analyze --user verify integrations/capture/touchbar-capture.service
 ```
 
-The suite covers the fixed launcher line, busy refusal during an ongoing
-capture, immediate nonzero exit reporting, the wire reject of unknown and
+The suite covers both fixed launcher lines, action allowlisting, busy refusal
+during an ongoing capture, immediate nonzero exit reporting, the wire reject of unknown and
 shell-like payloads, the `SO_PEERCRED` boundary, a session-free client
 process reaching the receiver, and the client CLI's rejection of arbitrary
 arguments before it connects.
