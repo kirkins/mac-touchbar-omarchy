@@ -188,6 +188,18 @@ pub fn set_button_kind(button: &mut ButtonConfig, kind: ButtonKind) {
     }
 }
 
+/// Save errors belong to the session, independently of draft validation.
+#[derive(Default, Debug)]
+pub struct SaveFeedback {
+    pub error: Option<String>,
+}
+
+impl SaveFeedback {
+    pub fn record(&mut self, result: Result<(), String>) {
+        self.error = result.err();
+    }
+}
+
 /// The editing document: the base file it overlays, the user file it
 /// will install, and the overlay being edited.
 pub struct Document {
@@ -213,17 +225,17 @@ impl Document {
     pub fn open(base_path: &Path, user_path: &Path) -> Result<Self> {
         let base_text = fs::read_to_string(base_path)
             .with_context(|| format!("reading the base configuration {}", base_path.display()))?;
-        parse_config(&base_text, None, 2008)
-            .with_context(|| format!("the base configuration {} is invalid", base_path.display()))?;
+        parse_config(&base_text, None, 2008).with_context(|| {
+            format!("the base configuration {} is invalid", base_path.display())
+        })?;
         let user = match fs::read_to_string(user_path) {
             Ok(text) if text.trim().is_empty() => ConfigProxy::default(),
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("parsing the user file {}", user_path.display()))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => ConfigProxy::default(),
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("reading the user file {}", user_path.display())
-                })
+                return Err(err)
+                    .with_context(|| format!("reading the user file {}", user_path.display()))
             }
         };
         Ok(Self {
@@ -251,6 +263,22 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn has_override(&self, name: &str) -> bool {
+        toml::Value::try_from(&self.user)
+            .ok()
+            .and_then(|value| value.get(name).cloned())
+            .is_some()
+    }
+
+    pub fn reset_global(&mut self, name: &str) {
+        let mut value = toml::Value::try_from(&self.user).expect("serializable overlay");
+        value.as_table_mut().expect("overlay table").remove(name);
+        self.user = value
+            .try_into()
+            .expect("removing an optional setting preserves the schema");
+        self.dirty = true;
     }
 
     pub fn base_text(&self) -> &str {
@@ -319,7 +347,11 @@ impl Document {
                     .unwrap_or("config.toml")
             ));
             fs::copy(&self.user_path, &backup).with_context(|| {
-                format!("backing up {} to {}", self.user_path.display(), backup.display())
+                format!(
+                    "backing up {} to {}",
+                    self.user_path.display(),
+                    backup.display()
+                )
             })?;
             self.backed_up = true;
         }
@@ -438,7 +470,11 @@ impl Document {
     /// Define or replace a user theme, refusing to exceed the picker's
     /// theme budget.
     pub fn set_theme(&mut self, name: &str, theme: ThemeConfig) -> Result<()> {
-        if !self.user.themes.as_ref().is_some_and(|themes| themes.contains_key(name))
+        if !self
+            .user
+            .themes
+            .as_ref()
+            .is_some_and(|themes| themes.contains_key(name))
             && self.known_themes().len() >= MAX_THEMES
         {
             bail!("at most {MAX_THEMES} themes may be defined");
@@ -473,7 +509,7 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-        
+
     const BASE: &str = include_str!("../../../share/tiny-dfr/config.toml");
     const MULTIBAR: &str = include_str!("../../../share/tiny-dfr/multibar.toml");
 
@@ -526,6 +562,36 @@ mod tests {
         };
         let doc = Document::open(&base, &user_path).unwrap();
         (tmp, doc)
+    }
+
+    #[test]
+    fn save_failure_survives_validation_and_retains_the_draft() {
+        let (tmp, mut doc) = document("save-failure", None);
+        doc.user_mut().active_brightness = Some(201);
+        std::fs::create_dir(tmp.0.join("config.toml.tmp")).unwrap();
+        let mut feedback = SaveFeedback::default();
+        feedback.record(doc.save().map_err(|err| format!("{err:#}")));
+        assert!(doc.validate().is_empty());
+        assert!(feedback.error.as_ref().unwrap().contains("staging"));
+        assert!(doc.is_dirty());
+        assert_eq!(doc.user().active_brightness, Some(201));
+        std::fs::remove_dir(tmp.0.join("config.toml.tmp")).unwrap();
+        feedback.record(doc.save().map_err(|err| format!("{err:#}")));
+        assert!(feedback.error.is_none());
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn reset_removes_the_override_and_restores_the_base_value() {
+        let (_tmp, mut doc) = document("reset", Some("ActiveBrightness = 201\n"));
+        assert!(doc.has_override("ActiveBrightness"));
+        doc.reset_global("ActiveBrightness");
+        assert!(!doc.has_override("ActiveBrightness"));
+        let base: ConfigProxy = toml::from_str(BASE).unwrap();
+        assert_eq!(
+            doc.effective().unwrap().active_brightness,
+            base.active_brightness
+        );
     }
 
     #[test]
@@ -619,7 +685,10 @@ mod tests {
         let err = doc.save().unwrap_err();
         assert!(format!("{err:#}").contains("refusing"), "{err:#}");
         // The file on disk still holds the original multibar text.
-        assert_eq!(std::fs::read_to_string(tmp.0.join("config.toml")).unwrap(), MULTIBAR);
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join("config.toml")).unwrap(),
+            MULTIBAR
+        );
         // Repair and save: now it installs.
         doc.layers().pop();
         assert!(doc.validate().is_empty(), "{:?}", doc.validate());
@@ -714,7 +783,11 @@ mod tests {
             .filter(|entry| {
                 entry
                     .as_ref()
-                    .map(|e| e.file_name().to_string_lossy().starts_with("config.toml.bak-"))
+                    .map(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("config.toml.bak-")
+                    })
                     .unwrap_or(false)
             })
             .count();

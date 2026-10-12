@@ -24,8 +24,10 @@ impl KnobsPage {
         // Group the registry's global knobs by their group field, in
         // registry order, and render each with the right widget.
         let mut current_group = "";
-    let mut current_group_row = adw::PreferencesGroup::new();
-        for knob in dfr_config::KNOBS.iter().filter(|k| k.scope == dfr_config::registry::Scope::Global)
+        let mut current_group_row = adw::PreferencesGroup::new();
+        for knob in dfr_config::KNOBS
+            .iter()
+            .filter(|k| k.scope == dfr_config::registry::Scope::Global)
         {
             if knob.group != current_group {
                 current_group = knob.group;
@@ -117,42 +119,44 @@ fn add_knob_row(
                 None => 0,
             };
             dropdown.set_selected(selected as u32);
-            let row = titled_row(knob, &dropdown);
+            let row = titled_row(editor, knob, &dropdown);
             group.add(&row);
-            dropdown.connect_selected_notify(
-                glib::clone!(#[strong] editor, #[strong] names, move |dropdown| {
+            dropdown.connect_selected_notify(glib::clone!(
+                #[strong]
+                editor,
+                #[strong]
+                names,
+                move |dropdown| {
                     let index = dropdown.selected() as usize;
                     let pinned = (index > 0).then(|| names[index].clone());
                     editor.doc.borrow_mut().user_mut().active_theme = pinned;
                     editor.run_pipeline();
-                }),
-            );
+                }
+            ));
         }
         name => {
             let user = editor.doc.borrow();
-            let proxy = user.user().clone();
+            let proxy = user.effective().expect("the base document parses");
             drop(user);
             match knob.kind {
                 "bool" => {
-                    let value = read_bool(&proxy, name);
+                    let value = read_bool(&proxy, name).or_else(|| knob.default.parse().ok());
                     let switch = gtk4::Switch::new();
                     switch.set_valign(gtk4::Align::Center);
                     if let Some(value) = value {
                         switch.set_active(value);
                     }
-                    let row = titled_row(knob, &switch);
+                    let row = titled_row(editor, knob, &switch);
                     group.add(&row);
-                    switch.connect_state_set(
-                        glib::clone!(#[strong] editor, move |_, active| {
-                            editor
-                                .doc
-                                .borrow_mut()
-                                .user_mut()
-                                .write_bool(name, active);
+                    switch.connect_state_set(glib::clone!(
+                        #[strong]
+                        editor,
+                        move |_, active| {
+                            editor.doc.borrow_mut().user_mut().write_bool(name, active);
                             editor.run_pipeline();
                             gtk4::glib::Propagation::Proceed
-                        }),
-                    );
+                        }
+                    ));
                 }
                 "u32" => {
                     let (min, max) = parse_range(knob.constraint);
@@ -161,23 +165,22 @@ fn add_knob_row(
                     let spin = gtk4::SpinButton::with_range(min as f64, max as f64, 1.0);
                     spin.set_value(value as f64);
                     spin.set_valign(gtk4::Align::Center);
-                    let row = titled_row(knob, &spin);
+                    let row = titled_row(editor, knob, &spin);
                     group.add(&row);
                     let name = knob.name;
-                    spin.connect_value_changed(
-                        glib::clone!(#[strong] editor, move |spin| {
+                    spin.connect_value_changed(glib::clone!(
+                        #[strong]
+                        editor,
+                        move |spin| {
                             let value = spin.value() as u32;
-                            let doc_default: u32 = default_string(name)
-                                .and_then(|default| default.parse().ok())
-                                .unwrap_or(min);
                             editor
                                 .doc
                                 .borrow_mut()
                                 .user_mut()
-                                .write_u32(name, (value != doc_default).then_some(value));
+                                .write_u32(name, Some(value));
                             editor.run_pipeline();
-                        }),
-                    );
+                        }
+                    ));
                 }
                 "enum" => {
                     let options: Vec<&str> = knob
@@ -191,56 +194,84 @@ fn add_knob_row(
                     // pet constraints "cat, fox".
                     let dropdown = gtk4::DropDown::from_strings(&options);
                     dropdown.set_valign(gtk4::Align::Center);
-                    let current = read_enum(&proxy, name).unwrap_or_else(|| knob.default.to_owned());
+                    let current =
+                        read_enum(&proxy, name).unwrap_or_else(|| knob.default.to_owned());
                     if let Some(index) = options.iter().position(|option| *option == current) {
                         dropdown.set_selected(index as u32);
                     }
-                    let row = titled_row(knob, &dropdown);
+                    let row = titled_row(editor, knob, &dropdown);
                     group.add(&row);
-                    dropdown.connect_selected_notify(
-                        glib::clone!(#[strong] editor, move |dropdown| {
+                    dropdown.connect_selected_notify(glib::clone!(
+                        #[strong]
+                        editor,
+                        move |dropdown| {
                             let index = dropdown.selected() as usize;
                             let value = options[index];
                             editor.doc.borrow_mut().user_mut().write_enum(name, value);
                             editor.run_pipeline();
-                        }),
-                    );
+                        }
+                    ));
                 }
                 _ => {
                     // The string knobs (FontTemplate and friends).
                     let entry = gtk4::Entry::new();
-                    entry.set_text(&read_string(&proxy, name).unwrap_or_default());
+                    entry.set_text(
+                        &read_string(&proxy, name)
+                            .unwrap_or_else(|| knob.default.trim_matches('"').to_owned()),
+                    );
                     entry.set_width_chars(28);
                     entry.set_valign(gtk4::Align::Center);
-                    let row = titled_row(knob, &entry);
+                    let row = titled_row(editor, knob, &entry);
                     group.add(&row);
-                    entry.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-                        let text = entry.text().to_string();
-                        editor
-                            .doc
-                            .borrow_mut()
-                            .user_mut()
-                            .write_string(name, (!text.is_empty()).then(|| text.clone()));
-                        editor.run_pipeline();
-                    }));
+                    entry.connect_changed(glib::clone!(
+                        #[strong]
+                        editor,
+                        move |entry| {
+                            let text = entry.text().to_string();
+                            editor
+                                .doc
+                                .borrow_mut()
+                                .user_mut()
+                                .write_string(name, (!text.is_empty()).then(|| text.clone()));
+                            editor.run_pipeline();
+                        }
+                    ));
                 }
             }
         }
     }
 }
 
-/// The registry's default for a knob name, looked up fresh so signal
-/// closures can hold a `&'static str` without borrowing the row build.
-fn default_string(name: &str) -> Option<&'static str> {
-    dfr_config::registry::default_of(name)
-}
-
-fn titled_row(knob: &dfr_config::registry::Knob, suffix: &impl IsA<gtk4::Widget>) -> adw::ActionRow {
+fn titled_row(
+    editor: &Rc<Editor>,
+    knob: &dfr_config::registry::Knob,
+    suffix: &impl IsA<gtk4::Widget>,
+) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(knob.name)
         .subtitle(knob.doc)
         .build();
     row.add_suffix(suffix);
+    let source = if editor.doc.borrow().has_override(knob.name) {
+        "Customized"
+    } else {
+        "Using Base Setting"
+    };
+    row.set_subtitle(&format!("{source} · {}", knob.doc));
+    let reset = gtk4::Button::from_icon_name("edit-undo-symbolic");
+    reset.set_tooltip_text(Some("Use Base Setting"));
+    reset.set_valign(gtk4::Align::Center);
+    reset.set_sensitive(editor.doc.borrow().has_override(knob.name));
+    let name = knob.name;
+    reset.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            editor.doc.borrow_mut().reset_global(name);
+            editor.restructured();
+        }
+    ));
+    row.add_suffix(&reset);
     row.set_activatable(false);
     row
 }
@@ -272,24 +303,32 @@ fn build_bands_editor(row: adw::ExpanderRow, editor: &Rc<Editor>) {
         let add = gtk4::Button::with_label("Override bands");
         add.set_valign(gtk4::Align::Center);
         row.add_suffix(&add);
-        add.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-            {
-                let mut doc = editor.doc.borrow_mut();
-                let defaults = dfr_config::BandConfig {
-                    name: "day".into(),
-                    start_hour: 12,
-                    color: "#1A1B1E".into(),
-                };
-                doc.set_bands(vec![defaults]);
+        add.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                {
+                    let mut doc = editor.doc.borrow_mut();
+                    let defaults = dfr_config::BandConfig {
+                        name: "day".into(),
+                        start_hour: 12,
+                        color: "#1A1B1E".into(),
+                    };
+                    doc.set_bands(vec![defaults]);
+                }
+                editor.restructured();
             }
-            editor.restructured();
-        }));
+        ));
         return;
     };
     drop_bands_into_row(&row, editor, &bands);
 }
 
-fn drop_bands_into_row(row: &adw::ExpanderRow, editor: &Rc<Editor>, bands: &[dfr_config::BandConfig]) {
+fn drop_bands_into_row(
+    row: &adw::ExpanderRow,
+    editor: &Rc<Editor>,
+    bands: &[dfr_config::BandConfig],
+) {
     for (index, band) in bands.iter().enumerate() {
         let band_row = adw::ActionRow::builder().title(&band.name).build();
         let hour = gtk4::SpinButton::with_range(0.0, 23.0, 1.0);
@@ -306,49 +345,65 @@ fn drop_bands_into_row(row: &adw::ExpanderRow, editor: &Rc<Editor>, bands: &[dfr
         band_row.add_suffix(&color);
         band_row.add_suffix(&remove);
 
-        hour.connect_value_changed(glib::clone!(#[strong] editor, move |spin| {
-            set_band(&editor, index, |band| band.start_hour = spin.value() as u8);
-        }));
-        color.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-            let text = entry.text().to_string();
-            set_band(&editor, index, |band| band.color = text.clone());
-        }));
-        remove.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-            let mut doc = editor.doc.borrow_mut();
-            if let Some(bands) = doc.bands().cloned() {
-                let mut bands = bands;
-                if index < bands.len() {
-                    bands.remove(index);
-                }
-                if bands.is_empty() {
-                    // An empty list is the default bands again.
-                    doc.user_mut().day_cycle_bands = None;
-                } else {
-                    doc.set_bands(bands);
-                }
+        hour.connect_value_changed(glib::clone!(
+            #[strong]
+            editor,
+            move |spin| {
+                set_band(&editor, index, |band| band.start_hour = spin.value() as u8);
             }
-            drop(doc);
-            editor.run_pipeline();
-        }));
+        ));
+        color.connect_changed(glib::clone!(
+            #[strong]
+            editor,
+            move |entry| {
+                let text = entry.text().to_string();
+                set_band(&editor, index, |band| band.color = text.clone());
+            }
+        ));
+        remove.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let mut doc = editor.doc.borrow_mut();
+                if let Some(bands) = doc.bands().cloned() {
+                    let mut bands = bands;
+                    if index < bands.len() {
+                        bands.remove(index);
+                    }
+                    if bands.is_empty() {
+                        // An empty list is the default bands again.
+                        doc.user_mut().day_cycle_bands = None;
+                    } else {
+                        doc.set_bands(bands);
+                    }
+                }
+                drop(doc);
+                editor.run_pipeline();
+            }
+        ));
         row.add_row(&band_row);
     }
     let add = gtk4::Button::from_icon_name("list-add-symbolic");
     add.set_tooltip_text(Some("Add a band"));
     add.set_valign(gtk4::Align::Center);
     row.add_suffix(&add);
-    add.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        {
-            let mut doc = editor.doc.borrow_mut();
-            let mut bands = doc.bands().cloned().unwrap_or_default();
-            bands.push(dfr_config::BandConfig {
-                name: format!("band-{}", bands.len() + 1),
-                start_hour: 0,
-                color: "#1A1B1E".into(),
-            });
-            doc.set_bands(bands);
+    add.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            {
+                let mut doc = editor.doc.borrow_mut();
+                let mut bands = doc.bands().cloned().unwrap_or_default();
+                bands.push(dfr_config::BandConfig {
+                    name: format!("band-{}", bands.len() + 1),
+                    start_hour: 0,
+                    color: "#1A1B1E".into(),
+                });
+                doc.set_bands(bands);
+            }
+            editor.run_pipeline();
         }
-        editor.run_pipeline();
-    }));
+    ));
 }
 
 fn set_band(editor: &Rc<Editor>, index: usize, change: impl FnOnce(&mut dfr_config::BandConfig)) {
@@ -385,61 +440,73 @@ fn build_themes_editor(row: adw::ExpanderRow, editor: &Rc<Editor>) {
             theme_row.add_row(&accent_row);
             let name = name.clone();
             let accent = accent;
-            entry.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-                let hex = entry.text().to_string();
-                let mut doc = editor.doc.borrow_mut();
-                if let Some(theme) = doc
-                    .user_mut()
-                    .themes
-                    .as_mut()
-                    .and_then(|themes| themes.get_mut(&name))
-                {
-                    theme
-                        .accents
-                        .get_or_insert_with(Default::default)
-                        .insert(accent, hex.clone());
+            entry.connect_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |entry| {
+                    let hex = entry.text().to_string();
+                    let mut doc = editor.doc.borrow_mut();
+                    if let Some(theme) = doc
+                        .user_mut()
+                        .themes
+                        .as_mut()
+                        .and_then(|themes| themes.get_mut(&name))
+                    {
+                        theme
+                            .accents
+                            .get_or_insert_with(Default::default)
+                            .insert(accent, hex.clone());
+                    }
+                    drop(doc);
+                    editor.run_pipeline();
                 }
-                drop(doc);
-                editor.run_pipeline();
-            }));
+            ));
         }
         let remove = gtk4::Button::from_icon_name("user-trash-symbolic");
         remove.add_css_class("flat");
         remove.set_valign(gtk4::Align::Center);
         theme_row.add_suffix(&remove);
         let name = name.clone();
-        remove.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-            let mut doc = editor.doc.borrow_mut();
-            doc.remove_theme(&name);
-            drop(doc);
-            editor.run_pipeline();
-        }));
+        remove.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let mut doc = editor.doc.borrow_mut();
+                doc.remove_theme(&name);
+                drop(doc);
+                editor.run_pipeline();
+            }
+        ));
     }
     let add = gtk4::Button::from_icon_name("list-add-symbolic");
     add.set_tooltip_text(Some("Add a theme"));
     add.set_valign(gtk4::Align::Center);
     row.add_suffix(&add);
-    add.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        let mut n = 1;
-        loop {
-            let name = format!("theme-{n}");
-            if editor
-                .doc
-                .borrow()
-                .known_themes()
-                .iter()
-                .all(|known| *known != name)
-            {
-                let _ = editor
+    add.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            let mut n = 1;
+            loop {
+                let name = format!("theme-{n}");
+                if editor
                     .doc
-                    .borrow_mut()
-                    .set_theme(&name, dfr_config::ThemeConfig::default());
-                break;
+                    .borrow()
+                    .known_themes()
+                    .iter()
+                    .all(|known| *known != name)
+                {
+                    let _ = editor
+                        .doc
+                        .borrow_mut()
+                        .set_theme(&name, dfr_config::ThemeConfig::default());
+                    break;
+                }
+                n += 1;
             }
-            n += 1;
+            editor.run_pipeline();
         }
-        editor.run_pipeline();
-    }));
+    ));
 }
 
 // ---- typed accessors over the overlay ------------------------------

@@ -27,9 +27,7 @@ fn main() -> anyhow::Result<()> {
     let doc = model::Document::open(&base_path, &user_path)?;
 
     adw::init().expect("libadwaita initializes");
-    let app = adw::Application::builder()
-        .application_id(APP_ID)
-        .build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
     let document = std::cell::RefCell::new(Some(doc));
     app.connect_activate(move |app| {
         if let Some(doc) = document.borrow_mut().take() {
@@ -138,7 +136,9 @@ fn build_window(app: &adw::Application, doc: model::Document) {
             return;
         };
         if diagnostics.is_empty() {
-            save.set_sensitive(true);
+            save.set_sensitive(
+                editor.doc.borrow().is_dirty() || !editor.doc.borrow().user_path().exists(),
+            );
             status.set_markup(
                 "<span weight='bold'>Configuration is valid</span> — Save installs it \
                  atomically and the daemon applies it live on its inotify reload.",
@@ -151,6 +151,9 @@ fn build_window(app: &adw::Application, doc: model::Document) {
                 glib::markup_escape_text(&diagnostics.join("\n"))
             ));
         }
+        if let Some(error) = editor.save_feedback.borrow().error.as_ref() {
+            status.set_text(&format!("Save failed — {error}. Retry with Save."));
+        }
         // Debounce the preview: one render per burst of edits.
         let weak_editor = weak_editor.clone();
         editor.preview.invalidate();
@@ -161,24 +164,32 @@ fn build_window(app: &adw::Application, doc: model::Document) {
         });
     }));
 
-    let weak_layers_page_root = layers_page.root.downgrade();
+    let layers_root = Rc::new(std::cell::RefCell::new(layers_page.root.clone()));
+    let knobs_root = Rc::new(std::cell::RefCell::new(knobs_page.root.clone()));
     let weak_stack = stack.downgrade();
     editor.set_on_structure(Box::new(move |editor: Rc<Editor>| {
         // Rebuild the deck page under its stack parent.
-        let (Some(old_root), Some(stack)) = (weak_layers_page_root.upgrade(), weak_stack.upgrade())
-        else {
+        let Some(stack) = weak_stack.upgrade() else {
             return;
         };
+        let visible = stack.visible_child_name();
+        if let Some(parent) = editor.preview.area.parent().and_downcast::<gtk4::Box>() {
+            parent.remove(&editor.preview.area);
+        }
         let replacement = LayersPage::build(&editor);
-        stack.remove(&old_root);
+        stack.remove(&*layers_root.borrow());
         stack.add_titled(&replacement.root, Some("deck"), "Deck");
         stack
             .page(&replacement.root)
             .set_icon_name(Some("view-grid-symbolic"));
-        if stack.visible_child_name().as_deref() == Some("deck") {
-            stack.set_visible_child_name("deck");
+        *layers_root.borrow_mut() = replacement.root.clone();
+        stack.remove(&*knobs_root.borrow());
+        let knobs = knobs::KnobsPage::build(&editor);
+        stack.add_titled(&knobs.root, Some("knobs"), "Knobs");
+        *knobs_root.borrow_mut() = knobs.root;
+        if let Some(visible) = visible {
+            stack.set_visible_child_name(&visible);
         }
-        let _ = &replacement;
         replacement.refresh(&editor);
     }));
 
@@ -192,49 +203,72 @@ fn build_window(app: &adw::Application, doc: model::Document) {
     });
     window.add_action(&show_deck);
 
-    save.connect_clicked(glib::clone!(#[strong] editor, #[strong] status, move |_| {
-        let outcome = editor.doc.borrow_mut().save().map_err(|err| format!("{err:#}"));
-        match outcome {
-            Ok(()) => {
-                status.set_markup(&format!(
-                    "<span weight='bold' foreground='#26a269'>Saved {}</span> — the daemon \
+    save.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        #[strong]
+        status,
+        move |_| {
+            let outcome = editor
+                .doc
+                .borrow_mut()
+                .save()
+                .map_err(|err| format!("{err:#}"));
+            editor.save_feedback.borrow_mut().record(outcome.clone());
+            editor.run_pipeline();
+            match outcome {
+                Ok(()) => {
+                    status.set_markup(&format!(
+                        "<span weight='bold' foreground='#26a269'>Saved {}</span> — the daemon \
                      reloads it on the inotify rename.",
-                    glib::markup_escape_text(&editor.doc.borrow().user_path().display().to_string())
-                ));
-            }
-            Err(err) => {
-                status.set_markup(&format!(
-                    "<span weight='bold' foreground='#e01b24'>Save failed:</span> {}",
-                    glib::markup_escape_text(&err)
-                ));
+                        glib::markup_escape_text(
+                            &editor.doc.borrow().user_path().display().to_string()
+                        )
+                    ));
+                }
+                Err(err) => {
+                    status.set_markup(&format!(
+                        "<span weight='bold' foreground='#e01b24'>Save failed:</span> {}",
+                        glib::markup_escape_text(&err)
+                    ));
+                }
             }
         }
-        editor.run_pipeline();
-    }));
+    ));
 
     // Close guard: unsaved changes ask first.
-    window.connect_close_request(glib::clone!(#[strong] editor, #[strong] window, move |_| {
-        if !editor.doc.borrow().is_dirty() {
-            return glib::Propagation::Proceed;
+    window.connect_close_request(glib::clone!(
+        #[strong]
+        editor,
+        #[strong]
+        window,
+        move |_| {
+            if !editor.doc.borrow().is_dirty() {
+                return glib::Propagation::Proceed;
+            }
+            let dialog = adw::AlertDialog::builder()
+                .heading("Unsaved changes")
+                .body("The deck has changes that were not saved to the configuration file.")
+                .build();
+            dialog.add_response("discard", "Discard");
+            dialog.add_response("cancel", "Cancel");
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            dialog.choose(
+                Some(&window),
+                None::<&gio::Cancellable>,
+                glib::clone!(
+                    #[strong]
+                    window,
+                    move |response| {
+                        if response == "discard" {
+                            window.close();
+                        }
+                    }
+                ),
+            );
+            glib::Propagation::Stop
         }
-        let dialog = adw::AlertDialog::builder()
-            .heading("Unsaved changes")
-            .body("The deck has changes that were not saved to the configuration file.")
-            .build();
-        dialog.add_response("discard", "Discard");
-        dialog.add_response("cancel", "Cancel");
-        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
-        dialog.choose(
-            Some(&window),
-            None::<&gio::Cancellable>,
-            glib::clone!(#[strong] window, move |response| {
-                if response == "discard" {
-                    window.close();
-                }
-            }),
-        );
-        glib::Propagation::Stop
-    }));
+    ));
 
     // Initial state: first layer selected, preview rendered, validated.
     layers_page.refresh(&editor);

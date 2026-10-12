@@ -242,7 +242,10 @@ mod tests {
         assert_eq!(key_from_gdk(38 + 8).map(key_name), Some("L".into()));
         assert!(key_from_gdk(7).is_none(), "below the evdev range");
         assert!(key_from_gdk(900).is_none(), "far outside the key range");
-        assert_eq!(key_by_name("LeftMeta").map(key_name), Some("LeftMeta".into()));
+        assert_eq!(
+            key_by_name("LeftMeta").map(key_name),
+            Some("LeftMeta".into())
+        );
         assert_eq!(key_by_name("NotAKey"), None);
     }
 

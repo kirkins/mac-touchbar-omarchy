@@ -27,17 +27,37 @@ pub struct Editor {
     after_edit: RefCell<Option<Box<dyn Fn(Rc<Editor>)>>>,
     on_structure: RefCell<Option<Box<dyn Fn(Rc<Editor>)>>>,
     pub preview: Rc<Preview>,
+    pub save_feedback: RefCell<crate::model::SaveFeedback>,
+    on_selection: RefCell<Option<Box<dyn Fn(Rc<Editor>)>>>,
 }
 
 impl Editor {
     pub fn new(doc: Document, preview: Rc<Preview>) -> Rc<Self> {
         Rc::new(Self {
             doc: RefCell::new(doc),
-            selection: RefCell::new(Selection { layer: 0, button: None }),
+            selection: RefCell::new(Selection {
+                layer: 0,
+                button: None,
+            }),
             after_edit: RefCell::new(None),
             on_structure: RefCell::new(None),
             preview,
+            save_feedback: RefCell::new(Default::default()),
+            on_selection: RefCell::new(None),
         })
+    }
+
+    pub fn set_on_selection(&self, callback: Box<dyn Fn(Rc<Editor>)>) {
+        *self.on_selection.borrow_mut() = Some(callback);
+    }
+
+    pub fn selection_changed(self: &Rc<Self>) {
+        let callback = self.on_selection.borrow_mut().take();
+        if let Some(callback) = callback {
+            callback(self.clone());
+            *self.on_selection.borrow_mut() = Some(callback);
+        }
+        self.run_pipeline();
     }
 
     pub fn set_after_edit(&self, callback: Box<dyn Fn(Rc<Editor>)>) {
@@ -196,7 +216,9 @@ impl LayersPage {
         right.append(&buttons_label);
         let buttons_scrolled = gtk4::ScrolledWindow::new();
         buttons_scrolled.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Never);
-        buttons_scrolled.set_vexpand(true);
+        buttons_scrolled.set_vexpand(false);
+        buttons_scrolled.set_max_content_height(160);
+        buttons_scrolled.set_propagate_natural_height(true);
         let buttons_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         buttons_box.set_margin_top(4);
         buttons_scrolled.set_child(Some(&buttons_box));
@@ -207,7 +229,11 @@ impl LayersPage {
         editor_label.add_css_class("heading");
         let button_editor = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         right.append(&editor_label);
-        right.append(&button_editor);
+        let properties_scrolled = gtk4::ScrolledWindow::new();
+        properties_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        properties_scrolled.set_vexpand(true);
+        properties_scrolled.set_child(Some(&button_editor));
+        right.append(&properties_scrolled);
 
         paned.set_start_child(Some(&left));
         paned.set_end_child(Some(&right));
@@ -221,8 +247,10 @@ impl LayersPage {
         };
 
         // ---- wiring ------------------------------------------------
-        page.layer_rows.connect_row_selected(
-            glib::clone!(#[strong] editor, move |_, row| {
+        page.layer_rows.connect_row_selected(glib::clone!(
+            #[strong]
+            editor,
+            move |_, row| {
                 let Some(row) = row else { return };
                 let index = row.index() as usize;
                 let name = editor
@@ -232,39 +260,59 @@ impl LayersPage {
                     .get(index)
                     .map(|layer| layer.name.clone());
                 if let Some(name) = name {
-                    *editor.selection.borrow_mut() = Selection { layer: index, button: None };
+                    if editor.selection.borrow().layer == index {
+                        return;
+                    }
+                    *editor.selection.borrow_mut() = Selection {
+                        layer: index,
+                        button: None,
+                    };
                     editor.preview.set_layer(&name);
-                    editor.run_pipeline();
+                    editor.selection_changed();
                 }
-            }),
-        );
+            }
+        ));
 
-        add.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-            let name = {
-                let mut doc = editor.doc.borrow_mut();
-                let layers = doc.layers_mut();
-                let mut n = layers.len() + 1;
-                while layers.iter().any(|layer| layer.name == format!("layer-{n}")) {
-                    n += 1;
-                }
-                let name = format!("layer-{n}");
-                layers.push(dfr_config::LayerConfig {
-                    name: name.clone(),
-                    keys: vec![dfr_config::ButtonConfig {
-                        text: Some("Button".into()),
-                        ..Default::default()
-                    }],
-                });
-                name
-            };
-            let count = editor.doc.borrow_mut().layers().len();
-            *editor.selection.borrow_mut() = Selection { layer: count - 1, button: None };
-            editor.preview.set_layer(&name);
-            editor.restructured();
-        }));
+        add.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let name = {
+                    let mut doc = editor.doc.borrow_mut();
+                    let layers = doc.layers_mut();
+                    let mut n = layers.len() + 1;
+                    while layers
+                        .iter()
+                        .any(|layer| layer.name == format!("layer-{n}"))
+                    {
+                        n += 1;
+                    }
+                    let name = format!("layer-{n}");
+                    layers.push(dfr_config::LayerConfig {
+                        name: name.clone(),
+                        keys: vec![dfr_config::ButtonConfig {
+                            text: Some("Button".into()),
+                            ..Default::default()
+                        }],
+                    });
+                    name
+                };
+                let count = editor.doc.borrow_mut().layers().len();
+                *editor.selection.borrow_mut() = Selection {
+                    layer: count - 1,
+                    button: None,
+                };
+                editor.preview.set_layer(&name);
+                editor.restructured();
+            }
+        ));
 
-        themes.connect_selected_notify(
-            glib::clone!(#[strong] editor, #[strong] themes, move |_| {
+        themes.connect_selected_notify(glib::clone!(
+            #[strong]
+            editor,
+            #[strong]
+            themes,
+            move |_| {
                 let Some(item) = themes.selected_item().and_downcast::<gtk4::StringObject>() else {
                     return;
                 };
@@ -276,18 +324,51 @@ impl LayersPage {
                 // document, exactly like writing `ActiveTheme` by hand.
                 editor.doc.borrow_mut().user_mut().active_theme = Some(name);
                 editor.run_pipeline();
-            }),
-        );
+            }
+        ));
 
-        width_toggle.connect_toggled(
-            glib::clone!(#[strong] editor, move |toggle| {
+        width_toggle.connect_toggled(glib::clone!(
+            #[strong]
+            editor,
+            move |toggle| {
                 editor
                     .preview
                     .set_width(if toggle.is_active() { 2170 } else { 2008 });
                 editor.preview.render(&editor.doc.borrow());
-            }),
-        );
+            }
+        ));
 
+        let root = page.root.downgrade();
+        let rows = page.layer_rows.downgrade();
+        let header = page.layer_header.downgrade();
+        let buttons = page.buttons_box.downgrade();
+        let properties = page.button_editor.downgrade();
+        editor.set_on_selection(Box::new(move |editor| {
+            if let (
+                Some(root),
+                Some(layer_rows),
+                Some(layer_header),
+                Some(buttons_box),
+                Some(button_editor),
+            ) = (
+                root.upgrade(),
+                rows.upgrade(),
+                header.upgrade(),
+                buttons.upgrade(),
+                properties.upgrade(),
+            ) {
+                let page = Self {
+                    root,
+                    layer_rows,
+                    layer_header,
+                    buttons_box,
+                    button_editor,
+                };
+                page.refresh_layer_header(&editor);
+                let layers = editor.doc.borrow_mut().layers().clone();
+                page.refresh_buttons(&editor, &layers);
+            }
+        }));
         page
     }
 
@@ -318,7 +399,13 @@ impl LayersPage {
             self.layer_rows.remove(&row);
         }
         for layer in &layers {
-            self.layer_rows.append(&layer_row(editor, layer, &default_layer, &fn_layer, &reachable));
+            self.layer_rows.append(&layer_row(
+                editor,
+                layer,
+                &default_layer,
+                &fn_layer,
+                &reachable,
+            ));
         }
         // Restore selection by name so reorders keep their target.
         let mut selected = false;
@@ -333,8 +420,15 @@ impl LayersPage {
             }
         }
         if !selected {
-            let index = editor.selection.borrow().layer.min(layers.len().saturating_sub(1));
-            *editor.selection.borrow_mut() = Selection { layer: index, button: None };
+            let index = editor
+                .selection
+                .borrow()
+                .layer
+                .min(layers.len().saturating_sub(1));
+            *editor.selection.borrow_mut() = Selection {
+                layer: index,
+                button: None,
+            };
             if let Some(layer) = layers.get(index) {
                 editor.preview.set_layer(&layer.name);
             }
@@ -361,7 +455,8 @@ impl LayersPage {
             return;
         };
 
-        self.layer_header.append(&gtk4::Label::new(Some("Layer name:")));
+        self.layer_header
+            .append(&gtk4::Label::new(Some("Layer name:")));
         let name = gtk4::Entry::new();
         name.set_text(&layer.name);
         name.set_hexpand(true);
@@ -393,64 +488,80 @@ impl LayersPage {
         self.layer_header.append(&fn_toggle);
         self.layer_header.append(&remove);
 
-        name.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-            let new = entry.text().to_string();
-            if new.is_empty() {
-                return;
-            }
-            editor.edit_selected_layer(|layer| {
-                if layer.name != new {
-                    layer.name = new.clone();
+        name.connect_changed(glib::clone!(
+            #[strong]
+            editor,
+            move |entry| {
+                let new = entry.text().to_string();
+                if new.is_empty() {
+                    return;
                 }
-            });
-            editor.preview.set_layer(&new);
-        }));
+                editor.edit_selected_layer(|layer| {
+                    if layer.name != new {
+                        layer.name = new.clone();
+                    }
+                });
+                editor.preview.set_layer(&new);
+            }
+        ));
 
-        default_toggle.connect_toggled(glib::clone!(#[strong] editor, move |toggle| {
-            let name = editor.selected_button_layer_name();
-            if let Some(name) = name {
-                let pinned = toggle.is_active().then_some(name);
-                editor.doc.borrow_mut().user_mut().default_layer = pinned;
+        default_toggle.connect_toggled(glib::clone!(
+            #[strong]
+            editor,
+            move |toggle| {
+                let name = editor.selected_button_layer_name();
+                if let Some(name) = name {
+                    let pinned = toggle.is_active().then_some(name);
+                    editor.doc.borrow_mut().user_mut().default_layer = pinned;
+                    editor.restructured();
+                }
+            }
+        ));
+
+        fn_toggle.connect_toggled(glib::clone!(
+            #[strong]
+            editor,
+            move |toggle| {
+                let name = editor.selected_button_layer_name();
+                if let Some(name) = name {
+                    let pinned = toggle.is_active().then_some(name);
+                    editor.doc.borrow_mut().user_mut().fn_layer = pinned;
+                    editor.restructured();
+                }
+            }
+        ));
+
+        remove.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let selection = editor.selection.borrow().clone();
+                let name = editor
+                    .doc
+                    .borrow_mut()
+                    .layers()
+                    .get(selection.layer)
+                    .map(|layer| layer.name.clone());
+                let Some(name) = name else { return };
+                {
+                    let mut doc = editor.doc.borrow_mut();
+                    doc.layers_mut().remove(selection.layer);
+                    // References to the removed layer go with it.
+                    if doc.user().default_layer.as_deref() == Some(name.as_str()) {
+                        let fallback = doc.layers().first().map(|l| l.name.clone());
+                        doc.user_mut().default_layer = fallback;
+                    }
+                    if doc.user().fn_layer.as_deref() == Some(name.as_str()) {
+                        doc.user_mut().fn_layer = None;
+                    }
+                }
+                *editor.selection.borrow_mut() = Selection {
+                    layer: selection.layer.saturating_sub(1),
+                    button: None,
+                };
                 editor.restructured();
             }
-        }));
-
-        fn_toggle.connect_toggled(glib::clone!(#[strong] editor, move |toggle| {
-            let name = editor.selected_button_layer_name();
-            if let Some(name) = name {
-                let pinned = toggle.is_active().then_some(name);
-                editor.doc.borrow_mut().user_mut().fn_layer = pinned;
-                editor.restructured();
-            }
-        }));
-
-        remove.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-            let selection = editor.selection.borrow().clone();
-            let name = editor
-                .doc
-                .borrow_mut()
-                .layers()
-                .get(selection.layer)
-                .map(|layer| layer.name.clone());
-            let Some(name) = name else { return };
-            {
-                let mut doc = editor.doc.borrow_mut();
-                doc.layers_mut().remove(selection.layer);
-                // References to the removed layer go with it.
-                if doc.user().default_layer.as_deref() == Some(name.as_str()) {
-                    let fallback = doc.layers().first().map(|l| l.name.clone());
-                    doc.user_mut().default_layer = fallback;
-                }
-                if doc.user().fn_layer.as_deref() == Some(name.as_str()) {
-                    doc.user_mut().fn_layer = None;
-                }
-            }
-            *editor.selection.borrow_mut() = Selection {
-                layer: selection.layer.saturating_sub(1),
-                button: None,
-            };
-            editor.restructured();
-        }));
+        ));
     }
 
     fn refresh_buttons(&self, editor: &Rc<Editor>, layers: &[dfr_config::LayerConfig]) {
@@ -474,27 +585,31 @@ impl LayersPage {
         let add = gtk4::Button::from_icon_name("list-add-symbolic");
         add.set_tooltip_text(Some("Add a button"));
         add.set_valign(gtk4::Align::Center);
-        add.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-            let new_index = {
-                let mut doc = editor.doc.borrow_mut();
-                let layers = doc.layers_mut();
-                layers
-                    .get_mut(layer_index)
-                    .map(|layer| {
-                        layer.keys.push(dfr_config::ButtonConfig {
-                            text: Some("Button".into()),
-                            ..Default::default()
-                        });
-                        layer.keys.len() - 1
-                    })
-                    .unwrap_or(0)
-            };
-            *editor.selection.borrow_mut() = Selection {
-                layer: layer_index,
-                button: Some(new_index),
-            };
-            editor.restructured();
-        }));
+        add.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let new_index = {
+                    let mut doc = editor.doc.borrow_mut();
+                    let layers = doc.layers_mut();
+                    layers
+                        .get_mut(layer_index)
+                        .map(|layer| {
+                            layer.keys.push(dfr_config::ButtonConfig {
+                                text: Some("Button".into()),
+                                ..Default::default()
+                            });
+                            layer.keys.len() - 1
+                        })
+                        .unwrap_or(0)
+                };
+                *editor.selection.borrow_mut() = Selection {
+                    layer: layer_index,
+                    button: Some(new_index),
+                };
+                editor.restructured();
+            }
+        ));
         self.buttons_box.append(&add);
 
         self.refresh_button_editor(editor, layers);
@@ -520,11 +635,14 @@ impl LayersPage {
         let Some(button) = layer.keys.get(button_index) else {
             return;
         };
-        self.button_editor
-            .append(&button_editor(editor, selection.layer, button_index, button));
+        self.button_editor.append(&button_editor(
+            editor,
+            selection.layer,
+            button_index,
+            button,
+        ));
     }
 }
-
 
 /// Mutate one identified button through a single borrow, then notify.
 fn edit_button(
@@ -631,12 +749,20 @@ fn layer_row(
         .iter()
         .position(|candidate| candidate.name == layer.name)
         .unwrap_or_default();
-    up.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        move_layer(&editor, index, -1);
-    }));
-    down.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        move_layer(&editor, index, 1);
-    }));
+    up.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            move_layer(&editor, index, -1);
+        }
+    ));
+    down.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            move_layer(&editor, index, 1);
+        }
+    ));
     row.upcast()
 }
 
@@ -668,6 +794,7 @@ fn button_card(
     button: &dfr_config::ButtonConfig,
 ) -> gtk4::Widget {
     let frame = gtk4::Frame::new(None);
+    frame.set_valign(gtk4::Align::Start);
     let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
     box_.set_margin_top(6);
     box_.set_margin_bottom(6);
@@ -721,36 +848,52 @@ fn button_card(
     frame.set_child(Some(&box_));
 
     let clickable = gtk4::GestureClick::new();
-    clickable.connect_pressed(glib::clone!(#[strong] editor, move |_, _, _, _| {
-        *editor.selection.borrow_mut() = Selection {
-            layer: layer_index,
-            button: Some(button_index),
-        };
-        editor.run_pipeline();
-    }));
+    clickable.connect_pressed(glib::clone!(
+        #[strong]
+        editor,
+        move |_, _, _, _| {
+            *editor.selection.borrow_mut() = Selection {
+                layer: layer_index,
+                button: Some(button_index),
+            };
+            editor.selection_changed();
+        }
+    ));
     frame.add_controller(clickable);
 
-    left.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        move_button(&editor, layer_index, button_index, -1);
-    }));
-    right.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        move_button(&editor, layer_index, button_index, 1);
-    }));
-    remove.connect_clicked(glib::clone!(#[strong] editor, move |_| {
-        {
-            let mut doc = editor.doc.borrow_mut();
-            if let Some(layer) = doc.layers_mut().get_mut(layer_index) {
-                if button_index < layer.keys.len() {
-                    layer.keys.remove(button_index);
+    left.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            move_button(&editor, layer_index, button_index, -1);
+        }
+    ));
+    right.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            move_button(&editor, layer_index, button_index, 1);
+        }
+    ));
+    remove.connect_clicked(glib::clone!(
+        #[strong]
+        editor,
+        move |_| {
+            {
+                let mut doc = editor.doc.borrow_mut();
+                if let Some(layer) = doc.layers_mut().get_mut(layer_index) {
+                    if button_index < layer.keys.len() {
+                        layer.keys.remove(button_index);
+                    }
                 }
             }
+            *editor.selection.borrow_mut() = Selection {
+                layer: layer_index,
+                button: None,
+            };
+            editor.restructured();
         }
-        *editor.selection.borrow_mut() = Selection {
-            layer: layer_index,
-            button: None,
-        };
-        editor.restructured();
-    }));
+    ));
 
     let is_selected = {
         let selection = editor.selection.borrow();
@@ -843,13 +986,31 @@ fn button_editor(
     outer.append(&size_row);
 
     // ---- action editor ----
-    outer.append(&action_editor(editor, layer_index, button_index, &button.action));
+    outer.append(&action_editor(
+        editor,
+        layer_index,
+        button_index,
+        &button.action,
+    ));
 
     // ---- plumbing ---------------------------------------------
-    rebuild_kind_fields(&fields, editor, layer_index, button_index, button_kind(button), button);
+    rebuild_kind_fields(
+        &fields,
+        editor,
+        layer_index,
+        button_index,
+        button_kind(button),
+        button,
+    );
 
-    kind_dropdown.connect_selected_notify(
-        glib::clone!(#[strong] editor, #[strong] fields, #[strong] kind_dropdown, move |_| {
+    kind_dropdown.connect_selected_notify(glib::clone!(
+        #[strong]
+        editor,
+        #[strong]
+        fields,
+        #[strong]
+        kind_dropdown,
+        move |_| {
             let Some(index) = kind_dropdown.selected().checked_sub(0) else {
                 return;
             };
@@ -860,18 +1021,26 @@ fn button_editor(
                 rebuild_kind_fields(&fields, &editor, layer_index, button_index, kind, &button);
             }
             editor.restructured();
-        }),
-    );
+        }
+    ));
 
-    stretch.connect_value_changed(glib::clone!(#[strong] editor, move |spin| {
-        let value = spin.value() as usize;
-        edit_button(&editor, layer_index, button_index, |button| {
-            button.stretch = (value > 1).then_some(value);
-        });
-    }));
+    stretch.connect_value_changed(glib::clone!(
+        #[strong]
+        editor,
+        move |spin| {
+            let value = spin.value() as usize;
+            edit_button(&editor, layer_index, button_index, |button| {
+                button.stretch = (value > 1).then_some(value);
+            });
+        }
+    ));
 
-    accent.connect_selected_notify(
-        glib::clone!(#[strong] editor, #[strong] accent, move |_| {
+    accent.connect_selected_notify(glib::clone!(
+        #[strong]
+        editor,
+        #[strong]
+        accent,
+        move |_| {
             let index = accent.selected() as usize;
             let name = accent_names[index];
             edit_button(&editor, layer_index, button_index, |button| {
@@ -881,21 +1050,29 @@ fn button_editor(
                     accent_from_name(name)
                 };
             });
-        }),
-    );
+        }
+    ));
 
-    icon_width.connect_value_changed(glib::clone!(#[strong] editor, move |spin| {
-        let value = spin.value() as i32;
-        edit_button(&editor, layer_index, button_index, |button| {
-            button.icon_width = (value != 40).then_some(value);
-        });
-    }));
-    icon_height.connect_value_changed(glib::clone!(#[strong] editor, move |spin| {
-        let value = spin.value() as i32;
-        edit_button(&editor, layer_index, button_index, |button| {
-            button.icon_height = (value != 40).then_some(value);
-        });
-    }));
+    icon_width.connect_value_changed(glib::clone!(
+        #[strong]
+        editor,
+        move |spin| {
+            let value = spin.value() as i32;
+            edit_button(&editor, layer_index, button_index, |button| {
+                button.icon_width = (value != 40).then_some(value);
+            });
+        }
+    ));
+    icon_height.connect_value_changed(glib::clone!(
+        #[strong]
+        editor,
+        move |spin| {
+            let value = spin.value() as i32;
+            edit_button(&editor, layer_index, button_index, |button| {
+                button.icon_height = (value != 40).then_some(value);
+            });
+        }
+    ));
 
     outer.upcast()
 }
@@ -924,12 +1101,16 @@ fn rebuild_kind_fields(
             entry.set_hexpand(true);
             row.append(&entry);
             fields.append(&row);
-            entry.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-                let text = entry.text().to_string();
-                edit_button(&editor, layer_index, button_index, |button| {
-                    button.text = (!text.is_empty()).then(|| text.clone());
-                });
-            }));
+            entry.connect_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |entry| {
+                    let text = entry.text().to_string();
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        button.text = (!text.is_empty()).then(|| text.clone());
+                    });
+                }
+            ));
         }
         ButtonKind::Icon => {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -939,12 +1120,16 @@ fn rebuild_kind_fields(
             entry.set_hexpand(true);
             row.append(&entry);
             fields.append(&row);
-            entry.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-                let name = entry.text().to_string();
-                edit_button(&editor, layer_index, button_index, |button| {
-                    button.icon = (!name.is_empty()).then(|| name.clone());
-                });
-            }));
+            entry.connect_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |entry| {
+                    let name = entry.text().to_string();
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        button.icon = (!name.is_empty()).then(|| name.clone());
+                    });
+                }
+            ));
 
             let theme_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             theme_row.append(&gtk4::Label::new(Some("XDG icon theme:")));
@@ -953,12 +1138,16 @@ fn rebuild_kind_fields(
             theme.set_placeholder_text(Some("e.g. Adwaita (optional)"));
             theme_row.append(&theme);
             fields.append(&theme_row);
-            theme.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-                let name = entry.text().to_string();
-                edit_button(&editor, layer_index, button_index, |button| {
-                    button.theme = (!name.is_empty()).then(|| name.clone());
-                });
-            }));
+            theme.connect_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |entry| {
+                    let name = entry.text().to_string();
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        button.theme = (!name.is_empty()).then(|| name.clone());
+                    });
+                }
+            ));
         }
         ButtonKind::Time => {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -971,8 +1160,7 @@ fn rebuild_kind_fields(
             } else {
                 "custom"
             };
-            dropdown
-                .set_selected(formats.iter().position(|f| *f == selected).unwrap_or(0) as u32);
+            dropdown.set_selected(formats.iter().position(|f| *f == selected).unwrap_or(0) as u32);
             row.append(&dropdown);
             let custom = gtk4::Entry::new();
             custom.set_placeholder_text(Some("%H:%M"));
@@ -993,25 +1181,37 @@ fn rebuild_kind_fields(
                     button.time = Some(format);
                 });
             }
-            dropdown.connect_selected_notify(
-                glib::clone!(#[strong] custom, #[strong] editor, move |dropdown| {
+            dropdown.connect_selected_notify(glib::clone!(
+                #[strong]
+                custom,
+                #[strong]
+                editor,
+                move |dropdown| {
                     let format = if dropdown.selected() == 2 {
                         let text = custom.text().to_string();
-                        (!text.is_empty()).then(|| text).unwrap_or_else(|| "%H:%M".into())
+                        (!text.is_empty())
+                            .then(|| text)
+                            .unwrap_or_else(|| "%H:%M".into())
                     } else {
                         formats[dropdown.selected() as usize].to_owned()
                     };
                     write_format(&editor, layer_index, button_index, format);
-                }),
-            );
-            custom.connect_changed(glib::clone!(#[strong] dropdown, #[strong] editor, move |entry| {
-                if dropdown.selected() == 2 {
-                    let text = entry.text().to_string();
-                    if !text.is_empty() {
-                        write_format(&editor, layer_index, button_index, text);
+                }
+            ));
+            custom.connect_changed(glib::clone!(
+                #[strong]
+                dropdown,
+                #[strong]
+                editor,
+                move |entry| {
+                    if dropdown.selected() == 2 {
+                        let text = entry.text().to_string();
+                        if !text.is_empty() {
+                            write_format(&editor, layer_index, button_index, text);
+                        }
                     }
                 }
-            }));
+            ));
 
             let locale_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             locale_row.append(&gtk4::Label::new(Some("Locale:")));
@@ -1020,12 +1220,16 @@ fn rebuild_kind_fields(
             locale.set_placeholder_text(Some("e.g. en_US (optional)"));
             locale_row.append(&locale);
             fields.append(&locale_row);
-            locale.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-                let name = entry.text().to_string();
-                edit_button(&editor, layer_index, button_index, |button| {
-                    button.locale = (!name.is_empty()).then(|| name.clone());
-                });
-            }));
+            locale.connect_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |entry| {
+                    let name = entry.text().to_string();
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        button.locale = (!name.is_empty()).then(|| name.clone());
+                    });
+                }
+            ));
         }
         ButtonKind::Battery => {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -1036,10 +1240,16 @@ fn rebuild_kind_fields(
             dropdown.set_selected(modes.iter().position(|m| *m == current).unwrap_or(0) as u32);
             row.append(&dropdown);
             fields.append(&row);
-            dropdown.connect_selected_notify(glib::clone!(#[strong] editor, move |dropdown| {
-                let mode = modes[dropdown.selected() as usize].to_owned();
-                edit_button(&editor, layer_index, button_index, |button| button.battery = Some(mode.clone()));
-            }));
+            dropdown.connect_selected_notify(glib::clone!(
+                #[strong]
+                editor,
+                move |dropdown| {
+                    let mode = modes[dropdown.selected() as usize].to_owned();
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        button.battery = Some(mode.clone())
+                    });
+                }
+            ));
         }
         ButtonKind::Waveform | ButtonKind::Visualizer => {
             let is_wave = kind == ButtonKind::Waveform;
@@ -1056,16 +1266,20 @@ fn rebuild_kind_fields(
             dropdown.set_selected(styles.iter().position(|s| *s == current).unwrap_or(0) as u32);
             style_row.append(&dropdown);
             fields.append(&style_row);
-            dropdown.connect_selected_notify(glib::clone!(#[strong] editor, move |dropdown| {
-                let style = styles[dropdown.selected() as usize].to_owned();
-                edit_button(&editor, layer_index, button_index, |button| {
-                    if is_wave {
-                        button.waveform_style = Some(style.clone());
-                    } else {
-                        button.visualizer_style = Some(style.clone());
-                    }
-                });
-            }));
+            dropdown.connect_selected_notify(glib::clone!(
+                #[strong]
+                editor,
+                move |dropdown| {
+                    let style = styles[dropdown.selected() as usize].to_owned();
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        if is_wave {
+                            button.waveform_style = Some(style.clone());
+                        } else {
+                            button.visualizer_style = Some(style.clone());
+                        }
+                    });
+                }
+            ));
 
             let motion_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             motion_row.append(&gtk4::Label::new(Some("Smoothing ms:")));
@@ -1091,26 +1305,34 @@ fn rebuild_kind_fields(
             );
             motion_row.append(&lag);
             fields.append(&motion_row);
-            smoothing.connect_value_changed(glib::clone!(#[strong] editor, move |spin| {
-                let value = spin.value() as u32;
-                edit_button(&editor, layer_index, button_index, |button| {
-                    if is_wave {
-                        button.waveform_smoothing = (value > 0).then_some(value);
-                    } else {
-                        button.visualizer_smoothing = (value > 0).then_some(value);
-                    }
-                });
-            }));
-            lag.connect_value_changed(glib::clone!(#[strong] editor, move |spin| {
-                let value = spin.value() as u32;
-                edit_button(&editor, layer_index, button_index, |button| {
-                    if is_wave {
-                        button.waveform_lag = (value > 0).then_some(value);
-                    } else {
-                        button.visualizer_lag = (value > 0).then_some(value);
-                    }
-                });
-            }));
+            smoothing.connect_value_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |spin| {
+                    let value = spin.value() as u32;
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        if is_wave {
+                            button.waveform_smoothing = (value > 0).then_some(value);
+                        } else {
+                            button.visualizer_smoothing = (value > 0).then_some(value);
+                        }
+                    });
+                }
+            ));
+            lag.connect_value_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |spin| {
+                    let value = spin.value() as u32;
+                    edit_button(&editor, layer_index, button_index, |button| {
+                        if is_wave {
+                            button.waveform_lag = (value > 0).then_some(value);
+                        } else {
+                            button.visualizer_lag = (value > 0).then_some(value);
+                        }
+                    });
+                }
+            ));
         }
         ButtonKind::NowPlaying | ButtonKind::Spacer => {
             fields.append(&gtk4::Label::new(Some(
@@ -1169,7 +1391,10 @@ fn action_editor(
     let (layer_names, theme_names) = {
         let mut doc = editor.doc.borrow_mut();
         (
-            doc.layers().iter().map(|l| l.name.clone()).collect::<Vec<_>>(),
+            doc.layers()
+                .iter()
+                .map(|l| l.name.clone())
+                .collect::<Vec<_>>(),
             doc.known_themes(),
         )
     };
@@ -1179,13 +1404,27 @@ fn action_editor(
         let layer_names = layer_names.clone();
         let theme_names = theme_names.clone();
         move |form: &ActionForm, fields: &gtk4::Box| {
-            rebuild_action_fields(fields, &editor, layer_index, button_index, form, &layer_names, &theme_names);
+            rebuild_action_fields(
+                fields,
+                &editor,
+                layer_index,
+                button_index,
+                form,
+                &layer_names,
+                &theme_names,
+            );
         }
     };
     rebuild(&ActionForm::of(action), &fields);
 
-    dropdown.connect_selected_notify(
-        glib::clone!(#[strong] editor, #[strong] fields, #[strong] dropdown, move |_| {
+    dropdown.connect_selected_notify(glib::clone!(
+        #[strong]
+        editor,
+        #[strong]
+        fields,
+        #[strong]
+        dropdown,
+        move |_| {
             let form = match dropdown.selected() {
                 0 => ActionForm::None,
                 1 => ActionForm::Keys(Vec::new()),
@@ -1204,10 +1443,12 @@ fn action_editor(
                 8 => ActionForm::BrightnessSlider,
                 _ => ActionForm::CycleTheme,
             };
-            edit_button(&editor, layer_index, button_index, |button| button.action = form.to_action());
+            edit_button(&editor, layer_index, button_index, |button| {
+                button.action = form.to_action()
+            });
             rebuild(&form, &fields);
-        }),
-    );
+        }
+    ));
 
     frame.upcast()
 }
@@ -1251,37 +1492,57 @@ fn rebuild_action_fields(
             let captured: Rc<RefCell<Vec<Key>>> = Rc::new(RefCell::new(keys.clone()));
             let controller = gtk4::EventControllerKey::new();
             controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            controller.connect_key_pressed(glib::clone!(#[strong] captured, #[strong] label, move |_, _, keycode, _| {
-                match key_from_gdk(keycode) {
-                    Some(key) => {
-                        let mut keys = captured.borrow_mut();
-                        if !keys.contains(&key) {
-                            keys.push(key);
-                            label.set_text(&keys_label(&keys));
+            controller.connect_key_pressed(glib::clone!(
+                #[strong]
+                captured,
+                #[strong]
+                label,
+                move |_, _, keycode, _| {
+                    match key_from_gdk(keycode) {
+                        Some(key) => {
+                            let mut keys = captured.borrow_mut();
+                            if !keys.contains(&key) {
+                                keys.push(key);
+                                label.set_text(&keys_label(&keys));
+                            }
+                            glib::Propagation::Stop
                         }
-                        glib::Propagation::Stop
+                        None => glib::Propagation::Proceed,
                     }
-                    None => glib::Propagation::Proceed,
                 }
-            }));
+            ));
             capture.add_controller(controller);
 
-            capture.connect_toggled(glib::clone!(#[strong] editor, #[strong] captured, move |toggle| {
-                if !toggle.is_active() {
-                    // Commit on release.
-                    let keys = captured.borrow().clone();
+            capture.connect_toggled(glib::clone!(
+                #[strong]
+                editor,
+                #[strong]
+                captured,
+                move |toggle| {
+                    if !toggle.is_active() {
+                        // Commit on release.
+                        let keys = captured.borrow().clone();
+                        edit_button(&editor, layer_index, button_index, |button| {
+                            button.action = ActionForm::Keys(keys.clone()).to_action();
+                        });
+                    }
+                }
+            ));
+            clear.connect_clicked(glib::clone!(
+                #[strong]
+                editor,
+                #[strong]
+                captured,
+                #[strong]
+                label,
+                move |_| {
+                    captured.borrow_mut().clear();
+                    label.set_text(&keys_label(&[]));
                     edit_button(&editor, layer_index, button_index, |button| {
-                        button.action = ActionForm::Keys(keys.clone()).to_action();
+                        button.action = ActionForm::None.to_action();
                     });
                 }
-            }));
-            clear.connect_clicked(glib::clone!(#[strong] editor, #[strong] captured, #[strong] label, move |_| {
-                captured.borrow_mut().clear();
-                label.set_text(&keys_label(&[]));
-                edit_button(&editor, layer_index, button_index, |button| {
-                    button.action = ActionForm::None.to_action();
-                });
-            }));
+            ));
         }
         ActionForm::SwitchLayer(_)
         | ActionForm::CommandLayer { .. }
@@ -1299,14 +1560,18 @@ fn rebuild_action_fields(
             }
             row.append(&dropdown);
             fields.append(&row);
-            dropdown.connect_selected_notify(
-                glib::clone!(#[strong] editor, #[strong] names, move |dropdown| {
+            dropdown.connect_selected_notify(glib::clone!(
+                #[strong]
+                editor,
+                #[strong]
+                names,
+                move |dropdown| {
                     let name = names[dropdown.selected() as usize].clone();
                     edit_button(&editor, layer_index, button_index, |button| {
                         button.action = patch_layer_target(&button.action, &name).to_action();
                     });
-                }),
-            );
+                }
+            ));
         }
         _ => {}
     }
@@ -1400,12 +1665,16 @@ fn command_field(
     entry.set_placeholder_text(Some("e.g. systemctl --user toggle night-light"));
     entry.set_hexpand(true);
     row.append(&entry);
-    entry.connect_changed(glib::clone!(#[strong] editor, move |entry| {
-        let command = entry.text().to_string();
-        edit_button(&editor, layer_index, button_index, |button| {
-            button.action = patch_command(&button.action, &command).to_action();
-        });
-    }));
+    entry.connect_changed(glib::clone!(
+        #[strong]
+        editor,
+        move |entry| {
+            let command = entry.text().to_string();
+            edit_button(&editor, layer_index, button_index, |button| {
+                button.action = patch_command(&button.action, &command).to_action();
+            });
+        }
+    ));
     row.upcast()
 }
 
@@ -1436,14 +1705,18 @@ fn theme_field(
     }
     row.append(&dropdown);
     let theme_names = theme_names.to_vec();
-    dropdown.connect_selected_notify(
-        glib::clone!(#[strong] editor, #[strong] theme_names, move |dropdown| {
+    dropdown.connect_selected_notify(glib::clone!(
+        #[strong]
+        editor,
+        #[strong]
+        theme_names,
+        move |dropdown| {
             let theme = theme_names[dropdown.selected() as usize].clone();
             edit_button(&editor, layer_index, button_index, |button| {
                 button.action = patch_theme(&button.action, &theme).to_action();
             });
-        }),
-    );
+        }
+    ));
     row.upcast()
 }
 

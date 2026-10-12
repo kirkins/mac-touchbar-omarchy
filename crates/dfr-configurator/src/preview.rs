@@ -5,8 +5,8 @@
 //! that surface, so idle previewing costs nothing.
 
 use crate::model::Document;
-use gtk4::prelude::*;
 use chrono::Timelike as _;
+use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -76,22 +76,16 @@ impl Preview {
     /// schedule it, never run it per frame.
     pub fn render(&self, doc: &Document) {
         let revision = self.revision.get();
-        let dir = std::env::temp_dir().join(format!(
-            "dfr-configurator-preview-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dfr-configurator-preview-{}", std::process::id()));
         let render = (|| -> anyhow::Result<cairo::ImageSurface> {
             std::fs::create_dir_all(&dir)?;
             let base = dir.join("base.toml");
             let user = dir.join("user.toml");
             std::fs::write(&base, doc.base_text())?;
             std::fs::write(&user, doc.candidate_text())?;
-            let (cfg, mut deck) = dfr_render::config::load_config(
-                self.width.get(),
-                &base,
-                Some(&user),
-                None,
-            )?;
+            let (cfg, mut deck) =
+                dfr_render::config::load_config(self.width.get(), &base, Some(&user), None)?;
             let layer = self.layer.borrow().clone();
             let index = *deck
                 .names
@@ -107,9 +101,7 @@ impl Preview {
             deck.slider.pixel_shift_width = 0;
             deck.slider.pixel_shift_x = 0.0;
             let slider = deck.slider_render();
-            let background = cfg
-                .day_cycle
-                .background(chrono::Local::now().hour());
+            let background = cfg.day_cycle.background(chrono::Local::now().hour());
             deck.current_mut().draw(
                 &cfg,
                 (self.width.get() as i32, HEIGHT),
@@ -119,12 +111,9 @@ impl Preview {
                 slider,
                 background,
             );
-            let horizontal = cairo::ImageSurface::create(
-                cairo::Format::ARgb32,
-                self.width.get() as i32,
-                HEIGHT,
-            )
-            .expect("the horizontal surface allocates");
+            let horizontal =
+                cairo::ImageSurface::create(cairo::Format::ARgb32, self.width.get() as i32, HEIGHT)
+                    .expect("the horizontal surface allocates");
             let context = cairo::Context::new(&horizontal).expect("the preview context allocates");
             context.translate(0.0, HEIGHT as f64);
             context.rotate((-90.0_f64).to_radians());
@@ -155,23 +144,20 @@ impl Preview {
     ) {
         // The panel's backdrop first: the bar never draws on transparency.
         context.set_source_rgb(0.11, 0.11, 0.12);
-        context
-            .rectangle(0.0, 0.0, width_px.max(1) as f64, height_px.max(1) as f64);
+        context.rectangle(0.0, 0.0, width_px.max(1) as f64, height_px.max(1) as f64);
         let _ = context.paint();
         if let Some(err) = self.error.borrow().as_ref() {
             // The toy text API is plenty for a one-line diagnostic.
             context.set_source_rgb(0.94, 0.94, 0.94);
-            context.select_font_face(
-                "Sans",
-                cairo::FontSlant::Normal,
-                cairo::FontWeight::Bold,
-            );
+            context.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
             context.set_font_size(11.0);
             let text = format!("preview unavailable: {err}");
             if let Ok(extents) = context.text_extents(&text) {
                 context.move_to(
                     8.0,
-                    (height_px as f64 / 2.0 - extents.height() / 2.0 + extents.y_advance().max(0.0)).max(12.0),
+                    (height_px as f64 / 2.0 - extents.height() / 2.0
+                        + extents.y_advance().max(0.0))
+                    .max(12.0),
                 );
             }
             let _ = context.show_text(&text);
