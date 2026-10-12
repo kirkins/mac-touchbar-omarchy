@@ -1,0 +1,22 @@
+[package]
+name = "dfr-configurator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND Apache-2.0"
+description = "The native GTK4/libadwaita configurator for the tiny-dfr Touch Bar deck"
+
+[dependencies]
+dfr-config = { path = "../dfr-config" }
+dfr-render = { path = "../dfr-render" }
+anyhow = "1"
+gtk4 = { version = "0.11", features = ["v4_10"] }
+libadwaita = { version = "0.9", features = ["v1_5", "gtk_v4_10"] }
+cairo-rs = { version = "0.22", default-features = false, features = ["png"] }
+input-linux = { version = "0.7", features = ["serde"] }
+toml = "0.8"
+serde = "1"
+chrono = "0.4"
+
+[[bin]]
+name = "dfr-configurator"
+path = "src/main.rs"

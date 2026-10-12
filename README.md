@@ -137,6 +137,46 @@ restart after editing: an invalid candidate never bricks the bar (the
 daemon keeps its current configuration), but `check` tells you about
 the problem instead of leaving it in the journal.
 
+## Graphical configurator
+
+A native GTK4/libadwaita configurator lives in `crates/dfr-configurator`
+(`cargo build -p dfr-configurator`). It is a build-on-demand tool for
+people editing a deck, **not** part of the daemon install: nothing in
+`make install` or the service depends on it, and it never runs as root
+beyond whatever privileges you start it with — save installs the file
+with an atomic rename, so point it at a copy if your config needs
+elevated rights and install that copy yourself.
+
+Building it needs the GTK 4 and libadwaita development packages at
+build time only (the daemon itself stays dependency-free of them):
+Arch `pacman -S gtk4 libadwaita`, Fedora `dnf install gtk4-devel
+libadwaita-devel`, Debian/Ubuntu `apt install libgtk-4-dev
+libadwaita-1-dev`. A checkout that lacks them still builds the daemon:
+`cargo build -p tiny-dfr` never compiles the configurator.
+
+Run it with:
+
+```sh
+cargo run -p dfr-configurator -- [--config PATH] [--base PATH]
+```
+
+The app edits whatever `--config` file it is pointed at (default
+`/etc/tiny-dfr/config.toml`, overlaid on the default base
+`/usr/share/tiny-dfr/config.toml`) — the same base-plus-user merge the
+daemon loads — and never writes anywhere else: no state, no caches, no
+touched daemon. The **Deck** page edits the named bars (button grid,
+add/remove/reorder, per-button action editor with live key-combo
+capture); the **Knobs** page exposes every registry knob with the
+validated input the config contract demands; the preview strip renders
+the real bar for each layer through the same `dfr-render` draw path the
+daemon uses, so what you see is what the glass shows. Save is disabled
+while the configuration is invalid; when it is valid, one click backs
+up the file once (`.bak-<epoch>` beside it), writes the canonical
+`dfr-config` TOML to a staged file, and renames it into place — the
+atomic save the daemon's inotify watcher reloads live, no restart. The
+headless model underneath (open/edit/validate/save) is unit-tested in
+`crates/dfr-configurator/src/model.rs` without a display.
+
 ## Configuration reference
 
 <!-- dfr-config knob reference: begin -->

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dfr-config", "crates/dfr-render"]
+members = ["crates/dfr-config", "crates/dfr-render", "crates/dfr-configurator"]
 resolver = "2"
 
 [package]

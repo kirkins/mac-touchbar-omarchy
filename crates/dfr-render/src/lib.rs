@@ -1721,7 +1721,7 @@ impl LayerDeck {
         self.slider_collapse();
     }
 
-    fn switch_to(&mut self, target: usize, emit_keys: &mut impl FnMut(&[Key], bool)) -> bool {
+    pub fn switch_to(&mut self, target: usize, emit_keys: &mut impl FnMut(&[Key], bool)) -> bool {
         if target >= self.layers.len() || target == self.active {
             return false;
         }
