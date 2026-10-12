@@ -45,7 +45,7 @@ pub mod themes;
 pub mod waveform;
 
 use crate::appearance::AccentPaint;
-pub use crate::config::{Config, ButtonAction, ButtonConfig};
+pub use crate::config::{ButtonAction, ButtonConfig, Config};
 use crate::themes::ThemeRequest;
 use appearance::{ButtonAccent, Palette};
 use dfr_config::defaults::DEFAULT_ICON_SIZE;

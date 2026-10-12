@@ -708,4 +708,3 @@ fn real_main(drm: &mut DrmBackend) {
         }
     }
 }
-

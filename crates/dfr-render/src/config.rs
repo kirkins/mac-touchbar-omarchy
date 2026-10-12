@@ -229,10 +229,10 @@ pub fn write_persisted_theme(path: &Path, name: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use dfr_config::{ConfigProxy, LayerLayout, LoadedModel, ThemeSet, PET_LAYER_STRETCH};
     use input_linux::Key;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     /// The content-level parse used by these tests: the shared
@@ -1095,10 +1095,10 @@ DoublePressSwitchLayers = 200
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        // Home, the shipped quick keys (Screenshot, Lock), and the two
+        // Home, the shipped quick keys (Screenshot, Settings, Lock), and the two
         // synthesized theme buttons: the compact cycle button and the
         // picker opener.
-        assert_eq!(more.keys.len(), 5);
+        assert_eq!(more.keys.len(), 6);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1299,11 +1299,19 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 5);
+        assert_eq!(more.keys.len(), 6);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
             ButtonAction::SwitchLayer("home".into())
+        );
+        assert_eq!(more.keys[2].text.as_deref(), Some("Settings"));
+        assert_eq!(
+            more.keys[2].action,
+            ButtonAction::CommandLayer {
+                command: "touchbar-capture-user settings".into(),
+                layer: "home".into()
+            }
         );
         let screenshot = &more.keys[1];
         assert_eq!(screenshot.text.as_deref(), Some("Screenshot"));
@@ -1335,7 +1343,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 7);
+        assert_eq!(more.keys.len(), 8);
         assert_eq!(more.keys[2].icon.as_deref(), Some("search"));
         assert!(more.keys[2].text.is_none());
         assert_eq!(
@@ -1954,7 +1962,11 @@ Color = "301020"
         let base_path = tmp.0.join("base.toml");
         fs::write(&base_path, toml::to_string(&installed).unwrap()).unwrap();
         let user_path = tmp.0.join("config.toml");
-        fs::write(&user_path, include_str!("../../../share/tiny-dfr/multibar.toml")).unwrap();
+        fs::write(
+            &user_path,
+            include_str!("../../../share/tiny-dfr/multibar.toml"),
+        )
+        .unwrap();
         let (cfg, deck) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
         assert_eq!(cfg.double_press_switch_layers, 0);
         assert!(!deck.legacy);
@@ -2114,12 +2126,20 @@ Keys = [{{ Text = \"P1\" }}]\n"
         let frame = |deck: &mut crate::LayerDeck, name: &str| -> u64 {
             let index = deck.names[name];
             deck.switch_to(index, &mut |_, _| {});
-            let mut portrait = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
+            let mut portrait =
+                cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 2048).unwrap();
             deck.slider.pixel_shift_width = 0;
             deck.slider.pixel_shift_x = 0.0;
             let volume = deck.slider_render();
-            deck.current_mut()
-                .draw(&cfg, (2008, 60), &portrait, (0.0, 0.0), true, volume, background);
+            deck.current_mut().draw(
+                &cfg,
+                (2008, 60),
+                &portrait,
+                (0.0, 0.0),
+                true,
+                volume,
+                background,
+            );
             frame_hash(&mut portrait)
         };
         for (name, golden) in [
@@ -2132,7 +2152,10 @@ Keys = [{{ Text = \"P1\" }}]\n"
             // within a run before the golden is meaningful.
             let repeat = frame(&mut deck, name);
             assert_eq!(first, repeat, "layer {name} is not pixel-stable");
-            assert_eq!(first, golden, "layer {name} frame drifted from the pinned digest");
+            assert_eq!(
+                first, golden,
+                "layer {name} frame drifted from the pinned digest"
+            );
         }
     }
 }
