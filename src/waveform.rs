@@ -1329,6 +1329,17 @@ fn viz_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_render_time_lag_cap_matches_the_parse_time_validation() {
+        // The renderer keeps its clamp as a defense; the configuration
+        // validator rejects anything larger first. The two constants
+        // must stay the same number.
+        assert_eq!(
+            LAG_MAX_MS,
+            u64::from(dfr_config::defaults::MAX_WAVEFORM_LAG_MS)
+        );
+    }
     use cairo::{Format, ImageSurface};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

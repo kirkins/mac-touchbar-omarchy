@@ -1,0 +1,17 @@
+[package]
+name = "dfr-config"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND Apache-2.0"
+description = "The tiny-dfr configuration model: types, merge, defaults, validation, and the canonical TOML writer"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+input-linux = { version = "0.7", features = ["serde"] }
+chrono = "0.4"
+freedesktop-icons = "0.4.0"
+
+[build-dependencies]
+pkg-config = "0.3"

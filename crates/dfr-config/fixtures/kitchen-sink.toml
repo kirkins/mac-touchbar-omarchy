@@ -1,0 +1,66 @@
+# The kitchen-sink user configuration: every knob set, every action
+# shape, every alias, every table form. Round-trip and golden tests
+# parse this file, so it must stay valid and must keep exercising the
+# full grammar.
+MediaLayerDefault = false
+ShowButtonOutlines = false
+EnablePixelShift = true
+FontTemplate = ":bold"
+AdaptiveBrightness = false
+ActiveBrightness = 200
+DoublePressSwitchLayers = 200
+BatteryCycleEnabled = false
+BatteryCycleTimeoutSecs = 9
+BatteryWarningThreshold = 30
+BatteryCriticalThreshold = 12
+BatteryWarningColor = "amber"
+BatteryCriticalColor = "red"
+PetEnabled = true
+PetVariant = "fox"
+PetEnergy = "rowdy"
+DayCycleEnabled = false
+ThemesEnabled = true
+ActiveTheme = "Mine"
+DefaultLayer = "home"
+FnLayer = "fn"
+
+[[DayCycleBands]]
+Name = "work"
+StartHour = 9
+Color = "#102030"
+
+[[DayCycleBands]]
+Name = "off"
+StartHour = 19
+Color = "#301020"
+
+[Themes.Mine.Accents]
+cyan = "#40E0D0"
+amber = "40e0a0"
+
+[[Layers]]
+Name = "home"
+Keys = [
+    { Icon = "volume_up", Stretch = 2, Action = "VolumeSlider" },
+    { Icon = "brightness_high", IconWidth = 48, IconHeight = 48, Action = "BrightnessSlider" },
+    { Text = "Combo", Action = ["LeftCtrl", "LeftAlt", "F1"] },
+    { Text = "Clock", Time = "24hr", Locale = "en_US", Action = "Time", Stretch = 3 },
+    { Battery = "both", Stretch = 2 },
+    { NowPlaying = true, Stretch = 2 },
+    { Text = "F1", Action = "F1" },
+    { Svg = "search" },
+    { },
+]
+
+[[Layers]]
+Name = "fn"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "Sync", Action = { Command = "sync-now" } },
+    { Text = "Stop", Action = { Command = "sync-now", Layer = "home" } },
+    { Text = "Wear", Action = { Theme = "Mine" } },
+    { Text = "Pick", Action = { Theme = "Mine", Layer = "home" } },
+    { Text = "Next", Action = "CycleTheme" },
+    { Waveform = true, WaveformStyle = "bars", WaveformSmoothing = 240, WaveformLag = 80, Stretch = 3, Accent = "cyan" },
+    { Visualizer = true, VisualizerStyle = "line", VisualizerSmoothing = 120, VisualizerLag = 40, Stretch = 2, Accent = "blue" },
+]

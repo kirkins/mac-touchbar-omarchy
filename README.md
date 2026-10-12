@@ -14,10 +14,14 @@ sequentially:
 
 ```sh
 cargo fmt --all -- --check
-CARGO_BUILD_JOBS=1 cargo test --locked -- --test-threads=1
-CARGO_BUILD_JOBS=1 cargo clippy --locked --all-targets
-CARGO_BUILD_JOBS=1 cargo build --locked --release
+CARGO_BUILD_JOBS=1 cargo test --locked --workspace -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo clippy --locked --workspace --all-targets
+CARGO_BUILD_JOBS=1 cargo build --locked --workspace --release
 ```
+
+The configuration model lives in the `dfr-config` crate
+(`crates/dfr-config`); the daemon binary is the root `tiny-dfr` package,
+so the check commands above build the whole workspace.
 
 For an offline visual check of the shipped named bars, the voice-dispatch test
 can also export actual Cairo frames without opening the Touch Bar or running
@@ -25,7 +29,7 @@ the voice commands:
 
 ```sh
 DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
-    cargo test --locked approved_multibar_preserves_voice_dispatch_and_renders_offline -- --test-threads=1
+    cargo test --locked --bin tiny-dfr approved_multibar_preserves_voice_dispatch_and_renders_offline -- --test-threads=1
 ```
 
 Inspect `implemented-home.png`, `implemented-home-muted.png` (the same bar
@@ -105,6 +109,117 @@ exactly while the view is displayed, a lost consumer still sends `off`),
 the music widget's rendering and idle wakes, config parsing, and the helper's
 capture, protocol, and idle-watchdog behavior against fakes; its on-glass look
 with real playback is a device check.
+
+## Validating a configuration offline
+
+`tiny-dfr check [FILE]` runs the exact parse, merge, and validation path
+the daemon runs - including icon and font resolution - without opening
+the Touch Bar. It prints one diagnostic per problem (with the TOML line
+where the parser knows it) and exits 0 when the file is as loadable as
+the daemon's own path allows, 1 when diagnostics were printed, and 2 on
+bad usage:
+
+```sh
+# Validate the installed user configuration against the installed base:
+tiny-dfr check
+
+# Validate the shipped showcase example over the checkout's own files
+# (what CI or a pre-commit hook runs from a source tree):
+tiny-dfr check --base share/tiny-dfr/config.toml \
+    --icon-root share/tiny-dfr share/tiny-dfr/multibar.toml
+
+# Also exercise the wide-bar layout, which synthesizes the esc key:
+tiny-dfr check --width 2170 /etc/tiny-dfr/config.toml
+```
+
+Run it before installing a candidate file and before every service
+restart after editing: an invalid candidate never bricks the bar (the
+daemon keeps its current configuration), but `check` tells you about
+the problem instead of leaving it in the journal.
+
+## Configuration reference
+
+<!-- dfr-config knob reference: begin -->
+The knob registry in `crates/dfr-config/src/registry.rs` is the single
+source of truth for this table; a test regenerates it and fails when the
+README copy drifts. Every knob rejects unknown siblings: a typo in a
+name rejects the candidate configuration naming the line, not a silent
+ignore. Defaults are code-level: a stripped base file still loads.
+
+### Global knobs
+
+| Knob | Type | Default | Constraints | Purpose |
+|---|---|---|---|---|
+| **Appearance** | | | | |
+| `ShowButtonOutlines` | bool | `true` | - | Draw the outline around each button; false leaves only labels and glyphs. |
+| `EnablePixelShift` | bool | `false` | - | Slowly shift the strip contents sideways to spread pixel wear. |
+| `FontTemplate` | string | `":bold"` | a fontconfig pattern that matches an installed font | Fontconfig pattern selecting the font for text labels (see the fontconfig font-names guide). |
+| `ActiveBrightness` | u32 | `128` | 0-255 | Static brightness with adaptive off; the curve's maximum with it on. |
+| `AdaptiveBrightness` | bool | `true` | - | Follow the primary display's backlight instead of a fixed brightness. |
+| **Input** | | | | |
+| `DoublePressSwitchLayers` | u32 | `0` | 0 disables; otherwise a millisecond window | Double-press Fn within this many milliseconds to swap the default layer. |
+| **Battery** | | | | |
+| `BatteryCycleEnabled` | bool | `true` | - | Tap a battery widget to cycle from the system battery through device batteries. |
+| `BatteryCycleTimeoutSecs` | u32 | `15` | 1-3600 seconds | Return to the system battery this long after the last cycling tap. |
+| `BatteryWarningThreshold` | u32 | `25` | 0-100, at least the critical threshold | Below this charge percent (and not charging) the widget paints the warning color. |
+| `BatteryCriticalThreshold` | u32 | `10` | 0-100, at most the warning threshold | Below this charge percent the widget paints the critical color. |
+| `BatteryWarningColor` | enum | `orange` | neutral, cyan, amber, blue, violet, orange, red, green | Accent painted below the warning threshold while not charging. |
+| `BatteryCriticalColor` | enum | `red` | neutral, cyan, amber, blue, violet, orange, red, green | Accent painted below the critical threshold while not charging. |
+| **Pet** | | | | |
+| `PetEnabled` | bool | `true` | - | Keep the pet layer and its home-bar Pet button; false removes both. |
+| `PetVariant` | enum | `cat` | cat, fox | The pet's sprite: an orange tabby or a red fox. |
+| `PetEnergy` | enum | `calm` | calm, rowdy | Rowdy pets dash more and get hungry sooner; calm ones stroll and doze. |
+| **Background** | | | | |
+| `DayCycleEnabled` | bool | `true` | - | Tint the strip by time of day; false keeps the plain black background. |
+| `DayCycleBands` | list of tables | `four shipped bands` | at least one band; unique names and 0-23 hours | Replace the default bands: each [[DayCycleBands]] entry has Name, StartHour, and a "#RRGGBB" Color. |
+| **Themes** | | | | |
+| `ThemesEnabled` | bool | `true` | - | Enable the color-theme system: the picker layer and the more bar's two theme buttons. |
+| `ActiveTheme` | string | `the remembered choice` | must name a defined theme | Pin the startup theme instead of the last choice made on the glass. |
+| `Themes` | table map | `the eight built-ins` | at most 21 themes in total | Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]]. |
+| **Layers** | | | | |
+| `MediaLayerDefault` | bool | `false` | legacy syntax only | Legacy syntax: show the media keys without Fn pressed. |
+| `PrimaryLayerKeys` | list of tables | `the shipped F1-F12 bar` | legacy syntax; mutually exclusive with Layers | Legacy syntax: the primary layer's buttons. |
+| `MediaLayerKeys` | list of tables | `the shipped media bar` | legacy syntax; mutually exclusive with Layers | Legacy syntax: the media layer's buttons. |
+| `Layers` | list of tables | `none (legacy syntax)` | named syntax; requires DefaultLayer; unique nonempty names | The named bars: each [[Layers]] entry has a Name and a nonempty Keys list of button tables. |
+| `DefaultLayer` | string | `primary (legacy)` | must name a Layers entry when Layers is used | The layer the bar starts on and returns to. |
+| `FnLayer` | string | `the other legacy layer` | optional; must name a Layers entry | The layer held while Fn is pressed. |
+
+### Button knobs
+
+| Knob | Type | Default | Constraints | Purpose |
+|---|---|---|---|---|
+| **Button content** | | | | |
+| `Icon` | string | `none` | Svg is an accepted alias; a file must resolve | Icon name, without extension: the fixed icon directories, or the XDG theme when Theme is set. |
+| `Text` | string | `none` | - | The button's text label. |
+| `Theme` | string | `none` | an installed XDG icon theme | The XDG icon theme to resolve this button's Icon in (not a color theme). |
+| `Time` | string | `none` | 24hr, 12hr, or a chrono strftime format string | Show a clock; the value is a shorthand or a strftime format. |
+| `Locale` | string | `POSIX` | a locale chrono knows | Locale for the Time button's names; an unknown locale falls back to POSIX. |
+| `Battery` | enum | `none` | icon, percentage, both | Show the battery as an icon ladder, a percentage, or both. |
+| **Waveform and visualizer** | | | | |
+| `Waveform` | bool | `false` | - | Make this button the live microphone waveform widget. |
+| `WaveformStyle` | enum | `line` | line, bars | The waveform's graph style. |
+| `WaveformSmoothing` | u32 | `0` | 0-5000 ms | Milliseconds of level decay for calmer waveform motion; the attack is a third of it. |
+| `WaveformLag` | u32 | `0` | 0-500 ms | Milliseconds of visual delay behind the measured level. |
+| `Visualizer` | bool | `false` | - | Make this button the opt-in music visualizer; a tap expands it to the full bar. |
+| `VisualizerStyle` | enum | `line` | line, bars | The visualizer's graph style. |
+| `VisualizerSmoothing` | u32 | `0` | 0-5000 ms | Visualizer motion decay, as WaveformSmoothing. |
+| `VisualizerLag` | u32 | `0` | 0-500 ms | Visualizer visual delay, as WaveformLag. |
+| **Button content** | | | | |
+| `NowPlaying` | bool | `false` | - | Make this button the now-playing row: the current track's title and artist. |
+| **Button action** | | | | |
+| `Action` | string, list, or table | `none` | a key name, a key list, a slider name, CycleTheme, or a Layer/Command/Theme table | What a press does: emit keys, run a command, switch layers, open a slider, or apply a theme. |
+| **Button size and color** | | | | |
+| `Stretch` | usize | `1` | at least 1 | Button spaces this button occupies. |
+| `IconWidth` | i32 | `40` | 8-256 px | Icon width; match PNG pixel size for best results. |
+| `IconHeight` | i32 | `40` | 8-256 px | Icon height; match PNG pixel size for best results. |
+| `Accent` | enum | `the action's family` | neutral, cyan, amber, blue, violet, orange, red, green | The semantic accent color for this button's fill and outline. |
+
+Reserved layer names: `pet` and `themes` name the daemon's synthesized
+layers; a user layer with the name replaces the synthesized one. The
+button `Theme` selects an XDG *icon* theme; the action table's `Theme`
+applies a *color* theme. No `Version` key exists yet; one would be
+additive if a future migration needs a hook.
+<!-- dfr-config knob reference: end -->
 
 ## Named bars
 
@@ -646,6 +761,43 @@ atomic saves are watched. Layer changes and valid reloads release held virtual
 keys and discard existing touches; fingers already down must lift and press
 again on the new bar.
 
+## Migration notes: the configuration is a contract now
+
+The configuration file is validated as a contract: unknown keys are
+rejected everywhere (previously a typo like `ShowButtonOutline` or a
+button's `Tex` was silently ignored), documented ranges are enforced at
+load time, and content errors that used to crash the daemon now reject
+the candidate configuration instead. Every shipped config and example
+passes unchanged; the tightening only bites files that were already
+broken in ways the old daemon ignored, clamped, or crashed on.
+
+If a configuration suddenly fails to load after upgrading:
+
+1. Run `tiny-dfr check` on it; every diagnostic names the file, the TOML
+   line where the parser knows it, and - for typos - the closest real
+   knob name (`did you mean `ShowButtonOutlines`?`).
+2. Unknown fields: fix the spelling, or remove keys the daemon never
+   read. The `Svg` alias for `Icon` remains accepted forever.
+3. Newly enforced ranges, each previously documented but not checked:
+   `ActiveBrightness` 0-255; `Stretch` at least 1 (a zero used to be
+   clamped to 1 with a console note); `WaveformLag`/`VisualizerLag` at
+   most 500 ms (the renderer silently clamped larger values);
+   `WaveformSmoothing`/`VisualizerSmoothing` at most 5000 ms;
+   `IconWidth`/`IconHeight` 8-256 px; `BatteryCycleTimeoutSecs` 1-3600
+   seconds; `Battery` one of icon, percentage, both; `WaveformStyle`
+   and `VisualizerStyle` one of line, bars; a `Time` value that chrono
+   can parse.
+4. Icon and font names must resolve: a button `Icon` (or an XDG theme
+   icon, or the battery icon set) that finds no file, or a
+   `FontTemplate` no installed font matches, now rejects the candidate
+   with the name and the searched paths - previously either one
+   panicked the daemon and left the bar a dead bitmap until an admin
+   edited the file by hand.
+
+No `Version` key exists (recorded decision): every change so far is
+additive, and adding one later would itself be additive. A future
+migration that needs a hook can introduce it then.
+
 ## Reversible device installation after review
 
 Branch development and offline checks do not require installation. After review
@@ -655,6 +807,13 @@ They keep the existing system binary and select the new binary through a separat
 service drop-in. The installed `/usr/share/tiny-dfr/config.toml` and icons must
 already be available. Keep any desired global settings in the example before
 installing it.
+
+The schema pass adds one operator step to this dance: the rebuild below is a
+workspace build (it compiles `crates/dfr-config` first), so on memory-limited
+machines keep the capped `CARGO_BUILD_JOBS=1` form from "Build and check" -
+that capped rebuild is the operator step at landing - and validate the live
+user configuration with `tiny-dfr check /etc/tiny-dfr/config.toml` before the
+restart so the stricter validation surprises no one at boot.
 
 Run this block in one shell and retain the printed backup path. It refuses to
 overwrite an earlier multibar binary or drop-in.

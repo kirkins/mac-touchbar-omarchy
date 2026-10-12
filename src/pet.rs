@@ -78,64 +78,30 @@ pub struct Span {
     pub clock: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PetVariant {
-    #[default]
-    Cat,
-    Fox,
-}
+pub use dfr_config::{PetEnergy, PetVariant};
 
-impl PetVariant {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "cat" => Ok(Self::Cat),
-            "fox" => Ok(Self::Fox),
-            _ => Err(format!(
-                "PetVariant must be one of: cat, fox (got {value:?})"
-            )),
-        }
-    }
-
-    fn palette(self) -> Palette {
-        match self {
-            Self::Cat => Palette {
-                body: (0.95, 0.55, 0.18),
-                stripe: (0.72, 0.33, 0.10),
-                dark: (0.25, 0.13, 0.08),
-                light: (0.98, 0.95, 0.90),
-                nose: (0.98, 0.55, 0.62),
-                ear: (0.97, 0.62, 0.66),
-                eye: (0.10, 0.55, 0.25),
-            },
-            Self::Fox => Palette {
-                body: (0.90, 0.42, 0.10),
-                stripe: (0.72, 0.30, 0.06),
-                dark: (0.20, 0.10, 0.06),
-                light: (0.97, 0.93, 0.85),
-                nose: (0.25, 0.15, 0.12),
-                ear: (0.95, 0.60, 0.50),
-                eye: (0.15, 0.12, 0.10),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PetEnergy {
-    #[default]
-    Calm,
-    Rowdy,
-}
-
-impl PetEnergy {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "calm" => Ok(Self::Calm),
-            "rowdy" => Ok(Self::Rowdy),
-            _ => Err(format!(
-                "PetEnergy must be one of: calm, rowdy (got {value:?})"
-            )),
-        }
+/// The sprite colors for one pet variant: the pet renderer's own
+/// palette, distinct from the accent palette the configuration names.
+fn pet_palette(variant: PetVariant) -> Palette {
+    match variant {
+        PetVariant::Cat => Palette {
+            body: (0.95, 0.55, 0.18),
+            stripe: (0.72, 0.33, 0.10),
+            dark: (0.25, 0.13, 0.08),
+            light: (0.98, 0.95, 0.90),
+            nose: (0.98, 0.55, 0.62),
+            ear: (0.97, 0.62, 0.66),
+            eye: (0.10, 0.55, 0.25),
+        },
+        PetVariant::Fox => Palette {
+            body: (0.90, 0.42, 0.10),
+            stripe: (0.72, 0.30, 0.06),
+            dark: (0.20, 0.10, 0.06),
+            light: (0.97, 0.93, 0.85),
+            nose: (0.25, 0.15, 0.12),
+            ear: (0.95, 0.60, 0.50),
+            eye: (0.15, 0.12, 0.10),
+        },
     }
 }
 
@@ -869,7 +835,7 @@ impl PetManager {
             );
         }
         let (grid, mirror) = self.current_grid();
-        let palette = self.variant.palette();
+        let palette = pet_palette(self.variant);
         draw_grid(
             c,
             grid,
@@ -1554,7 +1520,7 @@ mod tests {
             time: Some("24hr".into()),
             ..ButtonConfig::default()
         });
-        let layer = FunctionLayer::with_config(keys);
+        let layer = FunctionLayer::with_config(keys).unwrap();
         let spans = layer.layout_spans(WIDTH as i32, 0);
         assert_eq!(spans.len(), 12);
         for pair in spans.windows(2) {
@@ -1591,7 +1557,8 @@ mod tests {
                 stretch: Some(7),
                 ..ButtonConfig::default()
             },
-        ]);
+        ])
+        .unwrap();
         let spans = layer.layout_spans(WIDTH as i32, 0);
         assert_eq!(spans.len(), 1, "spacers are free ground");
         let mut p = pet();
@@ -2338,7 +2305,8 @@ mod tests {
                 time: Some("24hr".into()),
                 ..ButtonConfig::default()
             },
-        ]);
+        ])
+        .unwrap();
         let spans = layer.layout_spans(WIDTH as i32, 0);
         assert_eq!(spans.len(), 2, "spacers are free space");
         assert!(spans[0].left < spans[0].right);
@@ -2347,14 +2315,16 @@ mod tests {
         let no_clock = FunctionLayer::with_config(vec![ButtonConfig {
             text: Some("A".into()),
             ..ButtonConfig::default()
-        }]);
+        }])
+        .unwrap();
         assert!(!no_clock.layout_spans(WIDTH as i32, 0)[0].clock);
         // Pixel-shifted spans follow the drawn geometry: buttons compress
         // into width minus the shift and center by half of it.
         let single = FunctionLayer::with_config(vec![ButtonConfig {
             time: Some("24hr".into()),
             ..ButtonConfig::default()
-        }]);
+        }])
+        .unwrap();
         assert_eq!(
             single.layout_spans(WIDTH as i32, 0),
             vec![Span {

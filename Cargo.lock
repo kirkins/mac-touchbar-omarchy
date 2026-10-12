@@ -132,6 +132,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "dfr-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "freedesktop-icons",
+ "input-linux",
+ "pkg-config",
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "dirs"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -934,6 +947,7 @@ dependencies = [
  "anyhow",
  "cairo-rs",
  "chrono",
+ "dfr-config",
  "drm",
  "freedesktop-icons",
  "freetype-rs",

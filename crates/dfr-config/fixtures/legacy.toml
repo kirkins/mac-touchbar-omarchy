@@ -1,0 +1,11 @@
+MediaLayerDefault = true
+ShowButtonOutlines = true
+PrimaryLayerKeys = [
+    { Text = "F1", Action = "F1" },
+    { Text = "Combo", Action = ["LeftCtrl", "LeftAlt", "F1"] },
+]
+MediaLayerKeys = [
+    { Icon = "volume_up", Action = "VolumeUp" },
+    { Text = "Mute", Action = "Mute" },
+    { Time = "12hr", Action = "Time", Stretch = 3 },
+]

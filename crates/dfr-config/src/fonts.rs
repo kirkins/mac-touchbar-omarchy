@@ -30,6 +30,7 @@ pub struct FontConfig {
 }
 
 impl FontConfig {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> FontConfig {
         let config = unsafe { FcInitLoadConfigAndFonts() };
         FontConfig { config }
@@ -77,6 +78,24 @@ fn throw_on_fcpattern_result(res: FcResult) {
             panic!("Unknown fontconfig return value {:?}", r)
         }
     }
+}
+
+/// Resolve a fontconfig pattern to the file and face index the daemon
+/// would load. This is the configuration-facing half of font loading:
+/// an unmatchable `FontTemplate` is a configuration error reported
+/// here, not a panic inside the renderer.
+pub fn match_font(pattern: &str) -> Result<(String, isize), String> {
+    let fontconfig = FontConfig::new();
+    let mut parsed = Pattern::new(pattern);
+    fontconfig.perform_substitutions(&mut parsed);
+    let pat_match = fontconfig.match_pattern(&parsed).map_err(|_| {
+        format!(
+            "unable to find a font matching FontTemplate {pattern:?}; if you are using the default config, make sure you have at least one font installed"
+        )
+    })?;
+    let file_name = pat_match.get_file_name().to_owned();
+    let file_idx = pat_match.get_font_index();
+    Ok((file_name, file_idx))
 }
 
 pub struct Pattern {

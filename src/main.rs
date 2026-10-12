@@ -1,11 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use cairo::{Antialias, Context, Format, ImageSurface, Surface};
-use chrono::{
-    format::{Item as ChronoItem, StrftimeItems},
-    Local, Locale, Timelike,
-};
+use chrono::{format::Item as ChronoItem, Local, Locale, Timelike};
 use drm::control::ClipRect;
-use freedesktop_icons::lookup;
 use input::{
     event::{
         device::DeviceEvent,
@@ -50,7 +46,6 @@ mod command;
 mod config;
 mod daycycle;
 mod display;
-mod fonts;
 mod level_control;
 mod now_playing;
 mod pet;
@@ -59,6 +54,7 @@ mod slider;
 mod themes;
 mod waveform;
 
+use crate::appearance::AccentPaint;
 use crate::config::ConfigManager;
 use crate::themes::ThemeRequest;
 use appearance::{ButtonAccent, Palette};
@@ -67,6 +63,7 @@ use command::CommandRunner;
 use config::{ButtonAction, ButtonConfig, Config};
 #[cfg(test)]
 use daycycle::DayCycle;
+use dfr_config::defaults::DEFAULT_ICON_SIZE;
 use display::DrmBackend;
 #[cfg(test)]
 use level_control::Request as LevelRequest;
@@ -80,7 +77,6 @@ use waveform::{MicLevels, MonitorLevels, Sample as MicSample, Style, WaveformWid
 const BUTTON_SPACING_PX: i32 = 16;
 const BUTTON_COLOR_INACTIVE: f64 = 0.200;
 const BUTTON_COLOR_ACTIVE: f64 = 0.400;
-const DEFAULT_ICON_SIZE: i32 = 40;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
 /// Charging is the only state that changes how a battery renders: charging
@@ -381,37 +377,15 @@ fn try_load_image(
     icon_height: i32,
 ) -> Result<ButtonImage> {
     let name = name.as_ref();
-    let locations;
-
-    // Load list of candidate locations
-    if let Some(theme) = theme {
-        // Freedesktop icons
-        let theme = theme.as_ref();
-        let candidates = vec![
-            lookup(name)
-                .with_cache()
-                .with_theme(theme)
-                .with_size(icon_height as u16)
-                .force_svg()
-                .find(),
-            lookup(name)
-                .with_cache()
-                .with_theme(theme)
-                .force_svg()
-                .find(),
-        ];
-
-        // .flatten() removes `None` and unwraps `Some` values
-        locations = candidates.into_iter().flatten().collect();
-    } else {
-        // Standard file icons
-        locations = vec![
-            PathBuf::from(format!("/etc/tiny-dfr/{name}.svg")),
-            PathBuf::from(format!("/etc/tiny-dfr/{name}.png")),
-            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.svg")),
-            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.png")),
-        ];
-    };
+    // The candidate list comes from the shared configuration crate so
+    // the offline validator and this loader can never disagree about
+    // where an icon is looked up.
+    let locations = dfr_config::IconSearch::new(config::ICON_DIRS.iter().copied()).candidates(
+        name,
+        theme.as_ref().map(|theme| theme.as_ref()),
+        icon_width,
+        icon_height,
+    );
 
     // Try to load each candidate
     let mut last_err = anyhow!("no suitable icon path was found"); // in case locations is empty
@@ -534,21 +508,22 @@ fn read_battery_sources(root: &Path) -> Vec<BatterySource> {
 }
 
 impl Button {
-    fn with_config(cfg: ButtonConfig) -> Button {
+    fn with_config(cfg: ButtonConfig) -> Result<Button> {
         let mut button = if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
         } else if let Some(icon) = cfg.icon {
             Button::new_icon(
                 &icon,
-                cfg.theme,
+                cfg.theme.as_deref(),
                 cfg.action,
                 cfg.icon_width.unwrap_or(DEFAULT_ICON_SIZE),
                 cfg.icon_height.unwrap_or(DEFAULT_ICON_SIZE),
             )
+            .with_context(|| format!("loading Icon = {icon:?}"))?
         } else if let Some(time) = cfg.time {
-            Button::new_time(cfg.action, &time, cfg.locale.as_deref())
+            Button::new_time(cfg.action, &time, cfg.locale.as_deref())?
         } else if let Some(battery_mode) = cfg.battery {
-            Button::new_battery(cfg.action, battery_mode, cfg.theme)
+            Button::new_battery(cfg.action, battery_mode, cfg.theme.as_deref())?
         } else if cfg.waveform.unwrap_or(false) {
             Button::new_waveform(
                 cfg.action,
@@ -556,21 +531,21 @@ impl Button {
                 cfg.accent,
                 cfg.waveform_smoothing,
                 cfg.waveform_lag,
-            )
+            )?
         } else if cfg.visualizer.unwrap_or(false) {
             Button::new_visualizer(
                 cfg.action,
                 cfg.visualizer_style.as_deref(),
                 cfg.visualizer_smoothing,
                 cfg.visualizer_lag,
-            )
+            )?
         } else if cfg.now_playing.unwrap_or(false) {
             Button::new_now_playing(cfg.action)
         } else {
             Button::new_spacer()
         };
         button.accent = cfg.accent;
-        button
+        Ok(button)
     }
     fn new_spacer() -> Button {
         Button {
@@ -602,10 +577,10 @@ impl Button {
         action: ButtonAction,
         icon_width: i32,
         icon_height: i32,
-    ) -> Button {
+    ) -> Result<Button> {
         let image =
-            try_load_image(path, theme, icon_width, icon_height).expect("failed to load icon");
-        Button {
+            try_load_image(path, theme, icon_width, icon_height).context("failed to load icon")?;
+        Ok(Button {
             action,
             image,
             icon_width: icon_width as f64,
@@ -614,22 +589,22 @@ impl Button {
             changed: false,
             accent: None,
             muted: false,
-        }
+        })
     }
-    fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+    fn load_battery_image(icon: &str, theme: Option<&str>) -> Result<Handle> {
         if let ButtonImage::Svg(svg) =
-            try_load_image(icon, theme, DEFAULT_ICON_SIZE, DEFAULT_ICON_SIZE).unwrap()
+            try_load_image(icon, theme, DEFAULT_ICON_SIZE, DEFAULT_ICON_SIZE)?
         {
-            return svg;
+            return Ok(svg);
         }
-        panic!("failed to load icon");
+        bail!("the battery icon {icon:?} resolved to a non-SVG image")
     }
     fn new_battery(
         action: ButtonAction,
         battery_mode: String,
-        theme: Option<impl AsRef<str>>,
-    ) -> Button {
-        let bolt = Self::load_battery_image("bolt", theme.as_ref());
+        theme: Option<&str>,
+    ) -> Result<Button> {
+        let bolt = Self::load_battery_image("bolt", theme)?;
         let mut plain = Vec::new();
         let mut charging = Vec::new();
         for icon in [
@@ -642,7 +617,7 @@ impl Button {
             "battery_6_bar",
             "battery_full",
         ] {
-            plain.push(Self::load_battery_image(icon, theme.as_ref()));
+            plain.push(Self::load_battery_image(icon, theme)?);
         }
         for icon in [
             "battery_charging_20",
@@ -653,15 +628,17 @@ impl Button {
             "battery_charging_90",
             "battery_charging_full",
         ] {
-            charging.push(Self::load_battery_image(icon, theme.as_ref()));
+            charging.push(Self::load_battery_image(icon, theme)?);
         }
         let battery_mode = match battery_mode.as_str() {
             "icon" => BatteryIconMode::Icon,
             "percentage" => BatteryIconMode::Percentage,
             "both" => BatteryIconMode::Both,
-            _ => panic!("invalid battery mode, accepted modes: icon, percentage, both"),
+            other => {
+                bail!("invalid battery mode {other:?}, accepted modes: icon, percentage, both")
+            }
         };
-        Button {
+        Ok(Button {
             action,
             active: false,
             changed: false,
@@ -678,7 +655,7 @@ impl Button {
             icon_height: 0.0,
             accent: None,
             muted: false,
-        }
+        })
     }
 
     fn new_waveform(
@@ -687,12 +664,13 @@ impl Button {
         accent: Option<ButtonAccent>,
         smoothing: Option<u32>,
         lag: Option<u32>,
-    ) -> Button {
-        let style = style.map_or(Style::Line, |value| {
-            Style::parse(value)
-                .unwrap_or_else(|| panic!("invalid waveform style, accepted styles: line, bars"))
-        });
-        Button {
+    ) -> Result<Button> {
+        let style = style.map_or(Ok(Style::Line), |value| {
+            Style::parse(value).with_context(|| {
+                format!("invalid waveform style {value:?}, accepted styles: line, bars")
+            })
+        })?;
+        Ok(Button {
             action,
             active: false,
             changed: false,
@@ -705,7 +683,7 @@ impl Button {
             icon_height: 0.0,
             accent: None,
             muted: false,
-        }
+        })
     }
 
     fn new_visualizer(
@@ -713,12 +691,13 @@ impl Button {
         style: Option<&str>,
         smoothing: Option<u32>,
         lag: Option<u32>,
-    ) -> Button {
-        let style = style.map_or(Style::Line, |value| {
-            Style::parse(value)
-                .unwrap_or_else(|| panic!("invalid visualizer style, accepted styles: line, bars"))
-        });
-        Button {
+    ) -> Result<Button> {
+        let style = style.map_or(Ok(Style::Line), |value| {
+            Style::parse(value).with_context(|| {
+                format!("invalid visualizer style {value:?}, accepted styles: line, bars")
+            })
+        })?;
+        Ok(Button {
             action,
             active: false,
             changed: false,
@@ -729,7 +708,7 @@ impl Button {
             icon_height: 0.0,
             accent: None,
             muted: false,
-        }
+        })
     }
 
     /// The media bar's now-playing row: display-only, fed by the
@@ -750,24 +729,14 @@ impl Button {
         }
     }
 
-    fn new_time(action: ButtonAction, format: &str, locale_str: Option<&str>) -> Button {
-        let format_str = if format == "24hr" {
-            "%H:%M    %a %-e %b"
-        } else if format == "12hr" {
-            "%-l:%M %p    %a %-e %b"
-        } else {
-            format
-        };
-
-        let format_items = match StrftimeItems::new(format_str).parse_to_owned() {
-            Ok(s) => s,
-            Err(e) => panic!("Invalid time format, consult the configuration file for examples of correct ones: {e:?}"),
-        };
+    fn new_time(action: ButtonAction, format: &str, locale_str: Option<&str>) -> Result<Button> {
+        let format_items = dfr_config::layout::time_format_items(format)
+            .map_err(|err| anyhow!("invalid Time format: {err}"))?;
 
         let locale = locale_str
             .and_then(|l| Locale::try_from(l).ok())
             .unwrap_or(Locale::POSIX);
-        Button {
+        Ok(Button {
             action,
             active: false,
             changed: false,
@@ -776,7 +745,7 @@ impl Button {
             icon_height: 0.0,
             accent: None,
             muted: false,
-        }
+        })
     }
     fn needs_faster_refresh(&self) -> bool {
         match &self.image {
@@ -1068,9 +1037,9 @@ pub struct FunctionLayer {
 }
 
 impl FunctionLayer {
-    fn with_config(cfg: Vec<ButtonConfig>) -> FunctionLayer {
+    fn with_config(cfg: Vec<ButtonConfig>) -> Result<FunctionLayer> {
         if cfg.is_empty() {
-            panic!("Invalid configuration, layer has 0 buttons");
+            bail!("Invalid configuration, layer has 0 buttons");
         }
 
         let mut virtual_button_count = 0;
@@ -1079,15 +1048,12 @@ impl FunctionLayer {
             .into_iter()
             .scan(&mut virtual_button_count, |state, cfg| {
                 let i = **state;
-                let mut stretch = cfg.stretch.unwrap_or(1);
-                if stretch < 1 {
-                    println!("Stretch value must be at least 1, setting to 1.");
-                    stretch = 1;
-                }
+                let stretch = cfg.stretch.unwrap_or(1);
                 **state += stretch;
                 Some((i, Button::with_config(cfg)))
             })
-            .collect::<Vec<_>>();
+            .map(|(i, button)| button.map(|button| (i, button)))
+            .collect::<Result<Vec<_>>>()?;
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
         let waveform = buttons
             .iter()
@@ -1098,7 +1064,7 @@ impl FunctionLayer {
         let now_playing = buttons
             .iter()
             .position(|(_, b)| matches!(&b.image, ButtonImage::NowPlaying(_)));
-        FunctionLayer {
+        Ok(FunctionLayer {
             displays_time,
             buttons,
             virtual_button_count,
@@ -1108,7 +1074,7 @@ impl FunctionLayer {
             now_playing,
             viz_view: false,
             slider_region_drawn: None,
-        }
+        })
     }
 
     /// The full-bar visualizer view a media bar's Viz button toggles
@@ -2324,6 +2290,15 @@ where
 }
 
 fn main() {
+    // `tiny-dfr check [file]` validates a configuration offline - the
+    // exact parse/merge/validate path the daemon runs, plus icon and
+    // font resolution - without opening the Touch Bar. Scripts, CI,
+    // and editors run it before installing a candidate file; the
+    // daemon never needs to see an invalid one.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("check") {
+        std::process::exit(run_check(&args[2..]));
+    }
     let mut drm = DrmBackend::open_card().unwrap();
     let (height, width) = drm.mode().size();
     let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
@@ -2347,6 +2322,92 @@ fn main() {
     let mut sigset = SigSet::empty();
     sigset.add(Signal::SIGTERM);
     sigset.wait().unwrap();
+}
+
+/// The offline validator behind `tiny-dfr check`. Exit codes: 0 valid,
+/// 1 diagnostics printed, 2 usage error.
+fn run_check(args: &[String]) -> i32 {
+    let usage = || {
+        eprintln!("usage: tiny-dfr check [--base PATH] [--icon-root DIR] [--width N] [FILE]");
+        eprintln!("  FILE defaults to /etc/tiny-dfr/config.toml, validated over the base config");
+        eprintln!(
+            "  --base overrides the base configuration (default /usr/share/tiny-dfr/config.toml)"
+        );
+        eprintln!("  --icon-root replaces the fixed /usr/share/tiny-dfr icon directory");
+        eprintln!(
+            "  --width synthesizes the layout for that bar width (default 2008; 2170 adds esc)"
+        );
+    };
+    let mut base: Option<PathBuf> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut icon_root: Option<PathBuf> = None;
+    let mut width: u16 = 2008;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let missing = |flag: &str| -> ! {
+            eprintln!("missing value for {flag}");
+            usage();
+            std::process::exit(2)
+        };
+        match arg.as_str() {
+            "--base" => {
+                base = Some(PathBuf::from(
+                    iter.next().unwrap_or_else(|| missing("--base")),
+                ))
+            }
+            "--icon-root" => {
+                icon_root = Some(PathBuf::from(
+                    iter.next().unwrap_or_else(|| missing("--icon-root")),
+                ))
+            }
+            "--width" => match iter
+                .next()
+                .unwrap_or_else(|| missing("--width"))
+                .parse::<u16>()
+            {
+                Ok(parsed) => width = parsed,
+                Err(_) => {
+                    eprintln!("--width must be a number");
+                    usage();
+                    std::process::exit(2);
+                }
+            },
+            "-h" | "--help" => {
+                usage();
+                return 0;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown option {other}");
+                usage();
+                return 2;
+            }
+            other => match file {
+                None => file = Some(PathBuf::from(other)),
+                Some(_) => {
+                    eprintln!("only one configuration file may be given");
+                    usage();
+                    return 2;
+                }
+            },
+        }
+    }
+    let base = base.unwrap_or_else(|| PathBuf::from(config::BASE_CFG_PATH));
+    let file = file.unwrap_or_else(|| PathBuf::from(config::USER_CFG_PATH));
+    let share = icon_root.unwrap_or_else(|| PathBuf::from("/usr/share/tiny-dfr"));
+    let search = dfr_config::IconSearch::new(["/etc/tiny-dfr", share.to_str().unwrap_or("")]);
+    let diagnostics = dfr_config::check::check_user_config(&base, &file, width, &search);
+    if diagnostics.is_empty() {
+        println!(
+            "{}: OK (validated against {})",
+            file.display(),
+            base.display()
+        );
+        return 0;
+    }
+    for diagnostic in &diagnostics {
+        eprintln!("{}: {diagnostic}", file.display());
+    }
+    1
 }
 
 fn real_main(drm: &mut DrmBackend) {
@@ -2823,6 +2884,17 @@ fn real_main(drm: &mut DrmBackend) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_renderer_styles_agree_with_the_validated_knob_names() {
+        // dfr-config validates WaveformStyle/VisualizerStyle against its
+        // own list before any button is built; the renderer must accept
+        // exactly those names.
+        for name in dfr_config::layout::WAVEFORM_STYLES {
+            assert!(Style::parse(name).is_some(), "renderer rejects {name}");
+        }
+        assert!(Style::parse("dots").is_none());
+    }
+
     struct PowerSupplyFixture(PathBuf);
     impl PowerSupplyFixture {
         fn new() -> Self {
@@ -2888,7 +2960,8 @@ mod tests {
         let mut layer = FunctionLayer::with_config(vec![
             keys("Held", &[Key::LeftCtrl, Key::F1]),
             keys("Battery", &[Key::Battery]),
-        ]);
+        ])
+        .unwrap();
         layer.buttons[1].1 = battery_button(ButtonAction::Keys(vec![Key::Battery]));
         LayerDeck::new(vec![("home".into(), layer)], 0, None, None, false)
     }
@@ -3365,18 +3438,21 @@ mod tests {
                         keys("Combo", &[Key::LeftCtrl, Key::F1]),
                         nav("Functions", "function"),
                         nav("Media", "media"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "function".into(),
-                    FunctionLayer::with_config(vec![nav("Home", "home"), keys("F1", &[Key::F1])]),
+                    FunctionLayer::with_config(vec![nav("Home", "home"), keys("F1", &[Key::F1])])
+                        .unwrap(),
                 ),
                 (
                     "media".into(),
                     FunctionLayer::with_config(vec![
                         nav("Home", "home"),
                         keys("Play", &[Key::PlayPause]),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -3396,7 +3472,8 @@ mod tests {
                     FunctionLayer::with_config(vec![
                         keys("Combo", &[Key::LeftCtrl, Key::F1]),
                         nav("Pet", "pet"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "pet".into(),
@@ -3406,7 +3483,8 @@ mod tests {
                             stretch: Some(7),
                             ..ButtonConfig::default()
                         },
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -3444,7 +3522,8 @@ mod tests {
                             },
                         ),
                         text("Sync", ButtonAction::Command("sync-now".into())),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "recording".into(),
@@ -3452,7 +3531,8 @@ mod tests {
                         command_layer("voice-dictate cancel", "home"),
                         text("Recording", ButtonAction::default()),
                         command_layer("voice-dictate stop", "home"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -3471,7 +3551,8 @@ mod tests {
             vec![
                 (
                     "home".into(),
-                    FunctionLayer::with_config(vec![keys("Combo", &[Key::LeftCtrl, Key::F1])]),
+                    FunctionLayer::with_config(vec![keys("Combo", &[Key::LeftCtrl, Key::F1])])
+                        .unwrap(),
                 ),
                 (
                     "more".into(),
@@ -3479,7 +3560,8 @@ mod tests {
                         nav("Home", "home"),
                         text("Theme", ButtonAction::CycleTheme),
                         text("Themes", ButtonAction::SwitchLayer("themes".into())),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "themes".into(),
@@ -3493,7 +3575,8 @@ mod tests {
                             },
                         ),
                         text("Solo", ButtonAction::ApplyTheme("Mono".into())),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -3657,11 +3740,12 @@ mod tests {
                             accent: Some(ButtonAccent::Red),
                             ..crate::config::ButtonConfig::default()
                         },
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "home".into(),
-                    FunctionLayer::with_config(vec![nav("Back", "recording")]),
+                    FunctionLayer::with_config(vec![nav("Back", "recording")]).unwrap(),
                 ),
             ],
             1,
@@ -3758,7 +3842,8 @@ mod tests {
                                 layer: "recording".into(),
                             },
                         ),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "recording".into(),
@@ -3770,7 +3855,8 @@ mod tests {
                             ..ButtonConfig::default()
                         },
                         command_layer("voice-dictate stop", "home"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -3962,7 +4048,8 @@ mod tests {
                     FunctionLayer::with_config(vec![
                         keys("Combo", &[Key::LeftCtrl, Key::F1]),
                         nav("Media", "media"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "media".into(),
@@ -3974,7 +4061,8 @@ mod tests {
                             stretch: Some(2),
                             ..ButtonConfig::default()
                         },
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -3995,7 +4083,8 @@ mod tests {
                     FunctionLayer::with_config(vec![
                         keys("Combo", &[Key::LeftCtrl, Key::F1]),
                         nav("Media", "media"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "media".into(),
@@ -4012,7 +4101,8 @@ mod tests {
                             stretch: Some(2),
                             ..ButtonConfig::default()
                         },
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -4231,7 +4321,8 @@ mod tests {
                             ..ButtonConfig::default()
                         },
                         nav("Rec", "recording"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "recording".into(),
@@ -4243,7 +4334,8 @@ mod tests {
                             ..ButtonConfig::default()
                         },
                         keys("F1", &[Key::F1]),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -4288,7 +4380,8 @@ mod tests {
                 stretch: Some(2),
                 ..ButtonConfig::default()
             },
-        ]);
+        ])
+        .unwrap();
         let (width, height) = (2008, 60);
         // Draw over a time-of-day band, like the strip actually renders.
         let evening = crate::daycycle::DayCycle::default().background(19);
@@ -4552,7 +4645,8 @@ mod tests {
                     ),
                     keys("Brightness", &[Key::BrightnessUp]),
                     nav("Home", "home"),
-                ]);
+                ])
+                .unwrap();
                 let mut surface = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
                 let mut reference = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
                 layer.draw(
@@ -4636,7 +4730,8 @@ mod tests {
             ),
             keys("Brightness", &[Key::BrightnessUp]),
             nav("Home", "home"),
-        ]);
+        ])
+        .unwrap();
         let width = 2008;
         let mut surface = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
         let mut plain = ImageSurface::create(Format::ARgb32, 60, width).unwrap();
@@ -4805,11 +4900,11 @@ mod tests {
                 vec![
                     (
                         "primary".into(),
-                        FunctionLayer::with_config(vec![keys("F1", &[Key::F1])]),
+                        FunctionLayer::with_config(vec![keys("F1", &[Key::F1])]).unwrap(),
                     ),
                     (
                         "media".into(),
-                        FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]),
+                        FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]).unwrap(),
                     ),
                 ],
                 home,
@@ -4847,7 +4942,7 @@ mod tests {
         let replacement = LayerDeck::new(
             vec![(
                 "new-home".into(),
-                FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]),
+                FunctionLayer::with_config(vec![keys("Volume", &[Key::VolumeUp])]).unwrap(),
             )],
             0,
             None,
@@ -4953,14 +5048,16 @@ mod tests {
                         slider_button("Volume"),
                         slider_button("V+"),
                         nav("Functions", "function"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "function".into(),
                     FunctionLayer::with_config(vec![
                         nav("Home", "home"),
                         keys("Volume", &[Key::VolumeUp]),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
             ],
             0,
@@ -5006,7 +5103,8 @@ mod tests {
                 slider("Brightness", ButtonAction::BrightnessSlider),
                 keys("Play", &[Key::PlayPause]),
                 nav("Functions", "function"),
-            ]);
+            ])
+            .unwrap();
             let spans = layer.layout_spans(2008, 0);
             let width = |span: &PetSpan| span.right - span.left;
             // Equal Stretch runs the identical width formula for both
@@ -5038,11 +5136,12 @@ mod tests {
                         brightness,
                         keys("Play", &[Key::PlayPause]),
                         nav("Functions", "function"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "function".into(),
-                    FunctionLayer::with_config(vec![nav("Home", "home")]),
+                    FunctionLayer::with_config(vec![nav("Home", "home")]).unwrap(),
                 ),
             ],
             0,
@@ -5374,11 +5473,11 @@ mod tests {
                 vec![
                     (
                         "home".into(),
-                        FunctionLayer::with_config(vec![slider(), nav("Media", "media")]),
+                        FunctionLayer::with_config(vec![slider(), nav("Media", "media")]).unwrap(),
                     ),
                     (
                         "media".into(),
-                        FunctionLayer::with_config(vec![nav("Home", "home"), slider()]),
+                        FunctionLayer::with_config(vec![nav("Home", "home"), slider()]).unwrap(),
                     ),
                 ],
                 0,
@@ -5850,7 +5949,8 @@ mod tests {
                     slider_button("V-"),
                     slider_button("Mute"),
                     slider_button("V+"),
-                ]),
+                ])
+                .unwrap(),
             )],
             0,
             None,
@@ -5935,7 +6035,8 @@ mod tests {
                     keys("Esc", &[Key::Esc]),
                     slider_button("W-"),
                     slider_button("W+"),
-                ]),
+                ])
+                .unwrap(),
             )],
             0,
             None,
@@ -6077,11 +6178,12 @@ mod tests {
                         slider_button("Volume"),
                         slider_button("V-"),
                         slider_button("V+"),
-                    ]),
+                    ])
+                    .unwrap(),
                 ),
                 (
                     "primary".into(),
-                    FunctionLayer::with_config(vec![keys("F1", &[Key::F1])]),
+                    FunctionLayer::with_config(vec![keys("F1", &[Key::F1])]).unwrap(),
                 ),
             ],
             0,

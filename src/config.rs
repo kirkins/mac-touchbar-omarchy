@@ -1,39 +1,34 @@
 use crate::appearance::ButtonAccent;
-use crate::daycycle::{self, DayCycle, TimeBand};
-use crate::fonts::{FontConfig, Pattern};
-use crate::pet::{PetEnergy, PetVariant};
-use crate::themes::{ThemeConfig, ThemeSet, THEMES_LAYER};
 use crate::{FunctionLayer, LayerDeck};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use cairo::FontFace;
+use dfr_config::defaults;
+use dfr_config::{parse_config_files, IconSearch, PetEnergy, PetVariant, PET_LAYER};
 use freetype::Library as FtLibrary;
-use input_linux::Key;
 use nix::{
     errno::Errno,
     sys::inotify::{AddWatchFlags, InitFlags, Inotify, InotifyEvent, WatchDescriptor},
 };
-use serde::{Deserialize, Deserializer};
 use std::{
-    collections::{BTreeMap, HashSet},
-    fs::{self, read_to_string},
+    fs,
     os::fd::AsFd,
     path::{Path, PathBuf},
 };
 
-const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
-const BASE_CFG_PATH: &str = "/usr/share/tiny-dfr/config.toml";
+/// The configuration wire types and the whole parse/merge/validate path
+/// live in the `dfr-config` crate, shared with `tiny-dfr check` and the
+/// tests; re-exported here for the daemon's `crate::config` paths.
+pub use dfr_config::{ButtonAction, ButtonConfig};
+
+pub(crate) const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
+pub(crate) const BASE_CFG_PATH: &str = "/usr/share/tiny-dfr/config.toml";
 /// Where the daemon remembers the theme chosen on the glass. The
 /// directory is prepared by the service install (see the README); the
 /// daemon itself only reads and atomically rewrites this one file.
 const THEME_STATE_PATH: &str = "/var/lib/tiny-dfr/active-theme";
-
-/// Name of the pet's own layer. When the pet is enabled, a layer with this
-/// name is synthesized if the configuration does not define one, and the
-/// home bar gains a Pet button opening it.
-const PET_LAYER: &str = "pet";
-/// Free button spaces after the Home button inside the synthesized pet
-/// layer: open ground for the pet to wander.
-const PET_LAYER_STRETCH: usize = 7;
+/// The fixed-path icon lookup directories, in priority order, shared
+/// by the button loader and the configuration validator.
+pub(crate) const ICON_DIRS: &[&str] = &["/etc/tiny-dfr", "/usr/share/tiny-dfr"];
 
 pub struct Config {
     pub show_button_outlines: bool,
@@ -54,570 +49,26 @@ pub struct Config {
     /// The global (theme-free) day cycle as configured; the active
     /// theme's bands, if any, are applied on top for `day_cycle`, and
     /// re-applying a theme at runtime rebuilds from this copy.
-    pub global_day_cycle: DayCycle,
-    pub day_cycle: DayCycle,
+    pub global_day_cycle: crate::daycycle::DayCycle,
+    pub day_cycle: crate::daycycle::DayCycle,
     /// The accent palette the bar renders with, resolved from the
     /// active theme (or the shipped live palette with none).
     pub palette: crate::appearance::Palette,
-    pub themes: ThemeSet,
+    pub themes: crate::themes::ThemeSet,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ConfigProxy {
-    media_layer_default: Option<bool>,
-    show_button_outlines: Option<bool>,
-    enable_pixel_shift: Option<bool>,
-    font_template: Option<String>,
-    adaptive_brightness: Option<bool>,
-    active_brightness: Option<u32>,
-    double_press_switch_layers: Option<u32>,
-    battery_cycle_enabled: Option<bool>,
-    battery_cycle_timeout_secs: Option<u32>,
-    battery_warning_threshold: Option<u32>,
-    battery_critical_threshold: Option<u32>,
-    battery_warning_color: Option<ButtonAccent>,
-    battery_critical_color: Option<ButtonAccent>,
-    pet_enabled: Option<bool>,
-    pet_variant: Option<String>,
-    pet_energy: Option<String>,
-    day_cycle_enabled: Option<bool>,
-    day_cycle_bands: Option<Vec<BandConfig>>,
-    themes_enabled: Option<bool>,
-    active_theme: Option<String>,
-    themes: Option<BTreeMap<String, ThemeConfig>>,
-    primary_layer_keys: Option<Vec<ButtonConfig>>,
-    media_layer_keys: Option<Vec<ButtonConfig>>,
-    layers: Option<Vec<LayerConfig>>,
-    default_layer: Option<String>,
-    fn_layer: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ButtonAction {
-    /// Opens the absolute output-volume slider without stepping the mixer.
-    VolumeSlider,
-    /// Opens the built-in display slider without stepping its backlight.
-    BrightnessSlider,
-    Keys(Vec<Key>),
-    SwitchLayer(String),
-    /// Runs a shell command on touch-down.
-    Command(String),
-    /// Runs a shell command on touch-down and switches to the named layer,
-    /// so a single press does both.
-    CommandLayer {
-        command: String,
-        layer: String,
-    },
-    /// Applies the named color theme on touch-down and stays on the bar.
-    ApplyTheme(String),
-    /// Applies the named color theme and switches to the named layer in
-    /// one press - the picker's per-theme buttons return home this way.
-    ApplyThemeLayer {
-        theme: String,
-        layer: String,
-    },
-    /// Applies the next theme in the cycle, wrapping.
-    CycleTheme,
-}
-
-impl ButtonAction {
-    /// The layer this action switches to on touch-down, if any.
-    pub fn layer_target(&self) -> Option<&str> {
-        match self {
-            Self::SwitchLayer(layer) | Self::CommandLayer { layer, .. } => Some(layer),
-            Self::ApplyThemeLayer { layer, .. } => Some(layer),
-            _ => None,
-        }
-    }
-    /// The shell command this action runs on touch-down, if any.
-    pub fn command(&self) -> Option<&str> {
-        match self {
-            Self::Command(command) | Self::CommandLayer { command, .. } => Some(command),
-            _ => None,
-        }
-    }
-}
-
-impl Default for ButtonAction {
-    fn default() -> Self {
-        Self::Keys(Vec::new())
-    }
-}
-
-impl<'de> Deserialize<'de> for ButtonAction {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Action {
-            Unit(UnitAction),
-            Key(Key),
-            Keys(Vec<Key>),
-            Table(TableAction),
-        }
-        #[derive(Deserialize)]
-        enum UnitAction {
-            VolumeSlider,
-            BrightnessSlider,
-            CycleTheme,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase", deny_unknown_fields)]
-        struct TableAction {
-            layer: Option<String>,
-            command: Option<String>,
-            theme: Option<String>,
-        }
-        Ok(match Action::deserialize(deserializer)? {
-            Action::Unit(UnitAction::VolumeSlider) => Self::VolumeSlider,
-            Action::Unit(UnitAction::BrightnessSlider) => Self::BrightnessSlider,
-            Action::Unit(UnitAction::CycleTheme) => Self::CycleTheme,
-            Action::Key(key) => Self::Keys(vec![key]),
-            Action::Keys(keys) => Self::Keys(keys),
-            Action::Table(action) => {
-                let theme = action.theme.filter(|theme| !theme.trim().is_empty());
-                match (action.layer, action.command, theme) {
-                    (Some(layer), None, None) => Self::SwitchLayer(layer),
-                    (None, Some(command), None) => Self::Command(command),
-                    (Some(layer), Some(command), None) => Self::CommandLayer { command, layer },
-                    (None, None, Some(theme)) => Self::ApplyTheme(theme),
-                    (Some(layer), None, Some(theme)) => Self::ApplyThemeLayer { theme, layer },
-                    (_, Some(_), Some(_)) => {
-                        return Err(serde::de::Error::custom(
-                            "an Action table cannot combine Command with Theme",
-                        ))
-                    }
-                    (None, None, None) => {
-                        return Err(serde::de::Error::custom(
-                            "an Action table needs Layer, Command, or Theme",
-                        ))
-                    }
-                }
-            }
-        })
-    }
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct ButtonConfig {
-    #[serde(alias = "Svg")]
-    pub icon: Option<String>,
-    pub text: Option<String>,
-    pub theme: Option<String>,
-    pub time: Option<String>,
-    pub battery: Option<String>,
-    pub waveform: Option<bool>,
-    pub waveform_style: Option<String>,
-    pub waveform_smoothing: Option<u32>,
-    pub waveform_lag: Option<u32>,
-    pub visualizer: Option<bool>,
-    pub visualizer_style: Option<String>,
-    pub visualizer_smoothing: Option<u32>,
-    pub visualizer_lag: Option<u32>,
-    pub now_playing: Option<bool>,
-    pub locale: Option<String>,
-    #[serde(default)]
-    pub action: ButtonAction,
-    pub stretch: Option<usize>,
-    pub icon_width: Option<i32>,
-    pub icon_height: Option<i32>,
-    pub accent: Option<ButtonAccent>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase", deny_unknown_fields)]
-pub struct LayerConfig {
-    pub name: String,
-    pub keys: Vec<ButtonConfig>,
-}
-
-/// One `[[DayCycleBands]]` entry: the background color for the local
-/// hours from `StartHour` until the next band begins.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "PascalCase", deny_unknown_fields)]
-pub struct BandConfig {
-    pub name: String,
-    pub start_hour: u8,
-    pub color: String,
-}
-
-/// Validate and resolve a band list, shared by the global day cycle and
-/// each theme's bands. Band names must be nonempty and unique, hours
-/// 0-23 and unique, and colors six-hex-digit literals.
-pub fn parse_bands(bands: &[BandConfig]) -> Result<Vec<TimeBand>> {
-    if bands.is_empty() {
-        bail!("DayCycleBands must define at least one band");
-    }
-    let mut names = HashSet::new();
-    let mut hours = HashSet::new();
-    let mut parsed = Vec::with_capacity(bands.len());
-    for band in bands {
-        if band.name.trim().is_empty() || !names.insert(band.name.clone()) {
-            bail!("band names must be nonempty and unique: {:?}", band.name);
-        }
-        if band.start_hour > 23 {
-            bail!("band {:?} StartHour must be 0-23", band.name);
-        }
-        if !hours.insert(band.start_hour) {
-            bail!(
-                "band {:?} repeats the StartHour of an earlier band",
-                band.name
-            );
-        }
-        parsed.push(TimeBand {
-            name: band.name.clone(),
-            start_hour: band.start_hour,
-            color: daycycle::parse_hex_color(&band.color)
-                .with_context(|| format!("band {:?} Color", band.name))?,
-        });
-    }
-    Ok(parsed)
-}
-
-pub struct LayerLayout {
-    pub layers: Vec<LayerConfig>,
-    pub home: usize,
-    pub fn_layer: Option<usize>,
-    pub legacy: bool,
-}
-
-impl ConfigProxy {
-    fn merge(&mut self, user: Self) {
-        macro_rules! merge {
-            ($($field:ident),* $(,)?) => { $(self.$field = user.$field.or(self.$field.take());)* };
-        }
-        merge!(
-            media_layer_default,
-            show_button_outlines,
-            enable_pixel_shift,
-            font_template,
-            adaptive_brightness,
-            active_brightness,
-            double_press_switch_layers,
-            battery_cycle_enabled,
-            battery_cycle_timeout_secs,
-            battery_warning_threshold,
-            battery_critical_threshold,
-            battery_warning_color,
-            battery_critical_color,
-            pet_enabled,
-            pet_variant,
-            pet_energy,
-            day_cycle_enabled,
-            day_cycle_bands,
-            themes_enabled,
-            active_theme,
-            themes,
-            primary_layer_keys,
-            media_layer_keys,
-            layers,
-            default_layer,
-            fn_layer,
-        );
-    }
-
-    /// The day cycle resolves the enabled flag over the configured or
-    /// default bands, validating band names, hours, and colors together.
-    fn day_cycle(&self) -> Result<DayCycle> {
-        let enabled = self.day_cycle_enabled.unwrap_or(true);
-        let bands = match &self.day_cycle_bands {
-            None => DayCycle::default_bands(),
-            Some(bands) => parse_bands(bands)?,
-        };
-        Ok(DayCycle::new(enabled, bands))
-    }
-
-    fn layer_layout(&mut self, width: u16, themes: &ThemeSet) -> Result<LayerLayout> {
-        let legacy = self.layers.is_none();
-        let mut layers = if let Some(layers) = self.layers.take() {
-            layers
-        } else {
-            if self.default_layer.is_some() || self.fn_layer.is_some() {
-                bail!("DefaultLayer and FnLayer require named Layers");
-            }
-            vec![
-                LayerConfig {
-                    name: "primary".into(),
-                    keys: self
-                        .primary_layer_keys
-                        .take()
-                        .context("missing PrimaryLayerKeys")?,
-                },
-                LayerConfig {
-                    name: "media".into(),
-                    keys: self
-                        .media_layer_keys
-                        .take()
-                        .context("missing MediaLayerKeys")?,
-                },
-            ]
-        };
-        let mut names = HashSet::new();
-        for layer in &layers {
-            if layer.name.trim().is_empty() || !names.insert(layer.name.clone()) {
-                bail!("layer names must be nonempty and unique: {:?}", layer.name);
-            }
-            if layer.keys.is_empty() {
-                bail!("layer {:?} has no buttons", layer.name);
-            }
-        }
-        let home_name = if legacy {
-            if self.media_layer_default.unwrap_or(false) {
-                "media"
-            } else {
-                "primary"
-            }
-        } else {
-            self.default_layer
-                .as_deref()
-                .context("named Layers require DefaultLayer")?
-        };
-        let home = layers
-            .iter()
-            .position(|layer| layer.name == home_name)
-            .with_context(|| format!("DefaultLayer target {home_name:?} does not exist"))?;
-        let fn_layer = if legacy {
-            Some(1 - home)
-        } else {
-            self.fn_layer
-                .as_deref()
-                .map(|name| {
-                    layers
-                        .iter()
-                        .position(|layer| layer.name == name)
-                        .with_context(|| format!("FnLayer target {name:?} does not exist"))
-                })
-                .transpose()?
-        };
-        // The pet lives on its own layer, opened by a Pet button on the home
-        // bar whenever PetEnabled is on. A user-defined layer named "pet"
-        // replaces the synthesized playground, and an existing visible
-        // button targeting it replaces the synthesized Pet button.
-        if self.pet_enabled.unwrap_or(true) {
-            if names.insert(PET_LAYER.to_owned()) {
-                layers.push(LayerConfig {
-                    name: PET_LAYER.into(),
-                    keys: vec![
-                        ButtonConfig {
-                            text: Some("Home".into()),
-                            action: ButtonAction::SwitchLayer(home_name.to_owned()),
-                            ..ButtonConfig::default()
-                        },
-                        ButtonConfig {
-                            stretch: Some(PET_LAYER_STRETCH),
-                            ..ButtonConfig::default()
-                        },
-                    ],
-                });
-            }
-            let home_layer = &mut layers[home];
-            let has_pet_button = home_layer.keys.iter().any(|button| {
-                button.action.layer_target() == Some(PET_LAYER)
-                    && button.text.as_deref().map_or(
-                        button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
-                        |text| !text.trim().is_empty(),
-                    )
-            });
-            if !has_pet_button {
-                let at = home_layer
-                    .keys
-                    .iter()
-                    .rposition(|button| matches!(button.action, ButtonAction::SwitchLayer(_)))
-                    .map_or(home_layer.keys.len(), |last| last + 1);
-                home_layer.keys.insert(
-                    at,
-                    ButtonConfig {
-                        text: Some("Pet".into()),
-                        action: ButtonAction::SwitchLayer(PET_LAYER.into()),
-                        ..ButtonConfig::default()
-                    },
-                );
-            }
-        }
-        // The theme picker takes over its own layer - the full-bar surface
-        // the captain described - listing every theme name as a button that
-        // applies it and returns home. A user-defined layer named "themes"
-        // replaces the synthesized picker, and the quick-keys "more" bar
-        // carries the two compact activation surfaces: a Theme button that
-        // cycles to the next theme in place, and a Themes button opening
-        // the picker. Configs without a "more" bar stay untouched; their
-        // authors reach the picker by naming the layer in their own button.
-        if themes.enabled {
-            if names.insert(THEMES_LAYER.to_owned()) {
-                let mut keys = vec![ButtonConfig {
-                    text: Some("Home".into()),
-                    action: ButtonAction::SwitchLayer(home_name.to_owned()),
-                    ..ButtonConfig::default()
-                }];
-                keys.extend(themes.names.iter().map(|name| ButtonConfig {
-                    text: Some(name.clone()),
-                    action: ButtonAction::ApplyThemeLayer {
-                        theme: name.clone(),
-                        layer: home_name.to_owned(),
-                    },
-                    ..ButtonConfig::default()
-                }));
-                layers.push(LayerConfig {
-                    name: THEMES_LAYER.into(),
-                    keys,
-                });
-            }
-            let visible = |button: &ButtonConfig| {
-                button.text.as_deref().map_or(
-                    button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
-                    |text| !text.trim().is_empty(),
-                )
-            };
-            let more = layers.iter().position(|layer| layer.name == "more");
-            if let Some(more) = more {
-                let more_layer = &mut layers[more];
-                let has_cycle = more_layer.keys.iter().any(|button| {
-                    matches!(button.action, ButtonAction::CycleTheme) && visible(button)
-                });
-                let has_picker = more_layer.keys.iter().any(|button| {
-                    button.action.layer_target() == Some(THEMES_LAYER) && visible(button)
-                });
-                if !has_cycle {
-                    more_layer.keys.push(ButtonConfig {
-                        text: Some("Theme".into()),
-                        action: ButtonAction::CycleTheme,
-                        ..ButtonConfig::default()
-                    });
-                }
-                if !has_picker {
-                    more_layer.keys.push(ButtonConfig {
-                        text: Some("Themes".into()),
-                        action: ButtonAction::SwitchLayer(THEMES_LAYER.into()),
-                        ..ButtonConfig::default()
-                    });
-                }
-            }
-        }
-        for layer in &layers {
-            for button in &layer.keys {
-                if let Some(target) = button.action.layer_target() {
-                    if !names.contains(target) {
-                        bail!(
-                            "layer {:?} has an unknown button target {target:?}",
-                            layer.name
-                        );
-                    }
-                }
-                if button
-                    .action
-                    .command()
-                    .is_some_and(|command| command.trim().is_empty())
-                {
-                    bail!("layer {:?} has a button with an empty command", layer.name);
-                }
-            }
-        }
-        // Every named sub-bar remains navigable even when its author omits Home.
-        let home_name = home_name.to_owned();
-        for (index, layer) in layers.iter_mut().enumerate() {
-            if !legacy
-                && index != home
-                && !layer.keys.iter().any(|button| {
-                    button.action.layer_target() == Some(home_name.as_str())
-                        && button.text.as_deref().map_or(
-                            button.icon.is_some()
-                                || button.time.is_some()
-                                || button.battery.is_some(),
-                            |text| !text.trim().is_empty(),
-                        )
-                })
-            {
-                layer.keys.insert(
-                    0,
-                    ButtonConfig {
-                        text: Some("Home".into()),
-                        action: ButtonAction::SwitchLayer(home_name.clone()),
-                        ..ButtonConfig::default()
-                    },
-                );
-            }
-            if width >= 2170 {
-                layer.keys.insert(
-                    0,
-                    ButtonConfig {
-                        text: Some("esc".into()),
-                        action: ButtonAction::Keys(vec![Key::Esc]),
-                        ..ButtonConfig::default()
-                    },
-                );
-            }
-        }
-        Ok(LayerLayout {
-            layers,
-            home,
-            fn_layer,
-            legacy,
-        })
-    }
-}
-
-fn parse_config(base: &str, user: Option<&str>, width: u16) -> Result<(ConfigProxy, LayerLayout)> {
-    let mut base: ConfigProxy = toml::from_str(base).context("invalid base configuration")?;
-    if let Some(user) = user {
-        base.merge(toml::from_str(user).context("invalid user configuration")?);
-    }
-    if base.battery_cycle_timeout_secs == Some(0) {
-        bail!("BatteryCycleTimeoutSecs must be greater than zero");
-    }
-    if base
-        .battery_warning_threshold
-        .is_some_and(|value| value > 100)
-    {
-        bail!("BatteryWarningThreshold must be at most 100");
-    }
-    if base
-        .battery_critical_threshold
-        .is_some_and(|value| value > 100)
-    {
-        bail!("BatteryCriticalThreshold must be at most 100");
-    }
-    if base.battery_critical_threshold.unwrap_or(10) > base.battery_warning_threshold.unwrap_or(25)
-    {
-        bail!("BatteryCriticalThreshold must not exceed BatteryWarningThreshold");
-    }
-    base.pet_variant
-        .as_deref()
-        .map(PetVariant::parse)
-        .transpose()
-        .map_err(|err| anyhow!(err))?;
-    base.pet_energy
-        .as_deref()
-        .map(PetEnergy::parse)
-        .transpose()
-        .map_err(|err| anyhow!(err))?;
-    base.day_cycle()?;
-    let themes = ThemeSet::resolve(base.themes_enabled.unwrap_or(true), base.themes.clone())?;
-    if let Some(active) = base.active_theme.as_deref() {
-        if active.trim().is_empty() {
-            bail!("ActiveTheme must not be empty");
-        }
-        if !themes.contains(active) {
-            bail!("ActiveTheme {active:?} is not a defined theme");
-        }
-    }
-    let layers = base.layer_layout(width, &themes)?;
-    Ok((base, layers))
-}
-
-fn load_font(name: &str) -> FontFace {
-    let fontconfig = FontConfig::new();
-    let mut pattern = Pattern::new(name);
-    fontconfig.perform_substitutions(&mut pattern);
-    let pat_match = match fontconfig.match_pattern(&pattern) {
-        Ok(pat) => pat,
-        Err(_) => panic!("Unable to find specified font. If you are using the default config, make sure you have at least one font installed")
-    };
-    let file_name = pat_match.get_file_name();
-    let file_idx = pat_match.get_font_index();
-    let ft_library = FtLibrary::init().unwrap();
-    let face = ft_library.new_face(file_name, file_idx).unwrap();
-    FontFace::create_from_ft(&face).unwrap()
+/// Load the font a `FontTemplate` names. An unmatchable pattern or an
+/// unloadable file is a configuration error carried in the `Result`,
+/// never a panic: the caller's keep-current-configuration path absorbs
+/// it exactly like every other invalid knob.
+fn load_font(name: &str) -> Result<FontFace> {
+    let (file_name, file_idx) = dfr_config::fonts::match_font(name).map_err(anyhow::Error::msg)?;
+    let ft_library = FtLibrary::init().context("initializing freetype")?;
+    let face = ft_library.new_face(&file_name, file_idx).with_context(|| {
+        format!("loading the font file {file_name:?} matched for FontTemplate {name:?}")
+    })?;
+    FontFace::create_from_ft(&face)
+        .with_context(|| format!("creating a cairo face for the font file {file_name:?}"))
 }
 
 fn load_config(
@@ -626,20 +77,21 @@ fn load_config(
     user_path: Option<&Path>,
     state_path: Option<&Path>,
 ) -> Result<(Config, LayerDeck)> {
-    let user = user_path.map(read_to_string).transpose();
-    let user = match user {
-        Ok(user) => user,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err.into()),
-    };
-    let (base, layout) = parse_config(&read_to_string(base_path)?, user.as_deref(), width)?;
-    let global_day_cycle = base.day_cycle()?;
+    let dfr_config::LoadedModel {
+        proxy: base,
+        layout,
+        day_cycle: global_day_cycle,
+        mut themes,
+    } = parse_config_files(base_path, user_path, width)?;
+    // Resolve the file-backed resources the configuration names with
+    // the same lookup order the button loader below loads through, so
+    // what validates here is exactly what loads there.
+    IconSearch::new(ICON_DIRS.iter().copied()).validate_layout(&layout)?;
     // Resolve the active theme: a config `ActiveTheme` pins the choice,
     // and with no pin the state file's last on-glass choice decides. A
     // state entry that no longer names a theme (the theme was removed
     // or renamed) falls back to the first theme and the file heals to
     // match, so a stale file can never wedge the bar.
-    let mut themes = ThemeSet::resolve(base.themes_enabled.unwrap_or(true), base.themes.clone())?;
     themes.active = base.active_theme.clone().filter(|_| themes.enabled);
     if themes.enabled && themes.active.is_none() {
         match state_path.and_then(read_persisted_theme) {
@@ -663,7 +115,7 @@ fn load_config(
         }
     }
     let palette = themes.palette();
-    let pet_enabled = base.pet_enabled.unwrap_or(true);
+    let pet_enabled = base.pet_enabled.unwrap_or(defaults::PET_ENABLED);
     let pet_layer = pet_enabled
         .then(|| {
             layout
@@ -676,8 +128,13 @@ fn load_config(
         layout
             .layers
             .into_iter()
-            .map(|layer| (layer.name, FunctionLayer::with_config(layer.keys)))
-            .collect(),
+            .map(|layer| {
+                let name = layer.name;
+                FunctionLayer::with_config(layer.keys)
+                    .with_context(|| format!("building layer {name:?}"))
+                    .map(|built| (name, built))
+            })
+            .collect::<Result<Vec<_>>>()?,
         layout.home,
         layout.fn_layer,
         pet_layer,
@@ -690,18 +147,45 @@ fn load_config(
     layers.apply_palette(&palette);
     let day_cycle = themes.day_cycle(&global_day_cycle);
     let cfg = Config {
-        show_button_outlines: base.show_button_outlines.unwrap(),
-        enable_pixel_shift: base.enable_pixel_shift.unwrap(),
-        adaptive_brightness: base.adaptive_brightness.unwrap(),
-        font_face: load_font(&base.font_template.unwrap()),
-        active_brightness: base.active_brightness.unwrap(),
-        double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
-        battery_cycle_enabled: base.battery_cycle_enabled.unwrap_or(true),
-        battery_cycle_timeout_secs: base.battery_cycle_timeout_secs.unwrap_or(15),
-        battery_warning_threshold: base.battery_warning_threshold.unwrap_or(25),
-        battery_critical_threshold: base.battery_critical_threshold.unwrap_or(10),
-        battery_warning_color: base.battery_warning_color.unwrap_or(ButtonAccent::Orange),
-        battery_critical_color: base.battery_critical_color.unwrap_or(ButtonAccent::Red),
+        show_button_outlines: base
+            .show_button_outlines
+            .unwrap_or(defaults::SHOW_BUTTON_OUTLINES),
+        enable_pixel_shift: base
+            .enable_pixel_shift
+            .unwrap_or(defaults::ENABLE_PIXEL_SHIFT),
+        adaptive_brightness: base
+            .adaptive_brightness
+            .unwrap_or(defaults::ADAPTIVE_BRIGHTNESS),
+        font_face: load_font(
+            &base
+                .font_template
+                .clone()
+                .unwrap_or_else(|| defaults::FONT_TEMPLATE.to_owned()),
+        )?,
+        active_brightness: base
+            .active_brightness
+            .unwrap_or(defaults::ACTIVE_BRIGHTNESS),
+        double_press_switch_layers: base
+            .double_press_switch_layers
+            .unwrap_or(defaults::DOUBLE_PRESS_SWITCH_LAYERS),
+        battery_cycle_enabled: base
+            .battery_cycle_enabled
+            .unwrap_or(defaults::BATTERY_CYCLE_ENABLED),
+        battery_cycle_timeout_secs: base
+            .battery_cycle_timeout_secs
+            .unwrap_or(defaults::BATTERY_CYCLE_TIMEOUT_SECS),
+        battery_warning_threshold: base
+            .battery_warning_threshold
+            .unwrap_or(defaults::BATTERY_WARNING_THRESHOLD),
+        battery_critical_threshold: base
+            .battery_critical_threshold
+            .unwrap_or(defaults::BATTERY_CRITICAL_THRESHOLD),
+        battery_warning_color: base
+            .battery_warning_color
+            .unwrap_or(defaults::BATTERY_WARNING_COLOR),
+        battery_critical_color: base
+            .battery_critical_color
+            .unwrap_or(defaults::BATTERY_CRITICAL_COLOR),
         pet_enabled,
         pet_variant: base
             .pet_variant
@@ -898,13 +382,26 @@ impl ConfigManager {
         &self.inotify_fd
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfr_config::{ConfigProxy, LayerLayout, LoadedModel, ThemeSet, PET_LAYER_STRETCH};
+    use input_linux::Key;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::time::{Duration, Instant};
+
+    /// The content-level parse used by these tests: the shared
+    /// parse/validate path, mapped to the (proxy, layout) pair the
+    /// assertions read.
+    fn parse_config(
+        base: &str,
+        user: Option<&str>,
+        width: u16,
+    ) -> anyhow::Result<(ConfigProxy, LayerLayout)> {
+        dfr_config::parse_config(base, user, width)
+            .map(|LoadedModel { proxy, layout, .. }| (proxy, layout))
+    }
 
     const BASE: &str = include_str!("../share/tiny-dfr/config.toml");
     const NAMED: &str = r#"

@@ -1,0 +1,109 @@
+# tiny-dfr configuration, written canonically by dfr-config.
+# Installed as the user file, it overlays the shipped base per
+# field; arrays replace wholesale. Unknown keys are rejected, so
+# every knob below is spelled exactly as the daemon reads it.
+
+# Draw the outline around each button; false leaves only labels and glyphs.
+ShowButtonOutlines = false
+
+# Slowly shift the strip contents sideways to spread pixel wear.
+EnablePixelShift = true
+
+# Fontconfig pattern selecting the font for text labels (see the fontconfig font-names guide).
+FontTemplate = ":bold"
+
+# Static brightness with adaptive off; the curve's maximum with it on.
+ActiveBrightness = 200
+
+# Follow the primary display's backlight instead of a fixed brightness.
+AdaptiveBrightness = false
+
+# Double-press Fn within this many milliseconds to swap the default layer.
+DoublePressSwitchLayers = 200
+
+# Tap a battery widget to cycle from the system battery through device batteries.
+BatteryCycleEnabled = false
+
+# Return to the system battery this long after the last cycling tap.
+BatteryCycleTimeoutSecs = 9
+
+# Below this charge percent (and not charging) the widget paints the warning color.
+BatteryWarningThreshold = 30
+
+# Below this charge percent the widget paints the critical color.
+BatteryCriticalThreshold = 12
+
+# Accent painted below the warning threshold while not charging.
+BatteryWarningColor = "amber"
+
+# Accent painted below the critical threshold while not charging.
+BatteryCriticalColor = "red"
+
+# Keep the pet layer and its home-bar Pet button; false removes both.
+PetEnabled = true
+
+# The pet's sprite: an orange tabby or a red fox.
+PetVariant = "fox"
+
+# Rowdy pets dash more and get hungry sooner; calm ones stroll and doze.
+PetEnergy = "rowdy"
+
+# Tint the strip by time of day; false keeps the plain black background.
+DayCycleEnabled = false
+
+# Enable the color-theme system: the picker layer and the more bar's two theme buttons.
+ThemesEnabled = true
+
+# Pin the startup theme instead of the last choice made on the glass.
+ActiveTheme = "Mine"
+
+# Legacy syntax: show the media keys without Fn pressed.
+MediaLayerDefault = false
+
+# The layer the bar starts on and returns to.
+DefaultLayer = "home"
+
+# The layer held while Fn is pressed.
+FnLayer = "fn"
+
+# Replace the default bands: each [[DayCycleBands]] entry has Name, StartHour, and a "#RRGGBB" Color.
+[[DayCycleBands]]
+Name = "work"
+StartHour = 9
+Color = "#102030"
+[[DayCycleBands]]
+Name = "off"
+StartHour = 19
+Color = "#301020"
+
+# Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]].
+[Themes.Mine]
+[Themes.Mine.Accents]
+cyan = "#40E0D0"
+amber = "40e0a0"
+
+[[Layers]]
+Name = "home"
+Keys = [
+    { Icon = "volume_up", Action = "VolumeSlider", Stretch = 2 },
+    { Icon = "brightness_high", Action = "BrightnessSlider", IconWidth = 48, IconHeight = 48 },
+    { Text = "Combo", Action = ["LeftCtrl", "LeftAlt", "F1"] },
+    { Text = "Clock", Time = "24hr", Locale = "en_US", Action = "Time", Stretch = 3 },
+    { Battery = "both", Stretch = 2 },
+    { NowPlaying = true, Stretch = 2 },
+    { Text = "F1", Action = "F1" },
+    { Icon = "search" },
+    {},
+]
+[[Layers]]
+Name = "fn"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "Sync", Action = { Command = "sync-now" } },
+    { Text = "Stop", Action = { Command = "sync-now", Layer = "home" } },
+    { Text = "Wear", Action = { Theme = "Mine" } },
+    { Text = "Pick", Action = { Layer = "home", Theme = "Mine" } },
+    { Text = "Next", Action = "CycleTheme" },
+    { Waveform = true, WaveformStyle = "bars", WaveformSmoothing = 240, WaveformLag = 80, Stretch = 3, Accent = "cyan" },
+    { Visualizer = true, VisualizerStyle = "line", VisualizerSmoothing = 120, VisualizerLag = 40, Stretch = 2, Accent = "blue" },
+]

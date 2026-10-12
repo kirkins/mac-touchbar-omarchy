@@ -1,6 +1,6 @@
 //! One transient level control: ranges/adapters vary; drawing and interaction do not.
 use crate::{
-    appearance::{ButtonAccent, Palette},
+    appearance::{AccentPaint, ButtonAccent, Palette},
     config::ButtonAction,
     level_control::{Request, State, MAX_VOLUME_PERCENT},
     rounded_rect, BUTTON_COLOR_ACTIVE, BUTTON_COLOR_INACTIVE, BUTTON_SPACING_PX,
