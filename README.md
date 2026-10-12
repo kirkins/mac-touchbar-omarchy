@@ -39,6 +39,10 @@ frames `implemented-media-viz.png` (the expanded full-bar view) and
 now-playing frame `implemented-media-playing.png` (the same media bar
 with a playing track's title and artist caption; without the desktop
 receiver the row ships its dim `Nothing playing` state),
+the theme frames `implemented-themes.png` (the picker's full-bar takeover
+listing every theme name), `implemented-home-nord.png` (the same home bar
+with the Nord theme applied live), and `implemented-more-theme-flash.png`
+(the cycle button briefly wearing the applied theme's name),
 and the per-band frames
 `implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
 `implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
@@ -65,6 +69,15 @@ that renders identically in both slider states without moving any button),
 command buttons (parse and
 combined layer dispatch, detached execution, the one-invocation-per-command
 cap, and the More bar's quick-key entries and shipped screenshot flow), the
+color themes (the seeded set's order, readability, and cycle wrap; user
+themes merging by name with partial inheritance; invalid definitions
+rejecting the candidate configuration; the picker layer and both synthesized
+buttons with their suppression and disable rules; the live apply building
+the palette and bands from the config pin; the remembered-choice state
+file's precedence, healing, and atomic saves; the cycle button's
+flash-and-revert clock; picker buttons applying and returning home;
+unknown names consumed without effects; and the waveform retint without a
+deck rebuild), the
 recording waveform (level-history ring behavior, line and bar
 geometry from synthetic levels, flatness, bounds, and sample-boundary
 continuity of the line, incremental button repaints, recording-only fast cadence,
@@ -312,6 +325,80 @@ command execution follows the command-button rules above (detached, at most
 one invocation per command string, failures journalled). A quick key that
 needs the desktop session must go through a session receiver client like
 this one.
+
+The shipped bar also carries a `Lock` key:
+
+```toml
+{ Text = "Lock", Accent = "amber", Action = ["LeftMeta", "LeftCtrl", "L"] }
+```
+
+It emits the compositor's lock bind - Omarchy's default `SUPER+CTRL+L`
+(`omarchy-system-lock`) - as a pure key chord through the daemon's virtual
+keyboard, the same mechanism every other key button uses: no shell, no
+helper, nothing for the unprivileged sandbox to reach. Locking is the
+compositor's own bind, so rebinding it in Hyprland moves the bar's lock key
+too. If your compositor's lock bind differs, change the chord in this one
+entry like any key combo button.
+
+### Color themes
+
+The bar's colors come from named themes: presets of the knobs the config
+already expresses - the colors behind the accent names every button uses,
+and the time-of-day background bands. Eight tasteful built-ins ship seeded
+- `Default` (the live palette exactly as the deck always rendered it),
+`Midnight`, `Nord`, `Ember`, `Rosewater`, `Forest`, `Solarized`, and `Mono` -
+and owners add or override themes with `[Themes.Name]` tables:
+
+```toml
+ThemesEnabled = true     # set false to remove the theme buttons and picker
+ActiveTheme = "Midnight" # optional: pin the startup theme from the config
+
+[Themes.Mine.Accents]
+neutral = "#9AA0A6"
+cyan = "#40E0D0"
+# ... any of the eight accent names, values "#RRGGBB"
+[[Themes.Mine.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#1A1B1E"
+```
+
+A theme is partial by design: accents and bands it does not name are
+inherited - from the shipped defaults for a new theme, or from the built-in
+it shadows when overriding one by name. Invalid accent names, colors, or
+bands reject the candidate configuration on reload, keeping the current one,
+like every other knob. The alarm colors that must never follow a theme (the
+waveform's dead-feed red) keep their shipped values.
+
+Two activation surfaces reach the themes from the glass, both synthesized
+onto the quick-keys `more` bar (default on, exactly like the pet button):
+
+- A compact `Theme` cycle button: each tap applies the next theme in the
+  seeded order, wrapping, and the button briefly wears the applied theme's
+  name before returning to its own label. The tap is pure - no keys fire,
+  no command runs, the bar stays put.
+- A `Themes` button opening the picker: the theme list takes over the whole
+  bar, one button per theme name plus the usual Home. Tapping a name
+  applies that theme and returns home in the same press.
+
+Applying is live and invisible to the service: the palette and the
+background bands swap on the next frame - buttons, slider fills, accents,
+the waveform tint, the strip - with no restart and no reload, the same
+inotify reload path staying available for config edits. The choice is
+remembered in `/var/lib/tiny-dfr/active-theme` (prepared by the install
+notes below): it survives restarts, a config `ActiveTheme` pin wins over
+it, and a remembered name that no longer exists falls back to the first
+theme and heals the file, so a stale file can never wedge the bar. Up to 21
+themes fit the picker bar; more reject the candidate configuration.
+
+Authors reach the picker from other bars with their own buttons:
+`Action = { Layer = "themes" }` opens it (a user-defined `[[Layers]]` entry
+named `themes` replaces the synthesized picker, like the pet's layer),
+`Action = "CycleTheme"` cycles in place, and
+`Action = { Theme = "Nord" }` applies one theme by name, optionally with
+`Layer = "home"` to switch in the same press. With `ThemesEnabled = false`
+the synthesized layer and buttons disappear and buttons still targeting
+`themes` reject the candidate configuration like any unknown layer.
 
 ### Live recording waveform
 
@@ -586,7 +673,7 @@ printf 'Backup path: %s\n' "$dfr_backup"
 sudo install -D -m 0755 target/release/tiny-dfr /usr/local/libexec/tiny-dfr-multibar
 sudo install -d /etc/tiny-dfr /etc/systemd/system/tiny-dfr.service.d
 sudo install -m 0644 share/tiny-dfr/multibar.toml /etc/tiny-dfr/config.toml
-printf '[Service]\nExecStart=\nExecStart=/usr/local/libexec/tiny-dfr-multibar\n' |
+printf '[Service]\nExecStart=\nExecStart=/usr/local/libexec/tiny-dfr-multibar\n# The daemon (running as nobody after its privilege drop) remembers the\n# theme chosen on the glass here; ExecStartPre prepares the one writable\n# directory ProtectSystem=strict otherwise denies.\nExecStartPre=/usr/bin/install -d -o nobody -g nobody -m 0755 /var/lib/tiny-dfr\nReadWritePaths=/var/lib/tiny-dfr\n' |
     sudo tee /etc/systemd/system/tiny-dfr.service.d/multibar.conf >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl restart tiny-dfr.service
@@ -595,7 +682,13 @@ sudo systemctl status tiny-dfr.service --no-pager
 
 On the device, check Home → Functions → Home and Home → Media → Home, all
 F1-F12/media controls, the battery, Home → More → Screenshot → Home (the
-screenshot flow runs and the bar returns home), and Home → Pet → pet
+screenshot flow runs and the bar returns home), Home → More → Lock (the
+compositor locks; unlock and check the bar again), Home → More → Theme
+(each tap applies the next theme with the name flashing on the button; the
+palette and strip repaint at once) and Home → More → Themes → a theme name
+→ Home (the picker lists every theme, the tap applies it and returns), then
+restart the service and confirm the last theme is still the one worn, then
+Home → Pet → pet
 wandering, feeding, and startling → Home, plus Fn press/release. With the
 desktop-session voice integration installed, check the mic button opens
 the recording layer while dictation starts, and that Stop types the
@@ -617,6 +710,7 @@ else
     sudo rm -f /etc/tiny-dfr/config.toml
 fi
 sudo rm /etc/systemd/system/tiny-dfr.service.d/multibar.conf
+sudo rm -rf /var/lib/tiny-dfr
 sudo systemctl daemon-reload
 sudo systemctl restart tiny-dfr.service
 sudo rm /usr/local/libexec/tiny-dfr-multibar

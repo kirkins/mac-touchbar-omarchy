@@ -56,10 +56,12 @@ mod now_playing;
 mod pet;
 mod pixel_shift;
 mod slider;
+mod themes;
 mod waveform;
 
 use crate::config::ConfigManager;
-use appearance::ButtonAccent;
+use crate::themes::ThemeRequest;
+use appearance::{ButtonAccent, Palette};
 use backlight::BacklightManager;
 use command::CommandRunner;
 use config::{ButtonAction, ButtonConfig, Config};
@@ -1275,7 +1277,12 @@ impl FunctionLayer {
                 && (button.active || config.show_button_outlines)
             {
                 let accent = button.effective_accent(&escalation);
-                accent.surface(&c, button.active, button.action.command().is_some());
+                accent.surface(
+                    &c,
+                    button.active,
+                    button.action.command().is_some(),
+                    &config.palette,
+                );
                 // Visual inset only: layout, spacing and hit targets stay the same.
                 rounded_rect(
                     &c,
@@ -1286,7 +1293,7 @@ impl FunctionLayer {
                     10.0_f64.min(button_width / 2.0).min(height as f64 * 0.4),
                 );
                 c.fill_preserve().unwrap();
-                accent.outline(&c, button.active);
+                accent.outline(&c, button.active, &config.palette);
                 c.set_line_width(1.5);
                 c.stroke().unwrap();
             }
@@ -1340,7 +1347,7 @@ impl FunctionLayer {
                 c.fill().unwrap();
             }
 
-            geometry.draw(&c, height as f64, pixel_shift_y, slider);
+            geometry.draw(&c, height as f64, pixel_shift_y, slider, &config.palette);
 
             if !complete_redraw {
                 modified_regions.push(ClipRect::new(
@@ -1486,6 +1493,21 @@ pub struct LayerDeck {
     // its synthesized full-bar visualizer view; the map is the toggle's
     // whole routing table.
     viz_view_of: HashMap<usize, usize>,
+    // The cycle button's brief applied-theme label: which button shows
+    // the theme's name, the label to restore, and when. `None` whenever
+    // no flash is pending.
+    theme_flash: Option<ThemeFlash>,
+}
+
+/// How long the cycle button shows the applied theme's name before
+/// reverting to its own label.
+const THEME_FLASH: Duration = Duration::from_millis(1500);
+
+struct ThemeFlash {
+    layer: usize,
+    button: usize,
+    revert: String,
+    at: Instant,
 }
 
 impl LayerDeck {
@@ -1546,6 +1568,7 @@ impl LayerDeck {
             slider: Overlay::default(),
             mute: MuteWatch::default(),
             volume_sliders,
+            theme_flash: None,
         }
     }
 
@@ -1801,6 +1824,7 @@ impl LayerDeck {
             .set_active(active, emit_keys);
     }
 
+    #[allow(clippy::too_many_arguments)] // a router: identity plus the three effects
     fn touch_down(
         &mut self,
         slot: u32,
@@ -1809,6 +1833,7 @@ impl LayerDeck {
         y: f64,
         emit_keys: &mut impl FnMut(&[Key], bool),
         run_command: &mut impl FnMut(&str),
+        apply_theme: &mut impl FnMut(ThemeRequest) -> Option<(String, Palette)>,
     ) -> bool {
         self.touch_up(slot, emit_keys);
         if matches!(self.current().buttons[button].1.image, ButtonImage::Spacer) {
@@ -1850,6 +1875,46 @@ impl LayerDeck {
             let command = command.clone();
             run_command(&command);
         }
+        // Theme buttons apply their theme through the caller - which owns
+        // the palette, the day cycle, and persistence - and then retint
+        // the deck's per-build colors. The cycle button stays on its bar
+        // and briefly shows the applied theme's name; picker buttons
+        // apply and switch to their configured layer, home by default.
+        // Every theme tap is consumed: it never falls through to key
+        // emission, and an unknown theme name simply does nothing.
+        match self.current().buttons[button].1.action.clone() {
+            ButtonAction::CycleTheme => {
+                if let Some((name, palette)) = apply_theme(ThemeRequest::Next) {
+                    self.apply_palette(&palette);
+                    let layer = self.active;
+                    if let ButtonImage::Text(text) = &mut self.layers[layer].buttons[button].1.image
+                    {
+                        let revert = std::mem::replace(text, name);
+                        self.layers[layer].buttons[button].1.changed = true;
+                        self.theme_flash = Some(ThemeFlash {
+                            layer,
+                            button,
+                            revert,
+                            at: Instant::now() + THEME_FLASH,
+                        });
+                    }
+                }
+                return true;
+            }
+            ButtonAction::ApplyTheme(theme) => {
+                if let Some((_, palette)) = apply_theme(ThemeRequest::Named(&theme)) {
+                    self.apply_palette(&palette);
+                }
+                return true;
+            }
+            ButtonAction::ApplyThemeLayer { theme, layer } => {
+                if let Some((_, palette)) = apply_theme(ThemeRequest::Named(&theme)) {
+                    self.apply_palette(&palette);
+                }
+                return self.switch_named(&layer, emit_keys);
+            }
+            _ => {}
+        }
         self.touches.insert(
             slot,
             TouchState {
@@ -1866,7 +1931,7 @@ impl LayerDeck {
 
     /// Route a fresh touch-down: while the slider is drawn its region owns
     /// the touch, otherwise the press goes to the button under it.
-    #[allow(clippy::too_many_arguments)] // a router: geometry plus the two effects
+    #[allow(clippy::too_many_arguments)] // a router: geometry plus the three effects
     fn touch_down_at(
         &mut self,
         slot: u32,
@@ -1876,6 +1941,7 @@ impl LayerDeck {
         height: u16,
         emit_keys: &mut impl FnMut(&[Key], bool),
         run_command: &mut impl FnMut(&str),
+        apply_theme: &mut impl FnMut(ThemeRequest) -> Option<(String, Palette)>,
     ) -> bool {
         if self.slider_drag_start(slot, x, y, width, height, emit_keys) {
             return false;
@@ -1890,7 +1956,9 @@ impl LayerDeck {
             return false;
         }
         match self.current().hit(width, height, x, y, None) {
-            Some(button) => self.touch_down(slot, button, x, y, emit_keys, run_command),
+            Some(button) => {
+                self.touch_down(slot, button, x, y, emit_keys, run_command, apply_theme)
+            }
             None => false,
         }
     }
@@ -2022,6 +2090,47 @@ impl LayerDeck {
                 }
             }
         }
+    }
+
+    /// Retint every waveform widget's accent-derived color to a new
+    /// palette. All other accent colors resolve at draw time through the
+    /// palette the renderer holds; the waveform's live-dot tint is the
+    /// one color resolved per build, so a live theme swap refreshes it
+    /// here instead. Called after every deck build and theme apply.
+    pub fn apply_palette(&mut self, palette: &Palette) {
+        for layer in &mut self.layers {
+            for (_, button) in &mut layer.buttons {
+                if let ButtonImage::Waveform(wave) = &mut button.image {
+                    wave.retint(palette);
+                }
+            }
+        }
+    }
+
+    /// Expire the cycle button's applied-theme label when its moment
+    /// passes, restoring the button's own label. Returns whether a
+    /// button changed and the epoll timeout until the flash ends, idle
+    /// on every bar with no flash pending.
+    fn theme_flash_tick(&mut self, now: Instant) -> (bool, i32) {
+        let Some(flash) = &self.theme_flash else {
+            return (false, i32::MAX - 1);
+        };
+        if now >= flash.at {
+            let flash = self.theme_flash.take().unwrap();
+            let button = &mut self.layers[flash.layer].buttons[flash.button].1;
+            if let ButtonImage::Text(text) = &mut button.image {
+                if *text != flash.revert {
+                    *text = flash.revert;
+                    button.changed = true;
+                    return (true, i32::MAX - 1);
+                }
+            }
+            return (false, i32::MAX - 1);
+        }
+        (
+            false,
+            (flash.at - now).as_millis().clamp(1, TIMEOUT_MS as u128) as i32,
+        )
     }
 
     fn mark_slider_changed(&mut self) {
@@ -2449,6 +2558,12 @@ fn real_main(drm: &mut DrmBackend) {
         now_playing.set_armed(layers.now_playing_active());
         layers.now_playing_tick(now_playing_feed);
 
+        // The cycle button's applied-theme label reverts on its own
+        // timer; like every other widget deadline it only ever narrows
+        // the epoll timeout.
+        let (_, theme_flash_timeout_ms) = layers.theme_flash_tick(Instant::now());
+        next_timeout_ms = min(next_timeout_ms, theme_flash_timeout_ms);
+
         // The shared slider collapses on its own after a moment.
         layers.slider_refresh(Instant::now());
         if let Some(remaining) = layers.slider_timeout(Instant::now()) {
@@ -2619,6 +2734,33 @@ fn real_main(drm: &mut DrmBackend) {
                                 // underneath must not fire.
                                 needs_complete_redraw = true;
                             } else {
+                                // Theme buttons apply through here: the
+                                // palette, day cycle, and persistence live
+                                // outside the deck, and a successful apply
+                                // returns the applied name and palette so
+                                // the deck can retint its per-build colors.
+                                // Any theme tap forces a complete redraw,
+                                // so the whole strip repaints in the new
+                                // colors on the very next frame.
+                                let mut apply_theme =
+                                    |request: ThemeRequest| -> Option<(String, Palette)> {
+                                        let name = match request {
+                                            ThemeRequest::Next => cfg.themes.cycle_next()?,
+                                            ThemeRequest::Named(name) => name.to_owned(),
+                                        };
+                                        if !cfg.themes.apply(&name) {
+                                            eprintln!("theme {name:?} is not defined");
+                                            return None;
+                                        }
+                                        cfg.palette = cfg.themes.palette();
+                                        cfg.day_cycle = cfg.themes.day_cycle(&cfg.global_day_cycle);
+                                        if let Err(err) = cfg_mgr.save_theme(&name) {
+                                            eprintln!(
+                                                "could not persist the active theme {name:?}: {err}"
+                                            );
+                                        }
+                                        Some((name, cfg.palette))
+                                    };
                                 needs_complete_redraw |= layers.touch_down_at(
                                     dn.seat_slot(),
                                     x,
@@ -2631,6 +2773,7 @@ fn real_main(drm: &mut DrmBackend) {
                                     &mut |command| {
                                         commands.launch(command);
                                     },
+                                    &mut apply_theme,
                                 );
                             }
                         }
@@ -3032,15 +3175,15 @@ mod tests {
         );
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {});
-        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+        deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
+        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert!(deck.touches.is_empty());
         assert_eq!(widget(&deck).source().unwrap().id, "hidpp_mouse");
         deck.touch_motion(1, 1100.0, 30.0, 2008, 60, &mut emit);
         deck.touch_motion(0, 100.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(1, &mut emit);
         assert_eq!(widget(&deck).source().unwrap().id, "hidpp_mouse");
-        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(widget(&deck).source().unwrap().id, "keyboard");
         assert_eq!(
             events,
@@ -3058,11 +3201,13 @@ mod tests {
             let sources = sample_sources();
             let timeout = Duration::from_secs(15);
             deck.refresh_batteries(&sources, true, timeout, Instant::now(), &mut |_, _| {});
-            deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {});
+            deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            });
             let deadline = widget(&deck).return_at.unwrap();
             let mut events = Vec::new();
             let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-            deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut |_| {});
+            deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
             let snapshot = if removal { &sources[..1] } else { &sources[..] };
             let now = if removal {
                 deadline - timeout
@@ -3100,7 +3245,7 @@ mod tests {
             );
             let mut events = Vec::new();
             let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-            assert!(!deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+            assert!(!deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
             deck.touch_up(0, &mut emit);
             assert_eq!(widget(&deck).source().unwrap().id, "BAT0");
             assert!(widget(&deck).label().is_none());
@@ -3317,6 +3462,237 @@ mod tests {
         )
     }
 
+    /// A deck shaped like the theme system's surfaces: a home bar, the
+    /// quick-keys `more` bar carrying the cycle button and the picker
+    /// opener, and a `themes` picker layer with one per-theme button plus
+    /// a plain in-place apply button.
+    fn theme_deck() -> LayerDeck {
+        LayerDeck::new(
+            vec![
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![keys("Combo", &[Key::LeftCtrl, Key::F1])]),
+                ),
+                (
+                    "more".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        text("Theme", ButtonAction::CycleTheme),
+                        text("Themes", ButtonAction::SwitchLayer("themes".into())),
+                    ]),
+                ),
+                (
+                    "themes".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        text(
+                            "Nord",
+                            ButtonAction::ApplyThemeLayer {
+                                theme: "Nord".into(),
+                                layer: "home".into(),
+                            },
+                        ),
+                        text("Solo", ButtonAction::ApplyTheme("Mono".into())),
+                    ]),
+                ),
+            ],
+            0,
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn theme_button_index(deck: &LayerDeck, label: &str) -> usize {
+        deck.current()
+            .buttons
+            .iter()
+            .position(|(_, button)| {
+                matches!(&button.image, crate::ButtonImage::Text(text) if text == label)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn the_cycle_button_applies_the_next_theme_and_flashes_its_name() {
+        let mut deck = theme_deck();
+        deck.switch_named("more", &mut |_, _| {});
+        let button = theme_button_index(&deck, "Theme");
+        let mut asked = Vec::new();
+        let mut apply = |request: ThemeRequest| -> Option<(String, Palette)> {
+            asked.push(match request {
+                ThemeRequest::Next => "<next>".into(),
+                ThemeRequest::Named(name) => name.to_owned(),
+            });
+            Some(("Midnight".into(), Palette::default()))
+        };
+        let consumed = deck.touch_down(
+            0,
+            button,
+            100.0,
+            30.0,
+            &mut |_, _| panic!("theme tap emitted keys"),
+            &mut |_| panic!("theme tap ran a command"),
+            &mut apply,
+        );
+        assert!(consumed, "the tap is always consumed");
+        assert_eq!(asked, vec!["<next>"]);
+        // The button briefly wears the applied theme's name.
+        assert!(matches!(
+            &deck.layers[deck.names["more"]].buttons[button].1.image,
+            crate::ButtonImage::Text(text) if text == "Midnight"
+        ));
+        // Before the flash expires the label holds and only narrows the
+        // epoll timeout; past it, the button's own label returns and the
+        // button repaints.
+        let (changed, timeout) = deck.theme_flash_tick(Instant::now());
+        assert!(!changed);
+        assert!(timeout > 0 && timeout <= 1500);
+        let (changed, _) = deck.theme_flash_tick(Instant::now() + Duration::from_millis(1600));
+        assert!(changed);
+        assert!(matches!(
+            &deck.layers[deck.names["more"]].buttons[button].1.image,
+            crate::ButtonImage::Text(text) if text == "Theme"
+        ));
+        // The label sits only on the cycle button: a second flash while
+        // another layer is displayed still restores the right button.
+        let consumed = deck.touch_down(
+            1,
+            button,
+            100.0,
+            30.0,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| Some(("Nord".into(), Palette::default())),
+        );
+        assert!(consumed);
+        deck.switch_named("themes", &mut |_, _| {});
+        assert!(
+            deck.theme_flash_tick(Instant::now() + Duration::from_millis(1600))
+                .0
+        );
+        assert!(matches!(
+            &deck.layers[deck.names["more"]].buttons[button].1.image,
+            crate::ButtonImage::Text(text) if text == "Theme"
+        ));
+    }
+
+    #[test]
+    fn picker_buttons_apply_their_theme_and_the_in_place_button_stays() {
+        let mut deck = theme_deck();
+        deck.switch_named("themes", &mut |_, _| {});
+        let nord = theme_button_index(&deck, "Nord");
+        let mut asked = Vec::new();
+        let mut apply = |request: ThemeRequest| -> Option<(String, Palette)> {
+            asked.push(match request {
+                ThemeRequest::Next => "<next>".into(),
+                ThemeRequest::Named(name) => name.to_owned(),
+            });
+            Some(("Nord".into(), Palette::default()))
+        };
+        let switched = deck.touch_down(
+            0,
+            nord,
+            100.0,
+            30.0,
+            &mut |_, _| panic!("picker tap emitted keys"),
+            &mut |_| panic!("picker tap ran a command"),
+            &mut apply,
+        );
+        assert!(switched, "applying from the picker returns home");
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(asked, vec!["Nord"]);
+        // The in-place apply button applies and stays on its bar.
+        deck.switch_named("themes", &mut |_, _| {});
+        let solo = theme_button_index(&deck, "Solo");
+        let consumed = deck.touch_down(
+            1,
+            solo,
+            100.0,
+            30.0,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |request| {
+                assert_eq!(request, ThemeRequest::Named("Mono"));
+                Some(("Mono".into(), Palette::default()))
+            },
+        );
+        assert!(consumed);
+        assert_eq!(deck.active, deck.names["themes"]);
+    }
+
+    #[test]
+    fn theme_taps_for_unknown_names_are_consumed_without_effects() {
+        let mut deck = theme_deck();
+        deck.switch_named("more", &mut |_, _| {});
+        let button = theme_button_index(&deck, "Theme");
+        let consumed = deck.touch_down(
+            0,
+            button,
+            100.0,
+            30.0,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
+        assert!(consumed);
+        assert_eq!(deck.active, deck.names["more"]);
+        assert!(matches!(
+            &deck.layers[deck.names["more"]].buttons[button].1.image,
+            crate::ButtonImage::Text(text) if text == "Theme"
+        ));
+        assert_eq!(deck.theme_flash_tick(Instant::now()), (false, i32::MAX - 1));
+    }
+
+    #[test]
+    fn applying_a_palette_retints_the_waveform_widgets_in_place() {
+        let mut deck = LayerDeck::new(
+            vec![
+                (
+                    "recording".into(),
+                    FunctionLayer::with_config(vec![
+                        nav("Home", "home"),
+                        crate::config::ButtonConfig {
+                            waveform: Some(true),
+                            accent: Some(ButtonAccent::Red),
+                            ..crate::config::ButtonConfig::default()
+                        },
+                    ]),
+                ),
+                (
+                    "home".into(),
+                    FunctionLayer::with_config(vec![nav("Back", "recording")]),
+                ),
+            ],
+            1,
+            None,
+            None,
+            false,
+        );
+        let waveform = deck.layers[0]
+            .buttons
+            .iter()
+            .position(|(_, button)| matches!(&button.image, crate::ButtonImage::Waveform(_)))
+            .unwrap();
+        let dot_rgb = |deck: &LayerDeck| {
+            let crate::ButtonImage::Waveform(wave) = &deck.layers[0].buttons[waveform].1.image
+            else {
+                panic!();
+            };
+            wave.live_dot_rgb()
+        };
+        // Built with no palette the widget wears its accent's shipped red.
+        assert_eq!(dot_rgb(&deck), ButtonAccent::Red.rgb());
+        // A live theme apply retints it without a deck rebuild.
+        let mut themed = Palette::default();
+        themed.set(ButtonAccent::Red, (255, 80, 0));
+        deck.apply_palette(&themed);
+        assert_eq!(dot_rgb(&deck), (1.0, 80.0 / 255.0, 0.0));
+        // And a reload back to the live palette restores it.
+        deck.apply_palette(&Palette::default());
+        assert_eq!(dot_rgb(&deck), ButtonAccent::Red.rgb());
+    }
+
     #[test]
     fn command_buttons_fire_on_touch_down_and_combined_presses_switch_layers() {
         let mut deck = voice_deck();
@@ -3327,19 +3703,19 @@ mod tests {
 
         // One mic press starts dictation and opens the recording layer; the
         // touch is released with the switch, like any navigation button.
-        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut fired));
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut fired, &mut |_| None));
         assert_eq!(deck.active, deck.names["recording"]);
         assert!(deck.touches.is_empty());
         // Cancel discards a mis-start and returns home.
-        assert!(deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut fired));
+        assert!(deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut fired, &mut |_| None));
         assert_eq!(deck.active, deck.home);
         // Stop keeps the recording and returns home the same way.
-        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut fired));
-        assert!(deck.touch_down(1, 2, 1900.0, 30.0, &mut emit, &mut fired));
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut fired, &mut |_| None));
+        assert!(deck.touch_down(1, 2, 1900.0, 30.0, &mut emit, &mut fired, &mut |_| None));
         assert_eq!(deck.active, deck.home);
         // A plain command button fires on touch-down and keeps its momentary
         // highlight while held, without sending any key events.
-        assert!(!deck.touch_down(2, 2, 1900.0, 30.0, &mut emit, &mut fired));
+        assert!(!deck.touch_down(2, 2, 1900.0, 30.0, &mut emit, &mut fired, &mut |_| None));
         assert!(deck.current().buttons[2].1.active);
         deck.touch_up(2, &mut emit);
         assert!(!deck.current().buttons[2].1.active);
@@ -3419,7 +3795,11 @@ mod tests {
             .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
 
         // The mic press opens the recording layer and its widget session.
-        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(
+            deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            })
+        );
         assert_eq!(deck.active, deck.names["recording"]);
         assert!(deck.waveform_active());
         let (changed, timeout) = deck.waveform_tick(None, now);
@@ -3463,7 +3843,11 @@ mod tests {
 
         // Leaving the recording layer ends the session and the fast cadence;
         // a late in-flight sample never repaints any other layer.
-        assert!(deck.touch_down(1, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(
+            deck.touch_down(1, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            })
+        );
         assert_eq!(deck.active, deck.home);
         let later = later + Duration::from_secs(5);
         let (changed, timeout) = deck.waveform_tick(
@@ -3482,7 +3866,11 @@ mod tests {
             .all(|layer| layer.buttons.iter().all(|(_, b)| !b.changed)));
 
         // Re-entering starts the timer and graph fresh.
-        assert!(deck.touch_down(2, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(
+            deck.touch_down(2, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            })
+        );
         let (changed, _) = deck.waveform_tick(None, later);
         assert!(changed);
         let ButtonImage::Waveform(wave) = &deck.current().buttons[1].1.image else {
@@ -3497,7 +3885,11 @@ mod tests {
         let mut deck = waveform_deck();
         let now = Instant::now();
         // The mic press opens the recording layer and its widget session.
-        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(
+            deck.touch_down(0, 1, 1100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            })
+        );
         assert_eq!(deck.active, deck.names["recording"]);
         let (changed, _) = deck.waveform_tick(None, now);
         assert!(changed); // the first activation frame
@@ -3721,7 +4113,7 @@ mod tests {
         // Enter the media bar: the visualizer button is present but off -
         // it never shows by default, and the media bar is exactly the
         // configured layout it will return to.
-        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, deck.names["media"]);
         assert_eq!(deck.current().visualizer, Some(2));
         assert!(!deck.viz_active());
@@ -3732,7 +4124,7 @@ mod tests {
 
         // The Viz tap is a pure layer switch: no keys, no commands, no
         // held touch, and the full-bar view is what comes up.
-        assert!(deck.touch_down(1, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(1, 2, 1600.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert!(deck.touches.is_empty());
         assert_eq!(deck.active, view);
         assert!(deck.viz_active());
@@ -3767,14 +4159,14 @@ mod tests {
         // stays up.
         let mut silent =
             |keys: &[Key], _: bool| assert!(keys.is_empty(), "the graph button emitted {keys:?}");
-        assert!(!deck.touch_down(2, 0, 1000.0, 30.0, &mut silent, &mut |_| {}));
+        assert!(!deck.touch_down(2, 0, 1000.0, 30.0, &mut silent, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, view);
         assert!(deck.viz_active());
         deck.touch_up(2, &mut silent);
 
         // The Off tap returns to the media bar unchanged: same buttons,
         // same hit spans, the toggle never sticky.
-        assert!(deck.touch_down(3, 1, 1850.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(3, 1, 1850.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, deck.names["media"]);
         assert!(!deck.viz_active());
         assert_eq!(deck.current().layout_spans(2008, 0), before);
@@ -3800,7 +4192,7 @@ mod tests {
         // Leaving the view by any other navigation - here, straight to
         // home - ends the session the same way, and coming back to the
         // media bar starts from off again.
-        assert!(deck.touch_down(4, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(4, 2, 1600.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert!(deck.viz_active());
         assert!(deck.switch_named("home", &mut emit));
         assert!(!deck.viz_active());
@@ -3817,7 +4209,7 @@ mod tests {
         assert!(!deck.viz_active());
 
         // A reload replaces the deck wholesale: the fresh one is off.
-        assert!(deck.touch_down(5, 2, 1600.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(5, 2, 1600.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert!(deck.viz_active());
         deck.replace(media_deck(), &mut |_, _| {});
         assert!(!deck.viz_active());
@@ -3877,7 +4269,7 @@ mod tests {
             }),
             Instant::now(),
         );
-        deck.touch_down(0, 2, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 2, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         deck.touch_up(0, &mut emit);
         assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
         // The pet sees the waveform button like any other occupied span.
@@ -3973,15 +4365,15 @@ mod tests {
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         // Hold a key on the home bar, then open the pet layer: the held key
         // is released and the old touch cannot act on the new layer.
-        assert!(!deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {}));
-        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(!deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
+        assert!(deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, 1);
         assert!(deck.pet_active());
         assert!(deck.touches.is_empty());
         deck.touch_motion(0, 100.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
         // The pet layer's Home button returns to the home bar.
-        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, deck.home);
         assert!(!deck.pet_active());
         assert!(deck
@@ -4078,7 +4470,10 @@ mod tests {
             pet_enabled: false,
             pet_variant: Default::default(),
             pet_energy: Default::default(),
+            global_day_cycle: DayCycle::default(),
             day_cycle: DayCycle::default(),
+            palette: Palette::default(),
+            themes: crate::themes::ThemeSet::default(),
         };
         let (width, height) = (2008, 60);
         let mut surface = ImageSurface::create(Format::ARgb32, height, width).unwrap();
@@ -4098,7 +4493,15 @@ mod tests {
             .current()
             .hit(width as u16, height as u16, (width / 2) as f64, 30.0, None)
             .unwrap();
-        assert!(deck.touch_down(0, button, 1004.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(deck.touch_down(
+            0,
+            button,
+            1004.0,
+            30.0,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None
+        ));
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -4115,7 +4518,15 @@ mod tests {
             .current()
             .hit(width as u16, height as u16, 100.0, 30.0, None)
             .unwrap();
-        assert!(deck.touch_down(1, button, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(deck.touch_down(
+            1,
+            button,
+            100.0,
+            30.0,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None
+        ));
         deck.current_mut().draw(
             &config,
             (width, height),
@@ -4332,19 +4743,19 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        assert!(!deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {}));
-        assert!(deck.touch_down(1, 1, 1004.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(!deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
+        assert!(deck.touch_down(1, 1, 1004.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, 1);
         assert!(deck.touches.is_empty());
         deck.touch_motion(0, 330.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
         deck.touch_motion(1, 1004.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(1, &mut emit);
-        assert!(deck.touch_down(2, 0, 330.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(2, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, deck.home);
-        assert!(deck.touch_down(3, 2, 1679.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(3, 2, 1679.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, 2);
-        assert!(deck.touch_down(4, 0, 330.0, 30.0, &mut emit, &mut |_| {}));
+        assert!(deck.touch_down(4, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None));
         assert_eq!(deck.active, deck.home);
         assert!(deck
             .layers
@@ -4365,14 +4776,14 @@ mod tests {
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("media", &mut emit);
-        deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         assert!(deck.fn_event(true, false, &mut emit));
         assert_eq!(deck.active, 1);
-        deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(1, 1, 1100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         assert!(deck.fn_event(false, false, &mut emit));
         assert_eq!(deck.active, 2);
         assert!(deck.fn_event(true, false, &mut emit));
-        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit, &mut |_| {})); // Home while Fn is held
+        assert!(deck.touch_down(2, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None)); // Home while Fn is held
         assert_eq!(deck.active, deck.home);
         assert!(!deck.fn_event(false, false, &mut emit));
         assert_eq!(deck.active, deck.home);
@@ -4408,7 +4819,7 @@ mod tests {
             );
             let mut events = Vec::new();
             let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-            deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {});
+            deck.touch_down(0, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
             assert!(deck.fn_event(true, false, &mut emit));
             assert_eq!(deck.active, 1 - home);
             assert!(deck.fn_event(false, false, &mut emit));
@@ -4432,7 +4843,7 @@ mod tests {
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.fn_event(true, false, &mut emit);
-        deck.touch_down(0, 1, 1004.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1004.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         let replacement = LayerDeck::new(
             vec![(
                 "new-home".into(),
@@ -4450,7 +4861,7 @@ mod tests {
         deck.touch_motion(0, 1004.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
         assert!(!deck.fn_event(false, false, &mut emit));
-        deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(1, 0, 100.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         deck.touch_up(1, &mut emit);
         assert_eq!(
             events,
@@ -4468,7 +4879,7 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         deck.touch_motion(0, 2000.0, 30.0, 2008, 60, &mut emit);
         deck.touch_motion(0, 330.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(0, &mut emit);
@@ -4486,8 +4897,8 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {});
-        deck.touch_down(1, 0, 330.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
+        deck.touch_down(1, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         deck.touch_motion(0, 2000.0, 30.0, 2008, 60, &mut emit);
         deck.touch_up(1, &mut emit);
         assert!(!deck.current().buttons[0].1.active);
@@ -4506,7 +4917,7 @@ mod tests {
         let mut deck = named_deck();
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
-        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 0, 330.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         assert!(!deck.switch_named("missing", &mut emit));
         assert_eq!(deck.active, deck.home);
         assert_eq!(deck.touches.len(), 1);
@@ -4678,7 +5089,16 @@ mod tests {
                     (0, Kind::Volume, 100),
                 ] {
                     let x = (spans[button].left + spans[button].right) / 2.0 + shift;
-                    deck.touch_down_at(0, x, 30.0, width as u16, 60, &mut emit, &mut |_| {});
+                    deck.touch_down_at(
+                        0,
+                        x,
+                        30.0,
+                        width as u16,
+                        60,
+                        &mut emit,
+                        &mut |_| {},
+                        &mut |_| None,
+                    );
                     assert_eq!(deck.slider.kind, kind);
                     assert_eq!(deck.slider.region, Some((0, 1)));
                     assert_eq!(deck.slider_region(width as u16).unwrap(), expected_region);
@@ -4741,9 +5161,27 @@ mod tests {
         let spans = deck.current().layout_spans(2008, 0);
         let center = |index: usize| (spans[index].left + spans[index].right) / 2.0;
         // Both buttons are still visible while the first read is pending.
-        deck.touch_down_at(0, center(0), 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            center(0),
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         let old = deck.slider.revision;
-        deck.touch_down_at(1, center(1), 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            1,
+            center(1),
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         let selected = deck.slider.revision;
         assert_eq!(deck.slider.kind, Kind::Brightness);
         deck.slider_reply(
@@ -4796,7 +5234,16 @@ mod tests {
         );
         assert!(deck.slider_render().is_none());
         deck.release_all(&mut |_, _| {});
-        deck.touch_down_at(2, center(0), 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            2,
+            center(0),
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         deck.slider_reply(
             selected,
             Kind::Brightness,
@@ -4816,15 +5263,42 @@ mod tests {
             let spans = deck.current().layout_spans(2008, 0);
             let button = usize::from(kind == Kind::Brightness);
             let x = (spans[button].left + spans[button].right) / 2.0;
-            deck.touch_down_at(0, x, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+            deck.touch_down_at(
+                0,
+                x,
+                30.0,
+                2008,
+                60,
+                &mut |_, _| {},
+                &mut |_| {},
+                &mut |_| None,
+            );
             let (mut volume, mut brightness) = (65, 93);
             apply_level_requests(&mut deck, &mut volume, &mut brightness);
             deck.touch_up(0, &mut |_, _| {});
             let gap = (spans[0].right + spans[1].left) / 2.0;
             assert!(deck.current().hit(2008, 60, gap, 30.0, None).is_none());
-            deck.touch_down_at(1, gap, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+            deck.touch_down_at(
+                1,
+                gap,
+                30.0,
+                2008,
+                60,
+                &mut |_, _| {},
+                &mut |_| {},
+                &mut |_| None,
+            );
             let queued = deck.slider.requests.len();
-            deck.touch_down_at(2, x, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+            deck.touch_down_at(
+                2,
+                x,
+                30.0,
+                2008,
+                60,
+                &mut |_, _| {},
+                &mut |_| {},
+                &mut |_| None,
+            );
             assert_eq!(deck.slider.requests.len(), queued);
             assert_eq!(deck.slider.kind, kind);
             assert_eq!(deck.slider.drag.as_ref().unwrap().slot, 1);
@@ -4838,6 +5312,7 @@ mod tests {
                 60,
                 &mut |keys, state| events.push((keys.to_vec(), state)),
                 &mut |_| {},
+                &mut |_| None,
             );
             deck.touch_up(3, &mut |keys, state| events.push((keys.to_vec(), state)));
             assert_eq!(
@@ -4859,7 +5334,16 @@ mod tests {
             let mut deck = slider_deck();
             let mut actual = initial;
             let mut emit = |_: &[Key], _: bool| panic!("slider emitted relative keys");
-            deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+            deck.touch_down_at(
+                0,
+                1260.0,
+                30.0,
+                2008,
+                60,
+                &mut emit,
+                &mut |_| {},
+                &mut |_| None,
+            );
             apply_mixer_requests(&mut deck, &mut actual);
             deck.touch_motion(0, 0.0, 30.0, 2008, 60, &mut emit);
             apply_mixer_requests(&mut deck, &mut actual);
@@ -4868,7 +5352,9 @@ mod tests {
             assert_eq!(actual, 0, "left endpoint left audible volume");
             // A mixer change outside the bar must not defeat a repeated zero.
             actual = 100;
-            deck.touch_down_at(1, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+            deck.touch_down_at(1, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {}, &mut |_| {
+                None
+            });
             apply_mixer_requests(&mut deck, &mut actual);
             deck.touch_up(1, &mut emit);
             assert_eq!(actual, 0);
@@ -4906,7 +5392,16 @@ mod tests {
             let x = (spans[index].left + spans[index].right) / 2.0;
             let mut actual = 100;
             let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
-            deck.touch_down_at(0, x, 30.0, width as u16, 60, &mut emit, &mut |_| {});
+            deck.touch_down_at(
+                0,
+                x,
+                30.0,
+                width as u16,
+                60,
+                &mut emit,
+                &mut |_| {},
+                &mut |_| None,
+            );
             assert_eq!(deck.slider.requests.last().unwrap().2, LevelRequest::Get);
             apply_mixer_requests(&mut deck, &mut actual);
             assert_eq!(actual, 100);
@@ -4933,15 +5428,35 @@ mod tests {
         let mut deck = slider_deck();
         let mut actual = 100;
         let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         deck.touch_up(0, &mut emit);
         apply_mixer_requests(&mut deck, &mut actual);
         assert_eq!(deck.current().hit(2008, 60, 751.0, 30.0, None), Some(1));
-        deck.touch_down_at(1, 751.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(
+            1,
+            751.0,
+            30.0,
+            2008,
+            60,
+            &mut emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         apply_mixer_requests(&mut deck, &mut actual);
         assert_eq!(actual, Kind::Volume.level_at(751.0, 30.0, 1500.0));
         deck.touch_up(1, &mut emit);
-        deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(2, 10.0, 30.0, 2008, 60, &mut emit, &mut |_| {}, &mut |_| {
+            None
+        });
         apply_mixer_requests(&mut deck, &mut actual);
         deck.touch_up(2, &mut emit);
         assert_eq!(actual, 0);
@@ -4951,7 +5466,16 @@ mod tests {
     #[test]
     fn old_readbacks_and_failed_writes_cannot_display_a_false_success() {
         let mut deck = slider_deck();
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         assert!(deck.slider_render().is_none()); // no guessed zero while reading
         let old = deck.slider.revision;
         deck.slider_reply(
@@ -4995,7 +5519,16 @@ mod tests {
     #[test]
     fn confirmed_drag_progress_renders_while_a_newer_target_is_pending() {
         let mut deck = slider_deck();
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         let opening = deck.slider.revision;
         deck.slider_set_level(10, &mut |_, _| {});
         let first = deck.slider.revision;
@@ -5037,7 +5570,16 @@ mod tests {
         );
         assert_eq!(deck.slider_render().unwrap().level, 20);
         deck.slider_collapse();
-        deck.touch_down_at(1, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            1,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         deck.slider_reply(
             latest,
             Kind::Volume,
@@ -5061,6 +5603,7 @@ mod tests {
                 60,
                 &mut |_, _| panic!("volume button emitted keys"),
                 &mut |_| {},
+                &mut |_| None,
             );
             deck.touch_up(slot, &mut |_, _| {});
         }
@@ -5094,6 +5637,7 @@ mod tests {
                     60,
                     &mut |_, _| {},
                     &mut |_| {},
+                    &mut |_| None,
                 );
                 let mut actual = 100;
                 apply_mixer_requests(&mut deck, &mut actual);
@@ -5119,7 +5663,9 @@ mod tests {
     #[test]
     fn the_slider_collapses_after_a_lull_and_interaction_resets_the_timer() {
         let mut deck = slider_deck();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         let deadline = deck.slider.deadline.unwrap();
 
@@ -5131,7 +5677,9 @@ mod tests {
             .is_some());
 
         // A fresh press restarts the clock.
-        deck.touch_down(1, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(1, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(1, &mut |_, _| {});
         assert!(deck.slider.deadline.unwrap() > deadline);
 
@@ -5152,7 +5700,9 @@ mod tests {
         let mut deck = slider_deck();
         // The summoning press stays held: the slider must not collapse
         // under the finger even past the deadline.
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         let deadline = deck.slider.deadline.unwrap();
         assert!(!deck.slider_refresh(deadline + Duration::from_secs(10)));
         assert!(deck.slider.active);
@@ -5162,7 +5712,9 @@ mod tests {
             None
         );
         // A still-held second-finger press on the cluster holds it too.
-        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(1, 0, 200.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         assert!(!deck.slider_refresh(deadline + Duration::from_secs(20)));
         assert!(deck.slider.active);
@@ -5196,7 +5748,10 @@ mod tests {
             pet_enabled: false,
             pet_variant: Default::default(),
             pet_energy: Default::default(),
+            global_day_cycle: DayCycle::default(),
             day_cycle: DayCycle::default(),
+            palette: Palette::default(),
+            themes: crate::themes::ThemeSet::default(),
         }
     }
 
@@ -5221,7 +5776,9 @@ mod tests {
         let home_image = surface.data().unwrap().to_vec();
 
         // Pressing a volume control summons the slider over the whole cluster.
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.slider_render();
@@ -5315,7 +5872,9 @@ mod tests {
 
         // The cluster spans the whole bar, so the slider's edges touch the
         // framebuffer borders; its dirty clips must still fit inside them.
-        deck.touch_down(0, 2, 1800.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 2, 1800.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         apply_mixer_requests(&mut deck, &mut 65);
         let volume = deck.slider_render().unwrap();
@@ -5398,7 +5957,9 @@ mod tests {
         let home_image = surface.data().unwrap().to_vec();
 
         // Summon on the first cluster: its span is drawn over.
-        deck.touch_down(0, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         assert_eq!(deck.slider.region, Some((0, 2)));
         apply_mixer_requests(&mut deck, &mut 65);
@@ -5414,7 +5975,9 @@ mod tests {
         );
 
         // Pressing the second, separated cluster moves the slider there.
-        deck.touch_down(1, 4, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(1, 4, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(1, &mut |_, _| {});
         assert_eq!(deck.slider.region, Some((4, 5)));
         apply_mixer_requests(&mut deck, &mut 65);
@@ -5446,30 +6009,44 @@ mod tests {
     #[test]
     fn layer_changes_end_the_slider_and_legacy_keys_still_emit_keys() {
         let mut deck = slider_deck();
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         assert!(deck.slider.active);
 
         // Navigating away collapses it...
-        assert!(deck.touch_down(1, 3, 1750.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(
+            deck.touch_down(1, 3, 1750.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            })
+        );
         assert_eq!(deck.active, 1);
         assert!(!deck.slider.active);
 
         // ...and volume buttons on other layers never summon it.
-        deck.touch_down(2, 1, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(2, 1, 1500.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(2, &mut |_, _| {});
         assert!(!deck.slider.active);
         assert!(!deck.slider_drag_start(3, 700.0, 30.0, 2008, 60, &mut |_, _| {}));
 
         // Back home it summons again; a reload replaces it with a fresh deck.
-        assert!(deck.touch_down(4, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}));
+        assert!(
+            deck.touch_down(4, 0, 100.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+                None
+            })
+        );
         assert_eq!(deck.active, deck.home);
         deck.replace(slider_deck(), &mut |_, _| {});
         assert!(!deck.slider.active);
 
         // Summoning once more, input release (cancel, display sleep, device
         // removal) collapses it and drops any drag.
-        deck.touch_down(5, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(5, 2, 1260.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_motion(5, 1280.0, 30.0, 2008, 60, &mut |_, _| {});
         assert!(deck.slider.drag.is_some());
         deck.release_all(&mut |_, _| {});
@@ -5481,7 +6058,7 @@ mod tests {
     fn a_cancelled_drag_leaves_every_key_released() {
         let mut deck = slider_deck();
         let mut emit = |_: &[Key], _: bool| panic!("volume route emitted keys");
-        deck.touch_down(0, 2, 1260.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 2, 1260.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         deck.touch_motion(0, 1300.0, 30.0, 2008, 60, &mut emit);
         deck.release_all(&mut emit);
         assert!(deck.slider.drag.is_none());
@@ -5519,7 +6096,16 @@ mod tests {
         assert_eq!(deck.active, deck.home);
 
         // Summon the slider on the media home bar.
-        assert!(!deck.touch_down_at(0, 1400.0, 30.0, 2008, 60, &mut emit, &mut |_| {}));
+        assert!(!deck.touch_down_at(
+            0,
+            1400.0,
+            30.0,
+            2008,
+            60,
+            &mut emit,
+            &mut |_| {},
+            &mut |_| None
+        ));
         deck.touch_up(0, &mut emit);
         assert!(deck.slider.active);
         assert_eq!(deck.slider.region, Some((0, 2)));
@@ -5543,7 +6129,9 @@ mod tests {
     #[test]
     fn decks_without_a_slider_control_never_summon_a_slider() {
         let mut deck = named_deck();
-        deck.touch_down(0, 0, 330.0, 30.0, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down(0, 0, 330.0, 30.0, &mut |_, _| {}, &mut |_| {}, &mut |_| {
+            None
+        });
         deck.touch_up(0, &mut |_, _| {});
         assert!(!deck.slider.active);
         assert!(!deck.slider_drag_start(1, 500.0, 30.0, 2008, 60, &mut |_, _| {}));
@@ -5615,7 +6203,16 @@ mod tests {
         // A probe is outstanding when the user summons the slider.
         let (probe, _) = deck.mute_probe(Instant::now()).unwrap();
         let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         assert!(deck.slider.active);
         let pending = deck.slider.requests.len();
         let revision_before = deck.slider.revision;
@@ -5641,7 +6238,16 @@ mod tests {
     fn collapsing_the_slider_hands_the_canvas_back_to_the_mute_mark() {
         let mut deck = slider_deck();
         let mut actual = 100;
-        deck.touch_down_at(0, 1260.0, 30.0, 2008, 60, &mut |_, _| {}, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            2008,
+            60,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_| None,
+        );
         apply_mixer_requests(&mut deck, &mut actual);
         assert!(deck.slider_render().is_some());
         // While the slider is drawn, the mark's watch stays paused.
@@ -5703,7 +6309,16 @@ mod tests {
         // look at the same level, distinct from the unmuted draw. A fresh
         // open queues a fresh read; a replayed revision is stale.
         let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
-        deck.touch_down_at(0, 1260.0, 30.0, width as u16, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            1260.0,
+            30.0,
+            width as u16,
+            60,
+            &mut emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         for (revision, kind, request) in std::mem::take(&mut deck.slider.requests) {
             assert_eq!(kind, Kind::Volume);
             assert_eq!(request, LevelRequest::Get);
@@ -5727,7 +6342,7 @@ mod tests {
             background,
         );
         let open_unmuted = surface.data().unwrap().to_vec();
-        deck.touch_down(0, 1, 1260.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1260.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         deck.touch_up(0, &mut emit);
         for (revision, kind, request) in std::mem::take(&mut deck.slider.requests) {
             assert_eq!(kind, Kind::Volume);

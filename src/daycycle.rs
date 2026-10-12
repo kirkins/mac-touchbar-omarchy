@@ -42,6 +42,7 @@ impl TimeBand {
 }
 
 /// The configured set of bands, ordered by start hour.
+#[derive(Clone)]
 pub struct DayCycle {
     pub enabled: bool,
     bands: Vec<TimeBand>,

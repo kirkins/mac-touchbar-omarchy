@@ -1,6 +1,6 @@
 //! One transient level control: ranges/adapters vary; drawing and interaction do not.
 use crate::{
-    appearance::ButtonAccent,
+    appearance::{ButtonAccent, Palette},
     config::ButtonAction,
     level_control::{Request, State, MAX_VOLUME_PERCENT},
     rounded_rect, BUTTON_COLOR_ACTIVE, BUTTON_COLOR_INACTIVE, BUTTON_SPACING_PX,
@@ -243,7 +243,14 @@ impl Geometry {
         self.right - 2.0
     }
 
-    pub fn draw(&self, c: &Context, height: f64, pixel_shift_y: f64, render: Render) {
+    pub fn draw(
+        &self,
+        c: &Context,
+        height: f64,
+        pixel_shift_y: f64,
+        render: Render,
+        palette: &Palette,
+    ) {
         // The track and fill replace the cluster, macOS-style: a slim
         // rounded bar across the region with a fill up to the level,
         // anchored left by the selected control's glyph.
@@ -277,7 +284,7 @@ impl Geometry {
                     BUTTON_COLOR_ACTIVE,
                 );
             } else {
-                render.kind.accent().foreground(c);
+                render.kind.accent().foreground(c, palette);
             }
             rounded_rect(
                 c,

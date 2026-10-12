@@ -45,7 +45,7 @@
 //! helper's own idle watchdog), so no monitor stream outlives its
 //! consumer. See `integrations/viz/README.md`.
 
-use crate::appearance::ButtonAccent;
+use crate::appearance::{ButtonAccent, Palette};
 use cairo::{Context, LineCap, LineJoin};
 use std::{
     collections::VecDeque,
@@ -488,6 +488,9 @@ pub struct WaveformWidget {
     mode: Mode,
     /// Live color of the recording dot, from the button's accent.
     live_rgb: (f64, f64, f64),
+    /// The accent the live dot color came from, kept so a palette swap
+    /// (a theme apply) can retint without rebuilding the deck.
+    accent: Option<ButtonAccent>,
     history: LevelHistory,
     started: Option<Instant>,
     live: bool,
@@ -520,6 +523,7 @@ impl WaveformWidget {
             style,
             mode: Mode::Mic,
             live_rgb: ButtonAccent::Blue.rgb(),
+            accent: None,
             history: LevelHistory::new(),
             started: None,
             live: false,
@@ -550,6 +554,12 @@ impl WaveformWidget {
     /// than the recording layer's microphone meter.
     pub fn is_music(&self) -> bool {
         self.mode == Mode::Music
+    }
+
+    /// The live dot's current color, for tests proving palette retints.
+    #[cfg(test)]
+    pub fn live_dot_rgb(&self) -> (f64, f64, f64) {
+        self.live_rgb
     }
 
     /// Take the render-side motion knobs from the button's config.
@@ -736,8 +746,16 @@ impl WaveformWidget {
     /// Take the live dot color from the button's accent, defaulting to
     /// the shipped blue when the button carries no explicit accent.
     pub fn with_accent(mut self, accent: Option<ButtonAccent>) -> Self {
+        self.accent = accent;
         self.live_rgb = accent.unwrap_or(ButtonAccent::Blue).rgb();
         self
+    }
+
+    /// Re-resolve the live dot color against a new palette, keeping the
+    /// button's own accent choice. The one accent color resolved per
+    /// build instead of per draw, so theme applies stay live.
+    pub fn retint(&mut self, palette: &Palette) {
+        self.live_rgb = palette.accent(self.accent.unwrap_or(ButtonAccent::Blue));
     }
 
     /// Draw the widget. `c` carries the layer's rotation; the caller clips

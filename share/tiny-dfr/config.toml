@@ -102,6 +102,58 @@ DayCycleEnabled = true
 # StartHour = 21
 # Color = "#04060D"
 
+# The named color themes the bar can wear. With this enabled (the
+# default) the quick-keys "more" bar gains two buttons: a compact Theme
+# button that applies the next theme on each tap (briefly showing which
+# one applied), and a Themes button that opens the picker - a bar-sized
+# takeover listing every theme's name; tapping one applies it and
+# returns home. Applying is live: the accent palette and the background
+# bands repaint on the spot, with no service restart, and the choice is
+# remembered in /var/lib/tiny-dfr/active-theme across restarts.
+ThemesEnabled = true
+# Pin the startup theme here if you want the config file (not the last
+# on-glass tap) to decide; an unknown name rejects the candidate
+# configuration like other invalid knobs. Unset, the remembered choice
+# applies, falling back to the first theme.
+# ActiveTheme = "Midnight"
+# Define or override themes with [Themes.Name] tables. A theme presets
+# the colors behind the accent names every button already uses, and
+# optionally its own time-of-day background bands; anything a theme
+# leaves out is inherited (a user theme shadowing a built-in inherits
+# that built-in's unspecified knobs too). The daemon seeds eight
+# built-ins - Default (the live palette exactly as shipped), Midnight,
+# Nord, Ember, Rosewater, Forest, Solarized, and Mono - and this table
+# adds to or overrides them by name:
+# [Themes.Mine.Accents]
+# neutral = "#9AA0A6"
+# cyan = "#40E0D0"
+# amber = "#FFB347"
+# blue = "#5C99FF"
+# violet = "#AB87FF"
+# orange = "#FF8521"
+# red = "#FF526B"
+# green = "#45E191"
+# [[Themes.Mine.DayCycleBands]]
+# Name = "morning"
+# StartHour = 5
+# Color = "#16100C"
+# [[Themes.Mine.DayCycleBands]]
+# Name = "day"
+# StartHour = 12
+# Color = "#1A1B1E"
+# [[Themes.Mine.DayCycleBands]]
+# Name = "evening"
+# StartHour = 17
+# Color = "#170D07"
+# [[Themes.Mine.DayCycleBands]]
+# Name = "night"
+# StartHour = 21
+# Color = "#04060D"
+# Invalid accent names, colors, or bands reject the candidate
+# configuration on reload, keeping the current one, exactly like the
+# global knobs. Alarm colors that must never follow a theme - the
+# waveform's dead-feed red - keep their shipped values.
+
 # This key defines the contents of the primary layer
 # (the one with F{number} keys)
 # You can change the individual buttons, add, or remove them

@@ -1,0 +1,226 @@
+# The dfr-deck's seeded color themes, in cycle and picker order.
+# This file is embedded in the daemon as the built-in theme set; it is
+# not installed or read at runtime. Owners add or override themes in
+# /etc/tiny-dfr/config.toml with the same shape:
+#
+#   [Themes.Mine]
+#   [Themes.Mine.Accents]
+#   Cyan = "#30D4F2"
+#   [[Themes.Mine.DayCycleBands]]
+#   Name = "day"
+#   StartHour = 12
+#   Color = "#1A1B1E"
+#
+# Every accent keeps enough brightness for white labels and dark fills,
+# and the semantic families (cyan audio, amber brightness, violet
+# navigation, warning orange, critical red, charging green) stay
+# pairwise distinct so the deck's color language survives every preset.
+
+# The live palette exactly as the deck has always rendered it: no
+# overrides, the shipped accents and the configured day cycle.
+[[Theme]]
+Name = "Default"
+
+# Deep cool blues: icy accents over a blue-black strip.
+[[Theme]]
+Name = "Midnight"
+[Theme.Accents]
+neutral = "#8FA3C8"
+cyan = "#62D0F5"
+amber = "#FFC46B"
+blue = "#8CACFF"
+violet = "#9D8CFF"
+orange = "#FF9A57"
+red = "#FF647E"
+green = "#5FE3A8"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#0A1018"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#0D1522"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#101A2E"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#050810"
+
+# The Nord palette: frost accents over a slate-blue strip.
+[[Theme]]
+Name = "Nord"
+[Theme.Accents]
+neutral = "#8C99B2"
+cyan = "#88C0D0"
+amber = "#EBCB8B"
+blue = "#81A1C1"
+violet = "#B48EAD"
+orange = "#D08770"
+red = "#BC4A50"
+green = "#A3BE8C"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#2E3440"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#3B4252"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#434C5E"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#242933"
+
+# A warm hearth: honeyed accents over an ember-brown strip.
+[[Theme]]
+Name = "Ember"
+[Theme.Accents]
+neutral = "#B3A093"
+cyan = "#7FD1C0"
+amber = "#FFB347"
+blue = "#6FA8DC"
+violet = "#C49AEC"
+orange = "#FF8C42"
+red = "#E85060"
+green = "#9CD08F"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#1F1410"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#241A14"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#2A1408"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#120A06"
+
+# Rose and mint accents over a plum strip.
+[[Theme]]
+Name = "Rosewater"
+[Theme.Accents]
+neutral = "#BBA4B0"
+cyan = "#9FE0D2"
+amber = "#FFC69E"
+blue = "#A6C8F0"
+violet = "#C9A0E8"
+orange = "#FFA26B"
+red = "#FA6D95"
+green = "#A8E6B8"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#201318"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#26161E"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#2E1220"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#140A10"
+
+# Woodland greens and honeys over a moss-dark strip.
+[[Theme]]
+Name = "Forest"
+[Theme.Accents]
+neutral = "#9BAF9B"
+cyan = "#7FD4C0"
+amber = "#E8C46B"
+blue = "#7FB8D8"
+violet = "#B09AE0"
+orange = "#E89050"
+red = "#D64A55"
+green = "#8CD867"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#101A0E"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#16241A"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#1A1A08"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#08100A"
+
+# The Solarized accents over the Solarized dark strip.
+[[Theme]]
+Name = "Solarized"
+[Theme.Accents]
+neutral = "#93A1A1"
+cyan = "#2AA198"
+amber = "#DCB35C"
+blue = "#5CA6E0"
+violet = "#9BA0E8"
+orange = "#F0703A"
+red = "#D42A52"
+green = "#A8C838"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#073642"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#002B36"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#0A2E33"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#001E26"
+
+# Grayscale minimalism: one brightness ladder for the whole deck,
+# escalations at the brightest end.
+[[Theme]]
+Name = "Mono"
+[Theme.Accents]
+neutral = "#9AA0A6"
+cyan = "#AEB4BA"
+amber = "#C6CCD2"
+blue = "#989EA4"
+violet = "#BEC4CA"
+orange = "#D8DEE4"
+red = "#F2F6FA"
+green = "#CCD4DB"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#131416"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#17181A"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#141517"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#0B0C0D"

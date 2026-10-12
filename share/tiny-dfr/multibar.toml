@@ -143,6 +143,11 @@ Name = "more"
 Keys = [
     { Text = "Home", Action = { Layer = "home" } },
     { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
+    # Lock: emits the compositor's lock bind - Omarchy's default
+    # SUPER+CTRL+L (omarchy-system-lock) - as a pure key chord, so it
+    # works inside the daemon's unprivileged sandbox with no shell and
+    # no desktop helper. No Layer switch: the bar stays put.
+    { Text = "Lock", Accent = "amber", Action = ["LeftMeta", "LeftCtrl", "L"] },
 ]
 
 # To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,
@@ -156,3 +161,8 @@ Keys = [
 # the daemon user; failures are logged to the journal. With PetEnabled (see
 # config.toml) the home bar also gains a Pet button opening the daemon's own
 # pet layer, unless a layer named "pet" is defined here.
+# With ThemesEnabled (see config.toml) this more bar also gains a Theme
+# cycle button and a Themes opener to the daemon's own theme picker layer,
+# unless it carries visible equivalents; a [Themes.Name] table there adds
+# or overrides a named color theme (accents and day-cycle bands), and the
+# active theme is remembered across restarts.

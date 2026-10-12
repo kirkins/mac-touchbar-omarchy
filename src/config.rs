@@ -2,6 +2,7 @@ use crate::appearance::ButtonAccent;
 use crate::daycycle::{self, DayCycle, TimeBand};
 use crate::fonts::{FontConfig, Pattern};
 use crate::pet::{PetEnergy, PetVariant};
+use crate::themes::{ThemeConfig, ThemeSet, THEMES_LAYER};
 use crate::{FunctionLayer, LayerDeck};
 use anyhow::{anyhow, bail, Context, Result};
 use cairo::FontFace;
@@ -13,14 +14,18 @@ use nix::{
 };
 use serde::{Deserialize, Deserializer};
 use std::{
-    collections::HashSet,
-    fs::read_to_string,
+    collections::{BTreeMap, HashSet},
+    fs::{self, read_to_string},
     os::fd::AsFd,
     path::{Path, PathBuf},
 };
 
 const USER_CFG_PATH: &str = "/etc/tiny-dfr/config.toml";
 const BASE_CFG_PATH: &str = "/usr/share/tiny-dfr/config.toml";
+/// Where the daemon remembers the theme chosen on the glass. The
+/// directory is prepared by the service install (see the README); the
+/// daemon itself only reads and atomically rewrites this one file.
+const THEME_STATE_PATH: &str = "/var/lib/tiny-dfr/active-theme";
 
 /// Name of the pet's own layer. When the pet is enabled, a layer with this
 /// name is synthesized if the configuration does not define one, and the
@@ -46,7 +51,15 @@ pub struct Config {
     pub pet_enabled: bool,
     pub pet_variant: PetVariant,
     pub pet_energy: PetEnergy,
+    /// The global (theme-free) day cycle as configured; the active
+    /// theme's bands, if any, are applied on top for `day_cycle`, and
+    /// re-applying a theme at runtime rebuilds from this copy.
+    pub global_day_cycle: DayCycle,
     pub day_cycle: DayCycle,
+    /// The accent palette the bar renders with, resolved from the
+    /// active theme (or the shipped live palette with none).
+    pub palette: crate::appearance::Palette,
+    pub themes: ThemeSet,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +83,9 @@ struct ConfigProxy {
     pet_energy: Option<String>,
     day_cycle_enabled: Option<bool>,
     day_cycle_bands: Option<Vec<BandConfig>>,
+    themes_enabled: Option<bool>,
+    active_theme: Option<String>,
+    themes: Option<BTreeMap<String, ThemeConfig>>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
     layers: Option<Vec<LayerConfig>>,
@@ -93,6 +109,16 @@ pub enum ButtonAction {
         command: String,
         layer: String,
     },
+    /// Applies the named color theme on touch-down and stays on the bar.
+    ApplyTheme(String),
+    /// Applies the named color theme and switches to the named layer in
+    /// one press - the picker's per-theme buttons return home this way.
+    ApplyThemeLayer {
+        theme: String,
+        layer: String,
+    },
+    /// Applies the next theme in the cycle, wrapping.
+    CycleTheme,
 }
 
 impl ButtonAction {
@@ -100,6 +126,7 @@ impl ButtonAction {
     pub fn layer_target(&self) -> Option<&str> {
         match self {
             Self::SwitchLayer(layer) | Self::CommandLayer { layer, .. } => Some(layer),
+            Self::ApplyThemeLayer { layer, .. } => Some(layer),
             _ => None,
         }
     }
@@ -123,37 +150,50 @@ impl<'de> Deserialize<'de> for ButtonAction {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Action {
-            Slider(SliderAction),
+            Unit(UnitAction),
             Key(Key),
             Keys(Vec<Key>),
             Table(TableAction),
         }
         #[derive(Deserialize)]
-        enum SliderAction {
+        enum UnitAction {
             VolumeSlider,
             BrightnessSlider,
+            CycleTheme,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase", deny_unknown_fields)]
         struct TableAction {
             layer: Option<String>,
             command: Option<String>,
+            theme: Option<String>,
         }
         Ok(match Action::deserialize(deserializer)? {
-            Action::Slider(SliderAction::VolumeSlider) => Self::VolumeSlider,
-            Action::Slider(SliderAction::BrightnessSlider) => Self::BrightnessSlider,
+            Action::Unit(UnitAction::VolumeSlider) => Self::VolumeSlider,
+            Action::Unit(UnitAction::BrightnessSlider) => Self::BrightnessSlider,
+            Action::Unit(UnitAction::CycleTheme) => Self::CycleTheme,
             Action::Key(key) => Self::Keys(vec![key]),
             Action::Keys(keys) => Self::Keys(keys),
-            Action::Table(action) => match (action.layer, action.command) {
-                (Some(layer), None) => Self::SwitchLayer(layer),
-                (None, Some(command)) => Self::Command(command),
-                (Some(layer), Some(command)) => Self::CommandLayer { command, layer },
-                (None, None) => {
-                    return Err(serde::de::Error::custom(
-                        "an Action table needs Layer or Command",
-                    ))
+            Action::Table(action) => {
+                let theme = action.theme.filter(|theme| !theme.trim().is_empty());
+                match (action.layer, action.command, theme) {
+                    (Some(layer), None, None) => Self::SwitchLayer(layer),
+                    (None, Some(command), None) => Self::Command(command),
+                    (Some(layer), Some(command), None) => Self::CommandLayer { command, layer },
+                    (None, None, Some(theme)) => Self::ApplyTheme(theme),
+                    (Some(layer), None, Some(theme)) => Self::ApplyThemeLayer { theme, layer },
+                    (_, Some(_), Some(_)) => {
+                        return Err(serde::de::Error::custom(
+                            "an Action table cannot combine Command with Theme",
+                        ))
+                    }
+                    (None, None, None) => {
+                        return Err(serde::de::Error::custom(
+                            "an Action table needs Layer, Command, or Theme",
+                        ))
+                    }
                 }
-            },
+            }
         })
     }
 }
@@ -194,12 +234,45 @@ pub struct LayerConfig {
 
 /// One `[[DayCycleBands]]` entry: the background color for the local
 /// hours from `StartHour` until the next band begins.
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct BandConfig {
     pub name: String,
     pub start_hour: u8,
     pub color: String,
+}
+
+/// Validate and resolve a band list, shared by the global day cycle and
+/// each theme's bands. Band names must be nonempty and unique, hours
+/// 0-23 and unique, and colors six-hex-digit literals.
+pub fn parse_bands(bands: &[BandConfig]) -> Result<Vec<TimeBand>> {
+    if bands.is_empty() {
+        bail!("DayCycleBands must define at least one band");
+    }
+    let mut names = HashSet::new();
+    let mut hours = HashSet::new();
+    let mut parsed = Vec::with_capacity(bands.len());
+    for band in bands {
+        if band.name.trim().is_empty() || !names.insert(band.name.clone()) {
+            bail!("band names must be nonempty and unique: {:?}", band.name);
+        }
+        if band.start_hour > 23 {
+            bail!("band {:?} StartHour must be 0-23", band.name);
+        }
+        if !hours.insert(band.start_hour) {
+            bail!(
+                "band {:?} repeats the StartHour of an earlier band",
+                band.name
+            );
+        }
+        parsed.push(TimeBand {
+            name: band.name.clone(),
+            start_hour: band.start_hour,
+            color: daycycle::parse_hex_color(&band.color)
+                .with_context(|| format!("band {:?} Color", band.name))?,
+        });
+    }
+    Ok(parsed)
 }
 
 pub struct LayerLayout {
@@ -233,6 +306,9 @@ impl ConfigProxy {
             pet_energy,
             day_cycle_enabled,
             day_cycle_bands,
+            themes_enabled,
+            active_theme,
+            themes,
             primary_layer_keys,
             media_layer_keys,
             layers,
@@ -247,40 +323,12 @@ impl ConfigProxy {
         let enabled = self.day_cycle_enabled.unwrap_or(true);
         let bands = match &self.day_cycle_bands {
             None => DayCycle::default_bands(),
-            Some(bands) if bands.is_empty() => {
-                bail!("DayCycleBands must define at least one band")
-            }
-            Some(bands) => {
-                let mut names = HashSet::new();
-                let mut hours = HashSet::new();
-                let mut parsed = Vec::with_capacity(bands.len());
-                for band in bands {
-                    if band.name.trim().is_empty() || !names.insert(band.name.clone()) {
-                        bail!("band names must be nonempty and unique: {:?}", band.name);
-                    }
-                    if band.start_hour > 23 {
-                        bail!("band {:?} StartHour must be 0-23", band.name);
-                    }
-                    if !hours.insert(band.start_hour) {
-                        bail!(
-                            "band {:?} repeats the StartHour of an earlier band",
-                            band.name
-                        );
-                    }
-                    parsed.push(TimeBand {
-                        name: band.name.clone(),
-                        start_hour: band.start_hour,
-                        color: daycycle::parse_hex_color(&band.color)
-                            .with_context(|| format!("band {:?} Color", band.name))?,
-                    });
-                }
-                parsed
-            }
+            Some(bands) => parse_bands(bands)?,
         };
         Ok(DayCycle::new(enabled, bands))
     }
 
-    fn layer_layout(&mut self, width: u16) -> Result<LayerLayout> {
+    fn layer_layout(&mut self, width: u16, themes: &ThemeSet) -> Result<LayerLayout> {
         let legacy = self.layers.is_none();
         let mut layers = if let Some(layers) = self.layers.take() {
             layers
@@ -387,6 +435,65 @@ impl ConfigProxy {
                 );
             }
         }
+        // The theme picker takes over its own layer - the full-bar surface
+        // the captain described - listing every theme name as a button that
+        // applies it and returns home. A user-defined layer named "themes"
+        // replaces the synthesized picker, and the quick-keys "more" bar
+        // carries the two compact activation surfaces: a Theme button that
+        // cycles to the next theme in place, and a Themes button opening
+        // the picker. Configs without a "more" bar stay untouched; their
+        // authors reach the picker by naming the layer in their own button.
+        if themes.enabled {
+            if names.insert(THEMES_LAYER.to_owned()) {
+                let mut keys = vec![ButtonConfig {
+                    text: Some("Home".into()),
+                    action: ButtonAction::SwitchLayer(home_name.to_owned()),
+                    ..ButtonConfig::default()
+                }];
+                keys.extend(themes.names.iter().map(|name| ButtonConfig {
+                    text: Some(name.clone()),
+                    action: ButtonAction::ApplyThemeLayer {
+                        theme: name.clone(),
+                        layer: home_name.to_owned(),
+                    },
+                    ..ButtonConfig::default()
+                }));
+                layers.push(LayerConfig {
+                    name: THEMES_LAYER.into(),
+                    keys,
+                });
+            }
+            let visible = |button: &ButtonConfig| {
+                button.text.as_deref().map_or(
+                    button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
+                    |text| !text.trim().is_empty(),
+                )
+            };
+            let more = layers.iter().position(|layer| layer.name == "more");
+            if let Some(more) = more {
+                let more_layer = &mut layers[more];
+                let has_cycle = more_layer.keys.iter().any(|button| {
+                    matches!(button.action, ButtonAction::CycleTheme) && visible(button)
+                });
+                let has_picker = more_layer.keys.iter().any(|button| {
+                    button.action.layer_target() == Some(THEMES_LAYER) && visible(button)
+                });
+                if !has_cycle {
+                    more_layer.keys.push(ButtonConfig {
+                        text: Some("Theme".into()),
+                        action: ButtonAction::CycleTheme,
+                        ..ButtonConfig::default()
+                    });
+                }
+                if !has_picker {
+                    more_layer.keys.push(ButtonConfig {
+                        text: Some("Themes".into()),
+                        action: ButtonAction::SwitchLayer(THEMES_LAYER.into()),
+                        ..ButtonConfig::default()
+                    });
+                }
+            }
+        }
         for layer in &layers {
             for button in &layer.keys {
                 if let Some(target) = button.action.layer_target() {
@@ -485,7 +592,16 @@ fn parse_config(base: &str, user: Option<&str>, width: u16) -> Result<(ConfigPro
         .transpose()
         .map_err(|err| anyhow!(err))?;
     base.day_cycle()?;
-    let layers = base.layer_layout(width)?;
+    let themes = ThemeSet::resolve(base.themes_enabled.unwrap_or(true), base.themes.clone())?;
+    if let Some(active) = base.active_theme.as_deref() {
+        if active.trim().is_empty() {
+            bail!("ActiveTheme must not be empty");
+        }
+        if !themes.contains(active) {
+            bail!("ActiveTheme {active:?} is not a defined theme");
+        }
+    }
+    let layers = base.layer_layout(width, &themes)?;
     Ok((base, layers))
 }
 
@@ -508,6 +624,7 @@ fn load_config(
     width: u16,
     base_path: &Path,
     user_path: Option<&Path>,
+    state_path: Option<&Path>,
 ) -> Result<(Config, LayerDeck)> {
     let user = user_path.map(read_to_string).transpose();
     let user = match user {
@@ -516,7 +633,36 @@ fn load_config(
         Err(err) => return Err(err.into()),
     };
     let (base, layout) = parse_config(&read_to_string(base_path)?, user.as_deref(), width)?;
-    let day_cycle = base.day_cycle()?;
+    let global_day_cycle = base.day_cycle()?;
+    // Resolve the active theme: a config `ActiveTheme` pins the choice,
+    // and with no pin the state file's last on-glass choice decides. A
+    // state entry that no longer names a theme (the theme was removed
+    // or renamed) falls back to the first theme and the file heals to
+    // match, so a stale file can never wedge the bar.
+    let mut themes = ThemeSet::resolve(base.themes_enabled.unwrap_or(true), base.themes.clone())?;
+    themes.active = base.active_theme.clone().filter(|_| themes.enabled);
+    if themes.enabled && themes.active.is_none() {
+        match state_path.and_then(read_persisted_theme) {
+            Some(name) if themes.contains(&name) => themes.active = Some(name),
+            Some(stale) => {
+                eprintln!(
+                    "persisted theme {stale:?} is no longer defined; using {:?}",
+                    themes.names.first()
+                );
+                themes.active = themes.names.first().cloned();
+            }
+            None => {}
+        }
+    }
+    if themes.enabled && themes.active.is_none() {
+        themes.active = themes.names.first().cloned();
+    }
+    if themes.enabled {
+        if let Some(active) = &themes.active {
+            persist_active_theme(state_path, active);
+        }
+    }
+    let palette = themes.palette();
     let pet_enabled = base.pet_enabled.unwrap_or(true);
     let pet_layer = pet_enabled
         .then(|| {
@@ -537,6 +683,12 @@ fn load_config(
         pet_layer,
         layout.legacy,
     );
+    // Buttons resolve accent colors at draw time, except the waveform
+    // widgets' live-dot tint, which is resolved once per build; retint
+    // every widget so the active theme paints them too.
+    let mut layers = layers;
+    layers.apply_palette(&palette);
+    let day_cycle = themes.day_cycle(&global_day_cycle);
     let cfg = Config {
         show_button_outlines: base.show_button_outlines.unwrap(),
         enable_pixel_shift: base.enable_pixel_shift.unwrap(),
@@ -561,9 +713,42 @@ fn load_config(
             .as_deref()
             .and_then(|value| PetEnergy::parse(value).ok())
             .unwrap_or_default(),
+        global_day_cycle,
         day_cycle,
+        palette,
+        themes,
     };
     Ok((cfg, layers))
+}
+
+/// Read the persisted active-theme choice, trimmed; `None` when the
+/// file is missing or blank.
+fn read_persisted_theme(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Best-effort persistence of the active theme: written atomically
+/// (staged then renamed) only when the file does not already say it.
+/// Failures are logged, never fatal - the bar still applies the theme
+/// live without the file.
+fn persist_active_theme(state_path: Option<&Path>, name: &str) {
+    let Some(path) = state_path else {
+        return;
+    };
+    if read_persisted_theme(path).as_deref() == Some(name) {
+        return;
+    }
+    if let Err(err) = write_persisted_theme(path, name) {
+        eprintln!("could not persist the active theme {name:?}: {err}");
+    }
+}
+
+fn write_persisted_theme(path: &Path, name: &str) -> std::io::Result<()> {
+    let stage = path.with_extension("tmp");
+    fs::write(&stage, name)?;
+    fs::rename(&stage, path)
 }
 
 pub struct ConfigManager {
@@ -572,6 +757,7 @@ pub struct ConfigManager {
     file_watch: Option<WatchDescriptor>,
     user_path: PathBuf,
     base_path: PathBuf,
+    state_path: PathBuf,
 }
 
 fn arm_dir_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescriptor> {
@@ -601,9 +787,13 @@ fn arm_file_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescrip
 
 impl ConfigManager {
     pub fn new() -> ConfigManager {
-        Self::with_paths(PathBuf::from(BASE_CFG_PATH), PathBuf::from(USER_CFG_PATH))
+        Self::with_paths(
+            PathBuf::from(BASE_CFG_PATH),
+            PathBuf::from(USER_CFG_PATH),
+            PathBuf::from(THEME_STATE_PATH),
+        )
     }
-    fn with_paths(base_path: PathBuf, user_path: PathBuf) -> ConfigManager {
+    fn with_paths(base_path: PathBuf, user_path: PathBuf, state_path: PathBuf) -> ConfigManager {
         let inotify_fd = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
         let dir_watch = arm_dir_watch(&inotify_fd, &user_path);
         let file_watch = arm_file_watch(&inotify_fd, &user_path);
@@ -613,19 +803,37 @@ impl ConfigManager {
             file_watch,
             user_path,
             base_path,
+            state_path,
         }
     }
+    /// Persist a theme chosen on the glass for the next start; atomic
+    /// and best-effort, exactly like the load-time persistence.
+    pub fn save_theme(&self, name: &str) -> std::io::Result<()> {
+        write_persisted_theme(&self.state_path, name)
+    }
     pub fn load_config(&self, width: u16) -> (Config, LayerDeck) {
-        load_config(width, &self.base_path, Some(&self.user_path)).unwrap_or_else(|err| {
+        load_config(
+            width,
+            &self.base_path,
+            Some(&self.user_path),
+            Some(&self.state_path),
+        )
+        .unwrap_or_else(|err| {
             eprintln!("Ignoring user configuration: {err:#}");
-            load_config(width, &self.base_path, None).expect("failed to load base configuration")
+            load_config(width, &self.base_path, None, Some(&self.state_path))
+                .expect("failed to load base configuration")
         })
     }
     pub fn update_config(&mut self, width: u16) -> Option<(Config, LayerDeck)> {
         if !self.pending_reload() {
             return None;
         }
-        match load_config(width, &self.base_path, Some(&self.user_path)) {
+        match load_config(
+            width,
+            &self.base_path,
+            Some(&self.user_path),
+            Some(&self.state_path),
+        ) {
             Ok(parts) => Some(parts),
             Err(err) => {
                 eprintln!("Keeping current configuration after reload error: {err:#}");
@@ -708,6 +916,23 @@ Keys = [{ Text = "Functions", Action = { Layer = "function" } }]
 [[Layers]]
 Name = "function"
 Keys = [{ Text = "F1", Action = "F1" }]
+"#;
+    /// The minimal named layout plus a quick-keys `more` bar, so the theme
+    /// system's synthesized buttons have their home.
+    const NAMED_WITH_MORE: &str = r#"
+DefaultLayer = "home"
+FnLayer = "function"
+[[Layers]]
+Name = "home"
+Keys = [{ Text = "Functions", Action = { Layer = "function" } }]
+[[Layers]]
+Name = "function"
+Keys = [{ Text = "F1", Action = "F1" }]
+[[Layers]]
+Name = "more"
+Keys = [
+    { Text = "Sync", Action = { Layer = "home" } },
+]
 "#;
 
     #[test]
@@ -854,7 +1079,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
             .unwrap()
             .unwrap_or_else(|| include_str!("../share/tiny-dfr/multibar.toml").into());
         fs::write(&user_path, named).unwrap();
-        let (cfg, mut deck) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let (mut cfg, mut deck) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
 
         // Renders one frame with an explicit background color, used for the
         // time-of-day band review frames below.
@@ -903,9 +1128,16 @@ Keys = [{ Text = "F1", Action = "F1" }]
             let spans = deck.current().layout_spans(2008, 0);
             let x = (spans[index].left + spans[index].right) / 2.0;
             let mut emit = |keys: &[Key], _| assert!(keys.is_empty(), "voice button emitted keys");
-            deck.touch_down_at(0, x, 30.0, 2008, 60, &mut emit, &mut |command| {
-                commands.push(command.into())
-            });
+            deck.touch_down_at(
+                0,
+                x,
+                30.0,
+                2008,
+                60,
+                &mut emit,
+                &mut |command| commands.push(command.into()),
+                &mut |_| None,
+            );
             deck.touch_up(0, &mut emit);
         };
         let mut commands = Vec::new();
@@ -1002,7 +1234,16 @@ Keys = [{ Text = "F1", Action = "F1" }]
         let viz_x = (spans[viz_index].left + spans[viz_index].right) / 2.0;
         assert!(!deck.viz_active());
         let mut viz_emit = |_: &[Key], _: bool| panic!("visualizer emitted keys");
-        deck.touch_down_at(0, viz_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            viz_x,
+            30.0,
+            2008,
+            60,
+            &mut viz_emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         assert!(deck.viz_active());
         assert!(deck.current().viz_view);
         assert_eq!(deck.current().layout_spans(2008, 0).len(), 2);
@@ -1025,7 +1266,16 @@ Keys = [{ Text = "F1", Action = "F1" }]
         // the exact media bar that opened the view.
         let off_spans = deck.current().layout_spans(2008, 0);
         let off_x = (off_spans[1].left + off_spans[1].right) / 2.0;
-        deck.touch_down_at(1, off_x, 30.0, 2008, 60, &mut viz_emit, &mut |_| {});
+        deck.touch_down_at(
+            1,
+            off_x,
+            30.0,
+            2008,
+            60,
+            &mut viz_emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         assert!(!deck.viz_active());
         assert!(!deck.current().viz_view);
         assert_eq!(deck.current().visualizer, Some(viz_index));
@@ -1042,7 +1292,7 @@ Keys = [{ Text = "F1", Action = "F1" }]
         let spans = deck.current().layout_spans(2008, 0);
         let x = (spans[0].left + spans[0].right) / 2.0;
         let mut emit = |_: &[Key], _: bool| panic!("slider emitted keys");
-        deck.touch_down_at(0, x, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(0, x, 30.0, 2008, 60, &mut emit, &mut |_| {}, &mut |_| None);
         assert_eq!(deck.slider.region, Some((0, 1)));
         assert_eq!(
             deck.slider.requests.last().unwrap().2,
@@ -1083,7 +1333,16 @@ Keys = [{ Text = "F1", Action = "F1" }]
         deck.slider_collapse();
         let spans = deck.current().layout_spans(2008, 0);
         let brightness_x = (spans[brightness_index].left + spans[brightness_index].right) / 2.0;
-        deck.touch_down_at(0, brightness_x, 30.0, 2008, 60, &mut emit, &mut |_| {});
+        deck.touch_down_at(
+            0,
+            brightness_x,
+            30.0,
+            2008,
+            60,
+            &mut emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
         assert_eq!(deck.slider.region, Some((0, 1)));
         assert_eq!(deck.slider.kind, crate::slider::Kind::Brightness);
         assert!(!deck.slider.confirmed);
@@ -1188,6 +1447,118 @@ Keys = [{ Text = "F1", Action = "F1" }]
         tap(&mut deck, "More", &mut commands);
         assert_eq!(deck.active, deck.names["more"]);
         render(&mut deck, "implemented-more.png");
+        // The theme system: the Themes opener switches into the picker, a
+        // full-bar takeover listing every theme name; tapping one applies
+        // it live - the palette and the day-cycle bands swap in place, no
+        // restart, no reload - and returns home. The exported frames: the
+        // picker itself, the home bar under the applied theme, and the
+        // more bar's cycle button briefly wearing the applied name.
+        let themes_button = deck
+            .current()
+            .buttons
+            .iter()
+            .position(|(_, button)| {
+                matches!(&button.action, ButtonAction::SwitchLayer(name) if name == "themes")
+            })
+            .unwrap();
+        let spans = deck.current().layout_spans(2008, 0);
+        let themes_x = (spans[themes_button].left + spans[themes_button].right) / 2.0;
+        deck.touch_down_at(
+            0,
+            themes_x,
+            30.0,
+            2008,
+            60,
+            &mut viz_emit,
+            &mut |_| {},
+            &mut |_| None,
+        );
+        assert_eq!(deck.active, deck.names["themes"]);
+        assert!(deck.current().buttons.iter().any(|(_, button)| matches!(
+            (&button.image, &button.action),
+            (crate::ButtonImage::Text(text), ButtonAction::ApplyThemeLayer { theme, .. })
+                if text == theme
+        )));
+        render(&mut deck, "implemented-themes.png");
+        // Apply Nord by tapping its button through the same callback the
+        // daemon wires, then watch the home bar render in its colors.
+        let nord_button = deck
+            .current()
+            .buttons
+            .iter()
+            .position(
+                |(_, button)| matches!(&button.action, ButtonAction::ApplyThemeLayer { theme, .. } if theme == "Nord"),
+            )
+            .unwrap();
+        let spans = deck.current().layout_spans(2008, 0);
+        let nord_x = (spans[nord_button].left + spans[nord_button].right) / 2.0;
+        // The same apply callback the daemon wires: the palette, the day
+        // cycle, and the active choice live on the config, and each tap's
+        // callback borrows it only for that tap.
+        let apply_theme = |cfg: &mut Config,
+                           request: crate::themes::ThemeRequest|
+         -> Option<(String, crate::appearance::Palette)> {
+            let name = match request {
+                crate::themes::ThemeRequest::Next => cfg.themes.cycle_next()?,
+                crate::themes::ThemeRequest::Named(name) => name.to_owned(),
+            };
+            if !cfg.themes.apply(&name) {
+                return None;
+            }
+            cfg.palette = cfg.themes.palette();
+            cfg.day_cycle = cfg.themes.day_cycle(&cfg.global_day_cycle);
+            Some((name, cfg.palette))
+        };
+        deck.touch_down_at(
+            1,
+            nord_x,
+            30.0,
+            2008,
+            60,
+            &mut viz_emit,
+            &mut |_| {},
+            &mut |request| apply_theme(&mut cfg, request),
+        );
+        assert_eq!(deck.active, deck.home);
+        assert_eq!(cfg.themes.active.as_deref(), Some("Nord"));
+        // The frame helper paints with whatever theme is live.
+        let render = |deck: &mut LayerDeck, name: &str| {
+            let background = cfg.day_cycle.background(chrono::Local::now().hour());
+            render_with_background(deck, name, &cfg, background);
+        };
+        render(&mut deck, "implemented-home-nord.png");
+        // The cycle button on the more bar: one tap applies the next theme
+        // in place and briefly shows its name on the button.
+        tap(&mut deck, "More", &mut commands);
+        let theme_button = deck
+            .current()
+            .buttons
+            .iter()
+            .position(|(_, button)| matches!(button.action, ButtonAction::CycleTheme))
+            .unwrap();
+        let spans = deck.current().layout_spans(2008, 0);
+        let theme_x = (spans[theme_button].left + spans[theme_button].right) / 2.0;
+        deck.touch_down_at(
+            2,
+            theme_x,
+            30.0,
+            2008,
+            60,
+            &mut viz_emit,
+            &mut |_| {},
+            &mut |request| apply_theme(&mut cfg, request),
+        );
+        assert!(matches!(
+            &deck.current().buttons[theme_button].1.image,
+            crate::ButtonImage::Text(text) if text == "Ember"
+        ));
+        let render = |deck: &mut LayerDeck, name: &str| {
+            let background = cfg.day_cycle.background(chrono::Local::now().hour());
+            render_with_background(deck, name, &cfg, background);
+        };
+        render(&mut deck, "implemented-more-theme-flash.png");
+        let (restored, _) = deck.theme_flash_tick(Instant::now() + Duration::from_millis(1600));
+        assert!(restored);
         tap(&mut deck, "Screenshot", &mut commands);
         assert_eq!(deck.active, deck.home);
         assert_eq!(commands.len(), 5);
@@ -1211,7 +1582,9 @@ DoublePressSwitchLayers = 200
             );
             let (cfg, layout) = parse_config(BASE, Some(&user), 2008).unwrap();
             assert!(layout.legacy);
-            assert_eq!(layout.layers.len(), 3);
+            // primary, media, the synthesized pet layer, and the
+            // synthesized themes picker.
+            assert_eq!(layout.layers.len(), 4);
             assert_eq!(layout.home, usize::from(media_default));
             assert_eq!(layout.fn_layer, Some(1 - layout.home));
             assert_eq!(
@@ -1299,7 +1672,7 @@ DoublePressSwitchLayers = 200
             2008,
         )
         .unwrap();
-        assert_eq!(layout.layers.len(), 6);
+        assert_eq!(layout.layers.len(), 7);
         let home = &layout.layers[layout.home];
         // The clock is gone from the shipped home bar; its width goes to
         // the remaining buttons.
@@ -1375,7 +1748,10 @@ DoublePressSwitchLayers = 200
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 2);
+        // Home, the shipped quick keys (Screenshot, Lock), and the two
+        // synthesized theme buttons: the compact cycle button and the
+        // picker opener.
+        assert_eq!(more.keys.len(), 5);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1576,7 +1952,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 2);
+        assert_eq!(more.keys.len(), 5);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1612,7 +1988,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 4);
+        assert_eq!(more.keys.len(), 7);
         assert_eq!(more.keys[2].icon.as_deref(), Some("search"));
         assert!(more.keys[2].text.is_none());
         assert_eq!(
@@ -1632,6 +2008,310 @@ Keys = [\n\
             "Command = \"my-quick-tool\", Layer = \"missing\"",
         );
         assert!(parse_config(BASE, Some(&invalid), 2008).is_err());
+    }
+
+    #[test]
+    fn theme_actions_parse_in_all_three_shapes_and_reject_bad_combinations() {
+        let config = format!(
+            "{NAMED}\n\
+[[Layers]]\n\
+Name = \"restyler\"\n\
+Keys = [\n\
+    {{ Text = \"Theme\", Action = \"CycleTheme\" }},\n\
+    {{ Text = \"Nord\", Action = {{ Theme = \"Nord\" }} }},\n\
+    {{ Text = \"Pick\", Action = {{ Theme = \"Nord\", Layer = \"home\" }} }},\n\
+]"
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let restyler = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "restyler")
+            .unwrap();
+        // The restyler bar visibly returns home through its Pick button,
+        // so no extra Home button is synthesized.
+        assert_eq!(restyler.keys.len(), 3);
+        assert_eq!(restyler.keys[0].action, ButtonAction::CycleTheme);
+        assert_eq!(
+            restyler.keys[1].action,
+            ButtonAction::ApplyTheme("Nord".into())
+        );
+        assert_eq!(
+            restyler.keys[2].action,
+            ButtonAction::ApplyThemeLayer {
+                theme: "Nord".into(),
+                layer: "home".into()
+            }
+        );
+        // The helpers see through the theme shapes like the others.
+        assert_eq!(restyler.keys[0].action.layer_target(), None);
+        assert_eq!(restyler.keys[1].action.command(), None);
+        assert_eq!(restyler.keys[2].action.layer_target(), Some("home"));
+        // A theme combined with a command, an empty theme name, or an
+        // unknown layer target is rejected like any other bad action.
+        for invalid in [
+            config.replace(
+                "Action = { Theme = \"Nord\" }",
+                "Action = { Theme = \"Nord\", Command = \"x\" }",
+            ),
+            config.replace(
+                "Action = { Theme = \"Nord\" }",
+                "Action = { Theme = \" \" }",
+            ),
+            config.replace(
+                "Theme = \"Nord\", Layer = \"home\"",
+                "Theme = \"Nord\", Layer = \"missing\"",
+            ),
+            config.replace("Action = \"CycleTheme\"", "Action = \"CycleThemes\""),
+        ] {
+            assert!(
+                parse_config(BASE, Some(&invalid), 2008).is_err(),
+                "accepted invalid theme action: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_tables_parse_into_the_resolved_set_and_reject_invalid_knobs() {
+        let user = "\nThemesEnabled = true\nActiveTheme = \"Mine\"\n\
+[Themes.Mine.Accents]\ncyan = \"#40E0D0\"\namber = \"40e0a0\"\n";
+        let (base, _) = parse_config(BASE, Some(user), 2008).unwrap();
+        let themes =
+            ThemeSet::resolve(base.themes_enabled.unwrap_or(true), base.themes.clone()).unwrap();
+        assert!(themes.contains("Mine"));
+        assert!(themes.contains("Nord"), "the seeded set always rides along");
+        // An unknown or blank ActiveTheme rejects the candidate config.
+        for invalid in [
+            "ActiveTheme = \"Nope\"\n",
+            "ActiveTheme = \" \"\n",
+            "ThemesEnabled = 'true'\n",
+            "[Themes.Bad.Accents]\nmauve = \"#101010\"\n",
+            "[Themes.Bad.Accents]\ncyan = \"10g010\"\n",
+            "[Themes.Bad]\n[[Themes.Bad.DayCycleBands]]\nName = \"x\"\nStartHour = 24\nColor = \"#101010\"\n",
+            "[Themes.Bad]\nSurprise = true\n",
+            "[Themes.\" \"].Accents\n",
+        ] {
+            assert!(
+                parse_config(BASE, Some(invalid), 2008).is_err(),
+                "accepted invalid theme configuration: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_theme_picker_takes_over_its_own_layer_and_the_more_bar_gains_both_buttons() {
+        // With the theme system on (the default), a `themes` layer is
+        // synthesized listing every theme, and the quick-keys `more` bar
+        // gains the compact Theme cycle button and the Themes opener.
+        let (_, layout) = parse_config(BASE, Some(NAMED_WITH_MORE), 2008).unwrap();
+        let picker = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "themes")
+            .unwrap();
+        let seeded = crate::themes::builtin_themes().unwrap();
+        assert_eq!(
+            picker.keys.len(),
+            seeded.names.len() + 1,
+            "one Home button plus one button per theme"
+        );
+        assert_eq!(picker.keys[0].text.as_deref(), Some("Home"));
+        assert_eq!(
+            picker.keys[0].action,
+            ButtonAction::SwitchLayer("home".into())
+        );
+        for (button, name) in picker.keys.iter().skip(1).zip(&seeded.names) {
+            assert_eq!(button.text.as_deref(), Some(name.as_str()));
+            assert_eq!(
+                button.action,
+                ButtonAction::ApplyThemeLayer {
+                    theme: name.clone(),
+                    layer: "home".into()
+                }
+            );
+        }
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        let theme = more.keys.last().unwrap();
+        assert_eq!(theme.text.as_deref(), Some("Themes"));
+        assert_eq!(theme.action, ButtonAction::SwitchLayer("themes".into()));
+        assert_eq!(
+            more.keys[more.keys.len() - 2].text.as_deref(),
+            Some("Theme")
+        );
+        assert_eq!(
+            more.keys[more.keys.len() - 2].action,
+            ButtonAction::CycleTheme
+        );
+        // A user layer named `themes` replaces the synthesized picker,
+        // and the more bar still gains the openers unless it carries its
+        // own visible buttons for both surfaces.
+        let config = format!(
+            "{NAMED_WITH_MORE}\n\
+[[Layers]]\n\
+Name = \"themes\"\n\
+Keys = [{{ Text = \"P1\" }}]"
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let picker = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "themes")
+            .unwrap();
+        assert_eq!(picker.keys.len(), 2);
+        assert_eq!(picker.keys[1].text.as_deref(), Some("P1"));
+        // Author-provided visible buttons suppress both syntheses.
+        let config = NAMED_WITH_MORE.replace(
+            "    { Text = \"Sync\", Action = { Layer = \"home\" } },",
+            "    { Text = \"Sync\", Action = { Layer = \"home\" } },\n    { Text = \"Palette\", Action = \"CycleTheme\" },\n    { Text = \"Looks\", Action = { Layer = \"themes\" } },",
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert_eq!(
+            more.keys
+                .iter()
+                .filter(|key| matches!(key.action, ButtonAction::CycleTheme))
+                .count(),
+            1
+        );
+        assert!(
+            !more
+                .keys
+                .iter()
+                .any(|key| key.text.as_deref() == Some("Theme")),
+            "the synthesized cycle button yields to the author's own"
+        );
+        assert!(
+            !more
+                .keys
+                .iter()
+                .any(|key| key.text.as_deref() == Some("Themes")),
+            "the synthesized opener yields to the author's own"
+        );
+        // Configs without a `more` bar stay untouched: their home bar gains
+        // nothing and only the picker layer exists, reachable through the
+        // author's own button.
+        let (_, layout) = parse_config(BASE, Some(NAMED), 2008).unwrap();
+        let home = &layout.layers[layout.home];
+        assert!(!home.keys.iter().any(|key| {
+            matches!(key.action, ButtonAction::CycleTheme)
+                || key.action.layer_target() == Some("themes")
+        }));
+        assert!(layout.layers.iter().any(|layer| layer.name == "themes"));
+    }
+
+    #[test]
+    fn disabling_the_theme_system_removes_its_layer_and_buttons_and_rejects_stale_targets() {
+        let disabled = format!("ThemesEnabled = false\n{NAMED_WITH_MORE}");
+        let (_, layout) = parse_config(BASE, Some(&disabled), 2008).unwrap();
+        assert!(layout.layers.iter().all(|layer| layer.name != "themes"));
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert!(!more.keys.iter().any(|key| {
+            matches!(key.action, ButtonAction::CycleTheme)
+                || key
+                    .action
+                    .layer_target()
+                    .is_some_and(|target| target == "themes")
+        }));
+        // A button still targeting the removed layer is an unknown target.
+        let stale = disabled.replace(
+            "    { Text = \"Sync\", Action = { Layer = \"home\" } },",
+            "    { Text = \"Sync\", Action = { Layer = \"home\" } },\n    { Text = \"Looks\", Action = { Layer = \"themes\" } },",
+        );
+        assert!(parse_config(BASE, Some(&stale), 2008).is_err());
+    }
+
+    #[test]
+    fn the_active_theme_builds_the_palette_and_bands_from_the_config_pin() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        fs::write(&base_path, text_only_base()).unwrap();
+        let user_path = tmp.0.join("config.toml");
+        fs::write(
+            &user_path,
+            "\nThemesEnabled = true\nActiveTheme = \"Nord\"\n[Themes.Nord.Accents]\ncyan = \"#88C0D0\"\n",
+        )
+        .unwrap();
+        let (cfg, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
+        assert_eq!(cfg.themes.active.as_deref(), Some("Nord"));
+        assert_eq!(
+            cfg.palette.accent(ButtonAccent::Cyan),
+            (136.0 / 255.0, 192.0 / 255.0, 208.0 / 255.0),
+            "the pin's accent override reaches the render palette"
+        );
+        assert_eq!(
+            cfg.palette.accent(ButtonAccent::Amber),
+            (235.0 / 255.0, 203.0 / 255.0, 139.0 / 255.0),
+            "shadowing a built-in inherits its unspecified accents"
+        );
+        assert_eq!(
+            cfg.day_cycle.background(14),
+            (59.0 / 255.0, 66.0 / 255.0, 82.0 / 255.0),
+            "the seed Nord bands paint the strip"
+        );
+        assert_eq!(
+            cfg.global_day_cycle.background(14),
+            crate::daycycle::DayCycle::default().background(14),
+            "the theme-free cycle stays untouched for re-apply"
+        );
+        // Without a pin and without a state file the deck starts on the
+        // live palette exactly as before themes existed.
+        fs::write(&user_path, "\nThemesEnabled = true\n").unwrap();
+        let (cfg, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
+        assert_eq!(cfg.themes.active.as_deref(), Some("Default"));
+        assert_eq!(cfg.palette, crate::appearance::Palette::default());
+        // A disabled system renders the live palette whatever it says.
+        fs::write(
+            &user_path,
+            "ThemesEnabled = false\nActiveTheme = \"Nord\"\n",
+        )
+        .unwrap();
+        let (cfg, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
+        assert_eq!(cfg.palette, crate::appearance::Palette::default());
+    }
+
+    #[test]
+    fn the_theme_state_file_seeds_heals_and_yields_to_the_config_pin() {
+        let tmp = TempDir::new();
+        let base_path = tmp.0.join("base.toml");
+        fs::write(&base_path, text_only_base()).unwrap();
+        let user_path = tmp.0.join("config.toml");
+        let state_path = tmp.0.join("active-theme");
+        fs::write(&user_path, "ThemesEnabled = true\n").unwrap();
+        // The last on-glass choice, remembered across restarts, applies
+        // without any config pin - and is remembered for the next load.
+        fs::write(&state_path, "Ember").unwrap();
+        let (cfg, _) = load_config(2008, &base_path, Some(&user_path), Some(&state_path)).unwrap();
+        assert_eq!(cfg.themes.active.as_deref(), Some("Ember"));
+        // A config pin wins over the state file, and the file heals to
+        // match so the two sources never fight.
+        fs::write(&user_path, "ThemesEnabled = true\nActiveTheme = \"Nord\"\n").unwrap();
+        let (cfg, _) = load_config(2008, &base_path, Some(&user_path), Some(&state_path)).unwrap();
+        assert_eq!(cfg.themes.active.as_deref(), Some("Nord"));
+        assert_eq!(fs::read_to_string(&state_path).unwrap(), "Nord");
+        // A state entry naming a removed theme falls back to the first
+        // theme and heals the file, so a stale file cannot wedge the bar.
+        fs::write(&user_path, "ThemesEnabled = true\n").unwrap();
+        fs::write(&state_path, "Atlantis").unwrap();
+        let (cfg, _) = load_config(2008, &base_path, Some(&user_path), Some(&state_path)).unwrap();
+        assert_eq!(cfg.themes.active.as_deref(), Some("Default"));
+        assert_eq!(fs::read_to_string(&state_path).unwrap(), "Default");
+        // save_theme is the on-glass path: atomic, and reload picks it up.
+        let manager = ConfigManager::with_paths(base_path, user_path, state_path.clone());
+        manager.save_theme("Mono").unwrap();
+        let (cfg, _) = manager.load_config(2008);
+        assert_eq!(cfg.themes.active.as_deref(), Some("Mono"));
     }
 
     #[test]
@@ -1713,7 +2393,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             .unwrap()
             .remove("BatteryCycleTimeoutSecs");
         fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
-        let (config, deck) = load_config(2008, &base_path, None).unwrap();
+        let (config, deck) = load_config(2008, &base_path, None, None).unwrap();
         assert!(deck.legacy);
         assert!(config.battery_cycle_enabled);
         assert_eq!(config.battery_cycle_timeout_secs, 15);
@@ -1722,7 +2402,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             "BatteryCycleEnabled = false\nBatteryCycleTimeoutSecs = 7",
         )
         .unwrap();
-        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
         assert!(!config.battery_cycle_enabled);
         assert_eq!(config.battery_cycle_timeout_secs, 7);
         for invalid in [
@@ -1751,7 +2431,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             legacy.as_table_mut().unwrap().remove(key);
         }
         fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
-        let (config, _) = load_config(2008, &base_path, None).unwrap();
+        let (config, _) = load_config(2008, &base_path, None, None).unwrap();
         assert_eq!(config.battery_warning_threshold, 25);
         assert_eq!(config.battery_critical_threshold, 10);
         assert_eq!(config.battery_warning_color, ButtonAccent::Orange);
@@ -1762,7 +2442,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             "BatteryWarningThreshold = 30\nBatteryCriticalColor = \"violet\"",
         )
         .unwrap();
-        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
         assert_eq!(config.battery_warning_threshold, 30);
         assert_eq!(config.battery_critical_threshold, 10);
         assert_eq!(config.battery_warning_color, ButtonAccent::Orange);
@@ -1796,7 +2476,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         legacy.as_table_mut().unwrap().remove("PetVariant");
         legacy.as_table_mut().unwrap().remove("PetEnergy");
         fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
-        let (config, _) = load_config(2008, &base_path, None).unwrap();
+        let (config, _) = load_config(2008, &base_path, None, None).unwrap();
         assert!(config.pet_enabled);
         assert_eq!(config.pet_variant, PetVariant::Cat);
         assert_eq!(config.pet_energy, PetEnergy::Calm);
@@ -1806,7 +2486,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
             "PetEnabled = false\nPetVariant = \"fox\"\nPetEnergy = \"rowdy\"",
         )
         .unwrap();
-        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
         assert!(!config.pet_enabled);
         assert_eq!(config.pet_variant, PetVariant::Fox);
         assert_eq!(config.pet_energy, PetEnergy::Rowdy);
@@ -1839,7 +2519,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         legacy.as_table_mut().unwrap().remove("DayCycleEnabled");
         legacy.as_table_mut().unwrap().remove("DayCycleBands");
         fs::write(&base_path, toml::to_string(&legacy).unwrap()).unwrap();
-        let (config, _) = load_config(2008, &base_path, None).unwrap();
+        let (config, _) = load_config(2008, &base_path, None, None).unwrap();
         assert!(config.day_cycle.enabled);
         assert_eq!(config.day_cycle.band_at(14).unwrap().name, "day");
         assert_eq!(
@@ -1849,7 +2529,7 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         );
         // Disabling keeps the plain static black background at every hour.
         fs::write(&user_path, "DayCycleEnabled = false").unwrap();
-        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
         for hour in 0..=23 {
             assert_eq!(config.day_cycle.band_at(hour), None);
             assert_eq!(config.day_cycle.background(hour), (0.0, 0.0, 0.0));
@@ -1870,7 +2550,7 @@ Color = "301020"
 "##,
         )
         .unwrap();
-        let (config, _) = load_config(2008, &base_path, Some(&user_path)).unwrap();
+        let (config, _) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
         let off = config.day_cycle.band_at(2).unwrap();
         assert_eq!((off.name.as_str(), off.start_hour), ("off", 19));
         assert_eq!(off.rgb(), (48.0 / 255.0, 16.0 / 255.0, 32.0 / 255.0));
@@ -1916,7 +2596,11 @@ Color = "301020"
     fn watcher_handles_direct_writes_atomic_saves_rename_away_and_deletion() {
         let tmp = TempDir::new();
         let path = tmp.0.join("config.toml");
-        let mut manager = ConfigManager::with_paths(tmp.0.join("base.toml"), path.clone());
+        let mut manager = ConfigManager::with_paths(
+            tmp.0.join("base.toml"),
+            path.clone(),
+            tmp.0.join("active-theme"),
+        );
         assert!(!manager.pending_reload());
         fs::write(tmp.0.join("unrelated"), "ignored").unwrap();
         assert!(!manager.pending_reload());
@@ -1953,14 +2637,14 @@ Color = "301020"
         let path = tmp.0.join("config.toml");
         symlink(&target, &path).unwrap();
 
-        let mut manager = ConfigManager::with_paths(base, path.clone());
+        let mut manager = ConfigManager::with_paths(base, path.clone(), tmp.0.join("active-theme"));
         let (_, mut deck) = manager.load_config(2008);
         assert!(!deck.legacy);
-        assert_eq!(deck.layers.len(), 3);
+        assert_eq!(deck.layers.len(), 4);
         let mut events = Vec::new();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F1], true)]);
 
@@ -1973,7 +2657,7 @@ Color = "301020"
         events.clear();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F5], true)]);
 
@@ -1988,7 +2672,7 @@ Color = "301020"
         events.clear();
         let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         drop(emit);
         assert_eq!(events, vec![(vec![Key::F6], true)]);
     }
@@ -2000,12 +2684,12 @@ Color = "301020"
         fs::write(&base, text_only_base()).unwrap();
         let path = tmp.0.join("config.toml");
         fs::write(&path, NAMED).unwrap();
-        let mut manager = ConfigManager::with_paths(base, path.clone());
+        let mut manager = ConfigManager::with_paths(base, path.clone(), tmp.0.join("active-theme"));
         let (_, mut deck) = manager.load_config(2008);
         deck.switch_named("function", &mut |_, _| {});
         let mut keys = Vec::new();
         let mut emit = |codes: &[Key], active| keys.push((codes.to_vec(), active));
-        deck.touch_down(7, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(7, 1, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
         fs::write(
             &path,
             NAMED.replace("Layer = \"function\"", "Layer = \"missing\""),
@@ -2033,11 +2717,11 @@ Color = "301020"
             NAMED.replace("Layer = \"function\"", "Layer = \"missing\""),
         )
         .unwrap();
-        let mut manager = ConfigManager::with_paths(base, path.clone());
+        let mut manager = ConfigManager::with_paths(base, path.clone(), tmp.0.join("active-theme"));
         let (_, mut deck) = manager.load_config(2008);
         assert!(deck.legacy);
         assert_eq!(deck.active, 0);
-        assert_eq!(deck.layers.len(), 3);
+        assert_eq!(deck.layers.len(), 4);
 
         fs::write(&path, NAMED).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();
@@ -2046,14 +2730,14 @@ Color = "301020"
         deck.replace(replacement, &mut emit);
         assert!(!deck.legacy);
         deck.switch_named("function", &mut emit);
-        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {});
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
 
         fs::remove_file(path).unwrap();
         let (_, replacement) = manager.update_config(2008).unwrap();
         deck.replace(replacement, &mut emit);
         assert!(deck.legacy);
         assert_eq!(deck.active, deck.home);
-        assert_eq!(deck.layers.len(), 3);
+        assert_eq!(deck.layers.len(), 4);
         assert!(deck.touches.is_empty());
         deck.touch_up(0, &mut emit);
         assert_eq!(events, vec![(vec![Key::F1], true), (vec![Key::F1], false)]);
@@ -2074,14 +2758,15 @@ Color = "301020"
         fs::write(&base_path, toml::to_string(&installed).unwrap()).unwrap();
         let user_path = tmp.0.join("config.toml");
         fs::write(&user_path, include_str!("../share/tiny-dfr/multibar.toml")).unwrap();
-        let manager = ConfigManager::with_paths(base_path, user_path);
+        let manager = ConfigManager::with_paths(base_path, user_path, tmp.0.join("active-theme"));
         let (cfg, deck) = manager.load_config(2008);
         assert_eq!(cfg.double_press_switch_layers, 0);
         assert!(!deck.legacy);
         // The multibar's media bar carries the Viz button, so the deck
         // also synthesized its full-bar visualizer view; the named layers
-        // are home, function, media, recording, more, and pet.
-        assert_eq!(deck.layers.len(), 7);
+        // are home, function, media, recording, more, and pet, plus the
+        // synthesized themes picker.
+        assert_eq!(deck.layers.len(), 8);
         assert!(deck.names.contains_key("visualizer:media"));
     }
 
@@ -2118,7 +2803,7 @@ Color = "301020"
     fn pet_disabled_restores_the_pre_pet_home_bar_and_layer_list() {
         let config = format!("PetEnabled = false\n{NAMED}");
         let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
-        assert_eq!(layout.layers.len(), 2);
+        assert_eq!(layout.layers.len(), 3);
         assert!(layout.layers.iter().all(|layer| layer.name != "pet"));
         let home = &layout.layers[layout.home];
         assert_eq!(home.keys.len(), 1);
@@ -2134,7 +2819,7 @@ Color = "301020"
             2008,
         )
         .unwrap();
-        assert_eq!(legacy.layers.len(), 2);
+        assert_eq!(legacy.layers.len(), 3);
         assert!(legacy.layers.iter().all(|layer| layer.name != "pet"));
     }
 
@@ -2147,7 +2832,7 @@ Name = \"pet\"\n\
 Keys = [{{ Text = \"P1\" }}]\n"
         );
         let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
-        assert_eq!(layout.layers.len(), 3);
+        assert_eq!(layout.layers.len(), 4);
         let pet = &layout.layers[2];
         assert_eq!(pet.name, "pet");
         // The user's buttons are kept and gain only the generic Home button,
