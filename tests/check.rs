@@ -63,8 +63,11 @@ fn an_unknown_field_exits_nonzero_with_the_line_and_a_suggestion() {
 fn bad_usage_exits_two_and_help_exits_zero() {
     let (code, _, stderr) = check(&["--nonsense"]);
     assert_eq!(code, Some(2));
+    // Usage rides stderr on every path, including an explicit --help:
+    // diagnostics convention for a subcommand a human or a script reads
+    // interactively (an invalid file's diagnostics are stderr too).
     assert!(stderr.contains("usage"), "{stderr}");
-    let (code, stdout, _) = check(&["--help"]);
+    let (code, _, stderr) = check(&["--help"]);
     assert_eq!(code, Some(0));
-    assert!(stdout.contains("usage"), "{stdout}");
+    assert!(stderr.contains("usage"), "{stderr}");
 }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dfr-config"]
+members = ["crates/dfr-config", "crates/dfr-render"]
 resolver = "2"
 
 [package]
@@ -15,6 +15,7 @@ repository = "https://github.com/AsahiLinux/tiny-dfr.git"
 
 [dependencies]
 dfr-config = { path = "crates/dfr-config" }
+dfr-render = { path = "crates/dfr-render" }
 cairo-rs = { version = "0.22", default-features = false, features = ["freetype", "png"] }
 librsvg-rebind = "0.3"
 drm = "0.14"

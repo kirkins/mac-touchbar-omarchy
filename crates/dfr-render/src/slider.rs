@@ -2,7 +2,7 @@
 use crate::{
     appearance::{AccentPaint, ButtonAccent, Palette},
     config::ButtonAction,
-    level_control::{Request, State, MAX_VOLUME_PERCENT},
+    level::{Request, State, MAX_VOLUME_PERCENT},
     rounded_rect, BUTTON_COLOR_ACTIVE, BUTTON_COLOR_INACTIVE, BUTTON_SPACING_PX,
 };
 use cairo::Context;

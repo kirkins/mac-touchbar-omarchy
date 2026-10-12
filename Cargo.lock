@@ -145,6 +145,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfr-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cairo-rs",
+ "chrono",
+ "dfr-config",
+ "drm",
+ "freetype-rs",
+ "input-linux",
+ "libc",
+ "librsvg-rebind",
+ "nix 0.29.0",
+ "rand",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "dirs"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -948,6 +966,7 @@ dependencies = [
  "cairo-rs",
  "chrono",
  "dfr-config",
+ "dfr-render",
  "drm",
  "freedesktop-icons",
  "freetype-rs",

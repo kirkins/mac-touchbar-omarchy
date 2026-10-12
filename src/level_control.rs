@@ -1,4 +1,9 @@
-//! Serialized finite level protocol; explicit mixer and display endpoints.
+//! The level-control socket clients: explicit mixer and display
+//! endpoints for the slider widgets. The wire protocol types they
+//! speak live in `dfr-render` with the widgets that render them.
+
+pub use dfr_render::level::{Request, State, MAX_VOLUME_PERCENT};
+
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
@@ -11,20 +16,6 @@ use std::{
     thread,
     time::Duration,
 };
-
-pub const MAX_VOLUME_PERCENT: u8 = 130;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Request {
-    Get,
-    Set(u8),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct State {
-    pub percent: u8,
-    pub muted: bool,
-}
 
 fn request(
     address: &SocketAddr,

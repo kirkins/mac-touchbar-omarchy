@@ -1,0 +1,23 @@
+[package]
+name = "dfr-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND Apache-2.0"
+description = "The tiny-dfr render stack: decks, buttons, widgets, and the bar's draw path over a Cairo surface"
+
+[dependencies]
+dfr-config = { path = "../dfr-config" }
+anyhow = "1"
+cairo-rs = { version = "0.22", default-features = false, features = ["freetype", "png"] }
+librsvg-rebind = "0.3"
+drm = "0.14"
+rand = "0.8"
+freetype-rs = "0.38"
+chrono = { version = "0.4", features = ["unstable-locales"] }
+input-linux = { version = "0.7", features = ["serde"] }
+libc = "0.2"
+
+[dev-dependencies]
+toml = "0.8"
+nix = { version = "0.29", features = ["event"] }
+libc = "0.2"
