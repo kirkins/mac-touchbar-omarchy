@@ -1,34 +1,39 @@
-//! The Deck page: the layer list, the per-layer button grid, and the
-//! button editor with the action editor and its key-combo capture.
+//! The Layers page: the ordered collection and focused button properties,
+//! including action editing and explicit key-combo capture.
 //! Every edit writes through to the document model; nothing here
 //! touches a file until Save.
 
 use crate::capture::{key_from_gdk, key_name};
 use crate::model::{button_kind, set_button_kind, ActionForm, ButtonKind, Document};
 use crate::preview::Preview;
+use crate::ui;
 use gtk4::{glib, prelude::*};
 use input_linux::Key;
+use libadwaita::{self as adw, prelude::*};
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub const ACCENTS: &[&str] = &[
     "neutral", "cyan", "amber", "blue", "violet", "orange", "red", "green",
 ];
 
-/// Shared editing context handed to every callback. The page's widgets
-/// hold `Rc<Editor>`s; the editor holds no widgets, so teardown drops
-/// everything with the window. The window installs the two hooks:
-/// `notify` runs after every mutation (validation, status, preview
-/// debounce) and the structure hook rebuilds pages after edits that
-/// change the deck's shape (add/remove/reorder, kind switches).
+type EditorCallback = Box<dyn Fn(Rc<Editor>)>;
+
+/// Shared document and selection context. The window owns the page
+/// controllers; installed hooks use weak controller references. The
+/// after-edit hook validates, updates feedback and debounces previews;
+/// selection updates the focused properties; structure updates rebuild
+/// the affected collections and forms after add/remove/reorder or kind
+/// changes. Additional previews are held weakly here.
 pub struct Editor {
     pub doc: RefCell<Document>,
     pub selection: RefCell<Selection>,
-    after_edit: RefCell<Option<Box<dyn Fn(Rc<Editor>)>>>,
-    on_structure: RefCell<Option<Box<dyn Fn(Rc<Editor>)>>>,
+    after_edit: RefCell<Option<EditorCallback>>,
+    on_structure: RefCell<Option<EditorCallback>>,
     pub preview: Rc<Preview>,
     pub save_feedback: RefCell<crate::model::SaveFeedback>,
-    on_selection: RefCell<Option<Box<dyn Fn(Rc<Editor>)>>>,
+    pub previews: RefCell<Vec<Weak<Preview>>>,
+    on_selection: RefCell<Option<EditorCallback>>,
 }
 
 impl Editor {
@@ -43,11 +48,20 @@ impl Editor {
             on_structure: RefCell::new(None),
             preview,
             save_feedback: RefCell::new(Default::default()),
+            previews: RefCell::new(Vec::new()),
             on_selection: RefCell::new(None),
         })
     }
 
-    pub fn set_on_selection(&self, callback: Box<dyn Fn(Rc<Editor>)>) {
+    pub fn select(self: &Rc<Self>, layer: usize, button: Option<usize>) {
+        *self.selection.borrow_mut() = Selection { layer, button };
+        if let Some(layer) = self.doc.borrow().layer_snapshot().get(layer) {
+            self.preview.set_layer(&layer.name);
+        }
+        self.selection_changed();
+    }
+
+    pub fn set_on_selection(&self, callback: EditorCallback) {
         *self.on_selection.borrow_mut() = Some(callback);
     }
 
@@ -60,11 +74,11 @@ impl Editor {
         self.run_pipeline();
     }
 
-    pub fn set_after_edit(&self, callback: Box<dyn Fn(Rc<Editor>)>) {
+    pub fn set_after_edit(&self, callback: EditorCallback) {
         *self.after_edit.borrow_mut() = Some(callback);
     }
 
-    pub fn set_on_structure(&self, callback: Box<dyn Fn(Rc<Editor>)>) {
+    pub fn set_on_structure(&self, callback: EditorCallback) {
         *self.on_structure.borrow_mut() = Some(callback);
     }
 
@@ -97,586 +111,6 @@ pub struct Selection {
     pub button: Option<usize>,
 }
 
-impl Editor {
-    /// Read the selected button's clone (for building editors).
-    fn selected_button(&self) -> Option<dfr_config::ButtonConfig> {
-        let selection = self.selection.borrow().clone();
-        let mut doc = self.doc.borrow_mut();
-        doc.layers()
-            .get(selection.layer)?
-            .keys
-            .get(selection.button?)
-            .cloned()
-    }
-
-    /// Mutate the selected button through one borrow, then notify.
-    fn edit_selected_button(self: &Rc<Self>, change: impl FnOnce(&mut dfr_config::ButtonConfig)) {
-        let selection = self.selection.borrow().clone();
-        {
-            let mut doc = self.doc.borrow_mut();
-            let button = doc
-                .layers_mut()
-                .get_mut(selection.layer)
-                .and_then(|layer| layer.keys.get_mut(selection.button?));
-            if let Some(button) = button {
-                change(button);
-            }
-        }
-        self.run_pipeline();
-    }
-
-    /// Mutate the selected layer through one borrow, then notify.
-    fn edit_selected_layer(self: &Rc<Self>, change: impl FnOnce(&mut dfr_config::LayerConfig)) {
-        let selection = self.selection.borrow().clone();
-        {
-            let mut doc = self.doc.borrow_mut();
-            if let Some(layer) = doc.layers_mut().get_mut(selection.layer) {
-                change(layer);
-            }
-        }
-        self.run_pipeline();
-    }
-}
-
-/// Document-level layer mutation helper (the page re-borrows the
-/// overlay's layer list each edit, migrating legacy documents lazily).
-trait LayersMut {
-    fn layers_mut(&mut self) -> &mut Vec<dfr_config::LayerConfig>;
-}
-
-impl LayersMut for Document {
-    fn layers_mut(&mut self) -> &mut Vec<dfr_config::LayerConfig> {
-        self.layers()
-    }
-}
-
-pub struct LayersPage {
-    pub root: gtk4::Widget,
-    layer_rows: gtk4::ListBox,
-    layer_header: gtk4::Box,
-    buttons_box: gtk4::Box,
-    button_editor: gtk4::Box,
-}
-
-impl LayersPage {
-    pub fn build(editor: &Rc<Editor>) -> Self {
-        let paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
-        paned.set_position(300);
-        paned.set_shrink_start_child(false);
-        paned.set_shrink_end_child(false);
-
-        // ---- Left: the layer list ---------------------------------
-        let left = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-        let title = gtk4::Label::new(Some("Layers"));
-        title.set_halign(gtk4::Align::Start);
-        title.add_css_class("title-4");
-        left.append(&title);
-
-        let rows = gtk4::ListBox::new();
-        rows.set_css_classes(&["boxed-list"]);
-        rows.set_selection_mode(gtk4::SelectionMode::Single);
-        let scrolled = gtk4::ScrolledWindow::new();
-        scrolled.set_child(Some(&rows));
-        scrolled.set_vexpand(true);
-        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        left.append(&scrolled);
-
-        let add = gtk4::Button::with_label("Add layer");
-        add.add_css_class("suggested-action");
-        left.append(&add);
-
-        // ---- Right: preview + layer header + button grid + editor ---
-        let right = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-        right.set_margin_top(6);
-        right.set_margin_bottom(6);
-        right.set_margin_start(6);
-        right.set_margin_end(6);
-
-        let preview_frame = gtk4::Frame::new(None);
-        let preview_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        let preview_controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        preview_controls.append(&gtk4::Label::new(Some("Theme:")));
-        let themes = gtk4::DropDown::from_strings(&["Active"]);
-        themes.set_valign(gtk4::Align::Center);
-        let width_toggle = gtk4::CheckButton::with_label("2170 px bar (adds Esc)");
-        width_toggle.set_valign(gtk4::Align::Center);
-        preview_controls.append(&themes);
-        preview_controls.append(&width_toggle);
-        preview_box.append(&preview_controls);
-        preview_box.append(&editor.preview.area);
-        preview_frame.set_child(Some(&preview_box));
-        right.append(&preview_frame);
-
-        let layer_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        right.append(&layer_header);
-
-        let buttons_label = gtk4::Label::new(Some("Buttons"));
-        buttons_label.set_halign(gtk4::Align::Start);
-        buttons_label.add_css_class("heading");
-        right.append(&buttons_label);
-        let buttons_scrolled = gtk4::ScrolledWindow::new();
-        buttons_scrolled.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Never);
-        buttons_scrolled.set_vexpand(false);
-        buttons_scrolled.set_max_content_height(160);
-        buttons_scrolled.set_propagate_natural_height(true);
-        let buttons_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        buttons_box.set_margin_top(4);
-        buttons_scrolled.set_child(Some(&buttons_box));
-        right.append(&buttons_scrolled);
-
-        let editor_label = gtk4::Label::new(Some("Button editor"));
-        editor_label.set_halign(gtk4::Align::Start);
-        editor_label.add_css_class("heading");
-        let button_editor = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        right.append(&editor_label);
-        let properties_scrolled = gtk4::ScrolledWindow::new();
-        properties_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        properties_scrolled.set_vexpand(true);
-        properties_scrolled.set_child(Some(&button_editor));
-        right.append(&properties_scrolled);
-
-        paned.set_start_child(Some(&left));
-        paned.set_end_child(Some(&right));
-
-        let page = Self {
-            root: paned.upcast(),
-            layer_rows: rows,
-            layer_header,
-            buttons_box,
-            button_editor,
-        };
-
-        // ---- wiring ------------------------------------------------
-        page.layer_rows.connect_row_selected(glib::clone!(
-            #[strong]
-            editor,
-            move |_, row| {
-                let Some(row) = row else { return };
-                let index = row.index() as usize;
-                let name = editor
-                    .doc
-                    .borrow_mut()
-                    .layers()
-                    .get(index)
-                    .map(|layer| layer.name.clone());
-                if let Some(name) = name {
-                    if editor.selection.borrow().layer == index {
-                        return;
-                    }
-                    *editor.selection.borrow_mut() = Selection {
-                        layer: index,
-                        button: None,
-                    };
-                    editor.preview.set_layer(&name);
-                    editor.selection_changed();
-                }
-            }
-        ));
-
-        add.connect_clicked(glib::clone!(
-            #[strong]
-            editor,
-            move |_| {
-                let name = {
-                    let mut doc = editor.doc.borrow_mut();
-                    let layers = doc.layers_mut();
-                    let mut n = layers.len() + 1;
-                    while layers
-                        .iter()
-                        .any(|layer| layer.name == format!("layer-{n}"))
-                    {
-                        n += 1;
-                    }
-                    let name = format!("layer-{n}");
-                    layers.push(dfr_config::LayerConfig {
-                        name: name.clone(),
-                        keys: vec![dfr_config::ButtonConfig {
-                            text: Some("Button".into()),
-                            ..Default::default()
-                        }],
-                    });
-                    name
-                };
-                let count = editor.doc.borrow_mut().layers().len();
-                *editor.selection.borrow_mut() = Selection {
-                    layer: count - 1,
-                    button: None,
-                };
-                editor.preview.set_layer(&name);
-                editor.restructured();
-            }
-        ));
-
-        themes.connect_selected_notify(glib::clone!(
-            #[strong]
-            editor,
-            #[strong]
-            themes,
-            move |_| {
-                let Some(item) = themes.selected_item().and_downcast::<gtk4::StringObject>() else {
-                    return;
-                };
-                let name = item.string().to_string();
-                if name == "Active" {
-                    return;
-                }
-                // Choosing a theme in the preview pins it in the
-                // document, exactly like writing `ActiveTheme` by hand.
-                editor.doc.borrow_mut().user_mut().active_theme = Some(name);
-                editor.run_pipeline();
-            }
-        ));
-
-        width_toggle.connect_toggled(glib::clone!(
-            #[strong]
-            editor,
-            move |toggle| {
-                editor
-                    .preview
-                    .set_width(if toggle.is_active() { 2170 } else { 2008 });
-                editor.preview.render(&editor.doc.borrow());
-            }
-        ));
-
-        let root = page.root.downgrade();
-        let rows = page.layer_rows.downgrade();
-        let header = page.layer_header.downgrade();
-        let buttons = page.buttons_box.downgrade();
-        let properties = page.button_editor.downgrade();
-        editor.set_on_selection(Box::new(move |editor| {
-            if let (
-                Some(root),
-                Some(layer_rows),
-                Some(layer_header),
-                Some(buttons_box),
-                Some(button_editor),
-            ) = (
-                root.upgrade(),
-                rows.upgrade(),
-                header.upgrade(),
-                buttons.upgrade(),
-                properties.upgrade(),
-            ) {
-                let page = Self {
-                    root,
-                    layer_rows,
-                    layer_header,
-                    buttons_box,
-                    button_editor,
-                };
-                page.refresh_layer_header(&editor);
-                let layers = editor.doc.borrow_mut().layers().clone();
-                page.refresh_buttons(&editor, &layers);
-            }
-        }));
-        page
-    }
-
-    /// Rebuild the page from the document (structural changes; value
-    /// widgets are rebuilt with their rows, which is plenty fast at
-    /// deck sizes).
-    pub fn refresh(&self, editor: &Rc<Editor>) {
-        let (layers, default_layer, fn_layer, reachable) = {
-            let mut doc = editor.doc.borrow_mut();
-            (
-                doc.layers().clone(),
-                doc.user().default_layer.clone(),
-                doc.user().fn_layer.clone(),
-                doc.reachable_layers(),
-            )
-        };
-
-        let selected_name = editor
-            .selection
-            .borrow()
-            .layer
-            .checked_sub(0)
-            .and_then(|i| layers.get(i).map(|l| l.name.clone()));
-
-        let mut child = self.layer_rows.first_child();
-        while let Some(row) = child {
-            child = row.next_sibling();
-            self.layer_rows.remove(&row);
-        }
-        for layer in &layers {
-            self.layer_rows.append(&layer_row(
-                editor,
-                layer,
-                &default_layer,
-                &fn_layer,
-                &reachable,
-            ));
-        }
-        // Restore selection by name so reorders keep their target.
-        let mut selected = false;
-        if let Some(name) = &selected_name {
-            for (index, layer) in layers.iter().enumerate() {
-                if &layer.name == name {
-                    if let Some(row) = self.layer_rows.row_at_index(index as i32) {
-                        self.layer_rows.select_row(Some(&row));
-                        selected = true;
-                    }
-                }
-            }
-        }
-        if !selected {
-            let index = editor
-                .selection
-                .borrow()
-                .layer
-                .min(layers.len().saturating_sub(1));
-            *editor.selection.borrow_mut() = Selection {
-                layer: index,
-                button: None,
-            };
-            if let Some(layer) = layers.get(index) {
-                editor.preview.set_layer(&layer.name);
-            }
-            if let Some(row) = self.layer_rows.row_at_index(index as i32) {
-                self.layer_rows.select_row(Some(&row));
-            }
-        }
-
-        self.refresh_layer_header(editor);
-        self.refresh_buttons(editor, &layers);
-    }
-
-    fn refresh_layer_header(&self, editor: &Rc<Editor>) {
-        let mut child = self.layer_header.first_child();
-        while let Some(widget) = child {
-            child = widget.next_sibling();
-            self.layer_header.remove(&widget);
-        }
-        let selection = editor.selection.borrow().clone();
-        let Some(layer_index) = selection.layer.checked_sub(0) else {
-            return;
-        };
-        let Some(layer) = editor.doc.borrow_mut().layers().get(layer_index).cloned() else {
-            return;
-        };
-
-        self.layer_header
-            .append(&gtk4::Label::new(Some("Layer name:")));
-        let name = gtk4::Entry::new();
-        name.set_text(&layer.name);
-        name.set_hexpand(true);
-        self.layer_header.append(&name);
-        let default_toggle = gtk4::CheckButton::with_label("Default layer");
-        default_toggle.set_active(
-            editor
-                .doc
-                .borrow()
-                .user()
-                .default_layer
-                .as_deref()
-                .is_some_and(|n| n == layer.name),
-        );
-        let fn_toggle = gtk4::CheckButton::with_label("Fn layer");
-        fn_toggle.set_active(
-            editor
-                .doc
-                .borrow()
-                .user()
-                .fn_layer
-                .as_deref()
-                .is_some_and(|n| n == layer.name),
-        );
-        let remove = gtk4::Button::from_icon_name("user-trash-symbolic");
-        remove.add_css_class("destructive-action");
-        remove.set_tooltip_text(Some("Delete this layer"));
-        self.layer_header.append(&default_toggle);
-        self.layer_header.append(&fn_toggle);
-        self.layer_header.append(&remove);
-
-        name.connect_changed(glib::clone!(
-            #[strong]
-            editor,
-            move |entry| {
-                let new = entry.text().to_string();
-                if new.is_empty() {
-                    return;
-                }
-                editor.edit_selected_layer(|layer| {
-                    if layer.name != new {
-                        layer.name = new.clone();
-                    }
-                });
-                editor.preview.set_layer(&new);
-            }
-        ));
-
-        default_toggle.connect_toggled(glib::clone!(
-            #[strong]
-            editor,
-            move |toggle| {
-                let name = editor.selected_button_layer_name();
-                if let Some(name) = name {
-                    let pinned = toggle.is_active().then_some(name);
-                    editor.doc.borrow_mut().user_mut().default_layer = pinned;
-                    editor.restructured();
-                }
-            }
-        ));
-
-        fn_toggle.connect_toggled(glib::clone!(
-            #[strong]
-            editor,
-            move |toggle| {
-                let name = editor.selected_button_layer_name();
-                if let Some(name) = name {
-                    let pinned = toggle.is_active().then_some(name);
-                    editor.doc.borrow_mut().user_mut().fn_layer = pinned;
-                    editor.restructured();
-                }
-            }
-        ));
-
-        remove.connect_clicked(glib::clone!(
-            #[strong]
-            editor,
-            move |_| {
-                let selection = editor.selection.borrow().clone();
-                let name = editor
-                    .doc
-                    .borrow_mut()
-                    .layers()
-                    .get(selection.layer)
-                    .map(|layer| layer.name.clone());
-                let Some(name) = name else { return };
-                {
-                    let mut doc = editor.doc.borrow_mut();
-                    doc.layers_mut().remove(selection.layer);
-                    // References to the removed layer go with it.
-                    if doc.user().default_layer.as_deref() == Some(name.as_str()) {
-                        let fallback = doc.layers().first().map(|l| l.name.clone());
-                        doc.user_mut().default_layer = fallback;
-                    }
-                    if doc.user().fn_layer.as_deref() == Some(name.as_str()) {
-                        doc.user_mut().fn_layer = None;
-                    }
-                }
-                *editor.selection.borrow_mut() = Selection {
-                    layer: selection.layer.saturating_sub(1),
-                    button: None,
-                };
-                editor.restructured();
-            }
-        ));
-    }
-
-    fn refresh_buttons(&self, editor: &Rc<Editor>, layers: &[dfr_config::LayerConfig]) {
-        let mut child = self.buttons_box.first_child();
-        while let Some(widget) = child {
-            child = widget.next_sibling();
-            self.buttons_box.remove(&widget);
-        }
-        let selection = editor.selection.borrow().clone();
-        let Some(layer_index) = selection.layer.checked_sub(0) else {
-            return;
-        };
-        let Some(layer) = layers.get(layer_index) else {
-            return;
-        };
-
-        for (button_index, button) in layer.keys.iter().enumerate() {
-            self.buttons_box
-                .append(&button_card(editor, layer_index, button_index, button));
-        }
-        let add = gtk4::Button::from_icon_name("list-add-symbolic");
-        add.set_tooltip_text(Some("Add a button"));
-        add.set_valign(gtk4::Align::Center);
-        add.connect_clicked(glib::clone!(
-            #[strong]
-            editor,
-            move |_| {
-                let new_index = {
-                    let mut doc = editor.doc.borrow_mut();
-                    let layers = doc.layers_mut();
-                    layers
-                        .get_mut(layer_index)
-                        .map(|layer| {
-                            layer.keys.push(dfr_config::ButtonConfig {
-                                text: Some("Button".into()),
-                                ..Default::default()
-                            });
-                            layer.keys.len() - 1
-                        })
-                        .unwrap_or(0)
-                };
-                *editor.selection.borrow_mut() = Selection {
-                    layer: layer_index,
-                    button: Some(new_index),
-                };
-                editor.restructured();
-            }
-        ));
-        self.buttons_box.append(&add);
-
-        self.refresh_button_editor(editor, layers);
-    }
-
-    fn refresh_button_editor(&self, editor: &Rc<Editor>, layers: &[dfr_config::LayerConfig]) {
-        let mut child = self.button_editor.first_child();
-        while let Some(widget) = child {
-            child = widget.next_sibling();
-            self.button_editor.remove(&widget);
-        }
-        let selection = editor.selection.borrow().clone();
-        let Some(layer) = selection.layer.checked_sub(0).and_then(|i| layers.get(i)) else {
-            self.button_editor
-                .append(&gtk4::Label::new(Some("Select a button to edit it.")));
-            return;
-        };
-        let Some(button_index) = selection.button else {
-            self.button_editor
-                .append(&gtk4::Label::new(Some("Select a button to edit it.")));
-            return;
-        };
-        let Some(button) = layer.keys.get(button_index) else {
-            return;
-        };
-        self.button_editor.append(&button_editor(
-            editor,
-            selection.layer,
-            button_index,
-            button,
-        ));
-    }
-}
-
-/// Mutate one identified button through a single borrow, then notify.
-fn edit_button(
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    change: impl FnOnce(&mut dfr_config::ButtonConfig),
-) {
-    {
-        let mut doc = editor.doc.borrow_mut();
-        let target = doc
-            .layers_mut()
-            .get_mut(layer_index)
-            .and_then(|layer| layer.keys.get_mut(button_index));
-        if let Some(button) = target {
-            change(button);
-        }
-    }
-    editor.run_pipeline();
-}
-
-impl Editor {
-    fn selected_button_layer_name(&self) -> Option<String> {
-        let selection = self.selection.borrow().clone();
-        self.doc
-            .borrow_mut()
-            .layers()
-            .get(selection.layer)
-            .map(|layer| layer.name.clone())
-    }
-}
-
-/// The accent a wire name names (the same lowercase spelling the
-/// configuration's enum accepts).
 pub(crate) fn accent_from_name(name: &str) -> Option<dfr_config::ButtonAccent> {
     use dfr_config::ButtonAccent;
     Some(match name {
@@ -692,918 +126,1085 @@ pub(crate) fn accent_from_name(name: &str) -> Option<dfr_config::ButtonAccent> {
     })
 }
 
-fn badge(text: &str, css: &str) -> gtk4::Widget {
-    let label = gtk4::Label::new(Some(text));
-    label.add_css_class("badge");
-    label.add_css_class(css);
-    label.set_valign(gtk4::Align::Center);
-    label.upcast()
+pub struct LayersPage {
+    pub root: adw::NavigationSplitView,
+    rows: gtk4::ListBox,
+    buttons: gtk4::ListBox,
+    heading: adw::WindowTitle,
+    help: gtk4::Label,
+    navigation: adw::NavigationView,
+    overview: adw::NavigationPage,
+    detail: RefCell<Option<adw::NavigationPage>>,
+    refreshing: std::cell::Cell<bool>,
 }
 
-/// One layer's row: name, badges, and reordering.
-fn layer_row(
-    editor: &Rc<Editor>,
+impl LayersPage {
+    pub fn build(editor: &Rc<Editor>) -> Rc<Self> {
+        let split = adw::NavigationSplitView::builder()
+            .min_sidebar_width(220.0)
+            .max_sidebar_width(280.0)
+            .sidebar_width_fraction(0.23)
+            .build();
+        let rows = gtk4::ListBox::new();
+        rows.set_selection_mode(gtk4::SelectionMode::Single);
+        rows.add_css_class("navigation-sidebar");
+        ui::margins(&rows, 12);
+        let add = gtk4::Button::from_icon_name("list-add-symbolic");
+        add.set_tooltip_text(Some("Add Layer"));
+        let sidebar_header = adw::HeaderBar::new();
+        sidebar_header.set_show_start_title_buttons(false);
+        sidebar_header.set_show_end_title_buttons(false);
+        sidebar_header.pack_end(&add);
+        let sidebar_toolbar = adw::ToolbarView::new();
+        sidebar_toolbar.add_top_bar(&sidebar_header);
+        sidebar_toolbar.set_content(Some(&ui::scroll(&rows)));
+        let sidebar = adw::NavigationPage::new(&sidebar_toolbar, "Layers");
+        sidebar.set_tag(Some("collection"));
+        split.set_sidebar(Some(&sidebar));
+
+        let navigation = adw::NavigationView::new();
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+        ui::margins(&content, 24);
+        content.append(&crate::preview::compact(editor, &editor.preview));
+        let add_button = gtk4::Button::with_label("Add Button");
+        content.append(&ui::header("Buttons", &add_button));
+        let buttons = gtk4::ListBox::new();
+        buttons.set_selection_mode(gtk4::SelectionMode::Single);
+        buttons.add_css_class("boxed-list");
+        content.append(&ui::scroll(&buttons));
+        let help = gtk4::Label::new(Some("Choose a button to change its appearance or action."));
+        help.set_wrap(true);
+        help.set_xalign(0.0);
+        help.add_css_class("dim-label");
+        content.append(&help);
+        let heading = adw::WindowTitle::new("", "");
+        let options = gtk4::Button::with_label("Layer Options");
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        header.set_title_widget(Some(&heading));
+        header.pack_end(&options);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        let overview = adw::NavigationPage::new(&toolbar, "Buttons");
+        overview.set_tag(Some("buttons"));
+        navigation.add(&overview);
+        let workspace = adw::NavigationPage::new(&navigation, "Layer");
+        workspace.set_tag(Some("workspace"));
+        split.set_content(Some(&workspace));
+        split.set_show_content(true);
+        let page = Rc::new(Self {
+            root: split,
+            rows,
+            buttons,
+            heading,
+            help,
+            navigation,
+            overview,
+            detail: RefCell::new(None),
+            refreshing: std::cell::Cell::new(false),
+        });
+        page.rows.connect_row_selected(glib::clone!(
+            #[weak]
+            page,
+            #[strong]
+            editor,
+            move |_, row| {
+                if page.refreshing.get() {
+                    return;
+                }
+                if let Some(row) = row {
+                    // GTK can reselect the current row while restoring focus after
+                    // a structural edit. That is not a request to leave properties.
+                    if editor.selection.borrow().layer == row.index() as usize {
+                        return;
+                    }
+                    editor.select(row.index() as usize, None);
+                    page.root.set_show_content(true);
+                }
+            }
+        ));
+        // Activating the selected collection row also enters it when collapsed.
+        page.rows.connect_row_activated(glib::clone!(
+            #[weak]
+            page,
+            #[strong]
+            editor,
+            move |_, row| {
+                editor.select(row.index() as usize, None);
+                page.root.set_show_content(true);
+            }
+        ));
+        add.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let count = {
+                    let mut doc = editor.doc.borrow_mut();
+                    let layers = doc.layers();
+                    let mut n = layers.len() + 1;
+                    while layers.iter().any(|l| l.name == format!("Layer {n}")) {
+                        n += 1;
+                    }
+                    layers.push(dfr_config::LayerConfig {
+                        name: format!("Layer {n}"),
+                        keys: vec![new_button()],
+                    });
+                    layers.len()
+                };
+                *editor.selection.borrow_mut() = Selection {
+                    layer: count - 1,
+                    button: None,
+                };
+                editor.restructured();
+                editor.select(count - 1, None);
+            }
+        ));
+        add_button.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |_| {
+                let layer = editor.selection.borrow().layer;
+                let index = {
+                    let mut doc = editor.doc.borrow_mut();
+                    let Some(layer) = doc.layers().get_mut(layer) else {
+                        return;
+                    };
+                    layer.keys.push(new_button());
+                    layer.keys.len() - 1
+                };
+                *editor.selection.borrow_mut() = Selection {
+                    layer,
+                    button: Some(index),
+                };
+                editor.restructured();
+                editor.select(layer, Some(index));
+            }
+        ));
+        options.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            move |button| layer_options(&editor, button)
+        ));
+        page.refresh(editor);
+        page
+    }
+
+    pub fn refresh(&self, editor: &Rc<Editor>) {
+        self.refreshing.set(true);
+        while let Some(child) = self.rows.first_child() {
+            self.rows.remove(&child);
+        }
+        let layers = editor.doc.borrow().layer_snapshot();
+        let (startup, function) = editor.doc.borrow().layer_roles();
+        for layer in &layers {
+            let row = adw::ActionRow::builder()
+                .use_markup(false)
+                .title(&layer.name)
+                .subtitle(layer_subtitle(layer, &startup, &function))
+                .build();
+            row.set_activatable(true);
+            self.rows.append(&row);
+        }
+        let index = editor
+            .selection
+            .borrow()
+            .layer
+            .min(layers.len().saturating_sub(1));
+        editor.selection.borrow_mut().layer = index;
+        self.rows
+            .select_row(self.rows.row_at_index(index as i32).as_ref());
+        self.refreshing.set(false);
+        self.refresh_buttons(editor);
+        self.update_summaries(editor);
+        let selection = editor.selection.borrow().clone();
+        if selection.button.is_some() {
+            self.show_selection(editor);
+        }
+    }
+
+    fn refresh_buttons(&self, editor: &Rc<Editor>) {
+        while let Some(child) = self.buttons.first_child() {
+            self.buttons.remove(&child);
+        }
+        let selection = editor.selection.borrow().clone();
+        let layers = editor.doc.borrow().layer_snapshot();
+        if let Some(layer) = layers.get(selection.layer) {
+            for (index, button) in layer.keys.iter().enumerate() {
+                let row = adw::ActionRow::builder()
+                    .use_markup(false)
+                    .title(button_title(button))
+                    .subtitle(action_summary(&button.action))
+                    .activatable(true)
+                    .build();
+                row.add_prefix(&ui::icon(button));
+                row.add_prefix(&gtk4::Label::new(Some(&(index + 1).to_string())));
+                row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+                row.connect_activated(glib::clone!(
+                    #[strong]
+                    editor,
+                    move |_| editor.select(selection.layer, Some(index))
+                ));
+                self.buttons.append(&row);
+            }
+        }
+        self.buttons.select_row(
+            selection
+                .button
+                .and_then(|index| self.buttons.row_at_index(index as i32))
+                .as_ref(),
+        );
+    }
+
+    pub fn show_selection(&self, editor: &Rc<Editor>) {
+        self.refreshing.set(true);
+        self.rows.select_row(
+            self.rows
+                .row_at_index(editor.selection.borrow().layer as i32)
+                .as_ref(),
+        );
+        self.refreshing.set(false);
+        self.refresh_buttons(editor);
+        self.update_summaries(editor);
+        let selection = editor.selection.borrow().clone();
+        let layers = editor.doc.borrow().layer_snapshot();
+        let Some(layer) = layers.get(selection.layer) else {
+            return;
+        };
+        let Some(button) = selection.button.and_then(|index| layer.keys.get(index)) else {
+            self.navigation.pop_to_page(&self.overview);
+            return;
+        };
+        editor.preview.set_layer(&layer.name);
+        let title = format!("{} · {}", button_title(button), layer.name);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+        ui::margins(&content, 24);
+        let preview = Preview::new(&layer.name);
+        preview.copy_context(&editor.preview);
+        editor.previews.borrow_mut().push(Rc::downgrade(&preview));
+        content.append(&crate::preview::compact(editor, &preview));
+        content.append(&button_editor(
+            editor,
+            selection.layer,
+            selection.button.unwrap(),
+            button,
+        ));
+        // Keep this view's renderer alive for precisely the page lifetime.
+        content.connect_destroy(move |_| {
+            let _ = &preview;
+        });
+        let options = gtk4::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Button Options")
+            .build();
+        let popover = gtk4::Popover::new();
+        let actions = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        ui::margins(&actions, 12);
+        for (label, delta) in [("Move Earlier", -1), ("Move Later", 1)] {
+            let action = gtk4::Button::with_label(label);
+            let index = selection.button.unwrap();
+            action.set_sensitive(if delta < 0 {
+                index > 0
+            } else {
+                index + 1 < layer.keys.len()
+            });
+            action.connect_clicked(glib::clone!(
+                #[strong]
+                editor,
+                #[weak]
+                popover,
+                move |_| {
+                    popover.popdown();
+                    move_button(&editor, selection.layer, index, delta);
+                }
+            ));
+            actions.append(&action);
+        }
+        let remove = gtk4::Button::with_label("Delete Button");
+        remove.set_sensitive(layer.keys.len() > 1);
+        remove.set_tooltip_text(Some("A layer must keep at least one button"));
+        remove.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            #[weak]
+            popover,
+            move |_| {
+                popover.popdown();
+                let mut doc = editor.doc.borrow_mut();
+                let keys = &mut doc.layers()[selection.layer].keys;
+                if keys.len() <= 1 {
+                    return;
+                }
+                keys.remove(selection.button.unwrap());
+                drop(doc);
+                editor.selection.borrow_mut().button = None;
+                editor.restructured();
+                editor.select(selection.layer, None);
+            }
+        ));
+        actions.append(&remove);
+        popover.set_child(Some(&actions));
+        options.set_popover(Some(&popover));
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        header.pack_end(&options);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&content));
+        let existing = self.detail.borrow().clone();
+        let detail = if let Some(detail) = existing {
+            detail.set_title(&title);
+            detail.set_child(Some(&toolbar));
+            detail
+        } else {
+            let detail = adw::NavigationPage::new(&toolbar, &title);
+            detail.set_tag(Some("button"));
+            self.navigation.add(&detail);
+            *self.detail.borrow_mut() = Some(detail.clone());
+            detail
+        };
+        if self.navigation.visible_page().as_ref() != Some(&detail) {
+            self.navigation.push(&detail);
+        }
+        self.root.set_show_content(true);
+    }
+
+    /// Value edits update summaries without rebuilding focused entries.
+    pub fn update_summaries(&self, editor: &Rc<Editor>) {
+        let layers = editor.doc.borrow().layer_snapshot();
+        let (startup, function) = editor.doc.borrow().layer_roles();
+        let reachable = editor.doc.borrow().reachable_layers();
+        for (index, layer) in layers.iter().enumerate() {
+            if let Some(row) = self
+                .rows
+                .row_at_index(index as i32)
+                .and_downcast::<adw::ActionRow>()
+            {
+                row.set_title(&layer.name);
+                row.set_subtitle(&layer_subtitle(layer, &startup, &function));
+            }
+        }
+        if let Some(layer) = layers.get(editor.selection.borrow().layer) {
+            self.help.set_text(if reachable.contains(&layer.name) {
+                "Choose a button to change its appearance or action."
+            } else {
+                "This layer is not linked from Startup or Fn. Add a button that opens it, or assign it in Behavior → Layer Switching."
+            });
+            self.heading.set_title(&layer.name);
+            self.heading
+                .set_subtitle(&layer_subtitle(layer, &startup, &function));
+            self.overview.set_title(&layer.name);
+            for (index, button) in layer.keys.iter().enumerate() {
+                if let Some(row) = self
+                    .buttons
+                    .row_at_index(index as i32)
+                    .and_downcast::<adw::ActionRow>()
+                {
+                    row.set_title(&button_title(button));
+                    row.set_subtitle(&action_summary(&button.action));
+                }
+            }
+        }
+    }
+}
+
+fn layer_subtitle(
     layer: &dfr_config::LayerConfig,
-    default_layer: &Option<String>,
-    fn_layer: &Option<String>,
-    reachable: &[String],
-) -> gtk4::Widget {
-    let row = gtk4::ListBoxRow::new();
-    let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    box_.set_margin_top(6);
-    box_.set_margin_bottom(6);
-    box_.set_margin_start(8);
-    box_.set_margin_end(4);
-    let label = gtk4::Label::new(Some(&layer.name));
-    label.set_hexpand(true);
-    label.set_halign(gtk4::Align::Start);
-    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    box_.append(&label);
-    if default_layer.as_deref() == Some(layer.name.as_str()) {
-        box_.append(&badge("default", "suggested-action"));
+    startup: &str,
+    function: &Option<String>,
+) -> String {
+    let mut roles = Vec::new();
+    if layer.name == startup {
+        roles.push("Startup");
     }
-    if fn_layer.as_deref() == Some(layer.name.as_str()) {
-        box_.append(&badge("fn", "accent"));
+    if function.as_deref() == Some(&layer.name) {
+        roles.push("Fn");
     }
-    if !reachable.contains(&layer.name) {
-        box_.append(&badge("unreachable", "warning"));
-    }
-    let count = gtk4::Label::new(Some(&format!("{} buttons", layer.keys.len())));
-    count.add_css_class("dim-label");
-    box_.append(&count);
-
-    let up = gtk4::Button::from_icon_name("go-up-symbolic");
-    up.set_tooltip_text(Some("Move layer up"));
-    let down = gtk4::Button::from_icon_name("go-down-symbolic");
-    down.set_tooltip_text(Some("Move layer down"));
-    up.add_css_class("flat");
-    down.add_css_class("flat");
-    box_.append(&up);
-    box_.append(&down);
-    row.set_child(Some(&box_));
-
-    let index = editor
-        .doc
-        .borrow_mut()
-        .layers()
-        .iter()
-        .position(|candidate| candidate.name == layer.name)
-        .unwrap_or_default();
-    up.connect_clicked(glib::clone!(
-        #[strong]
-        editor,
-        move |_| {
-            move_layer(&editor, index, -1);
-        }
-    ));
-    down.connect_clicked(glib::clone!(
-        #[strong]
-        editor,
-        move |_| {
-            move_layer(&editor, index, 1);
-        }
-    ));
-    row.upcast()
+    let prefix = if roles.is_empty() {
+        String::new()
+    } else {
+        format!("{} · ", roles.join(" / "))
+    };
+    format!("{prefix}{} authored buttons", layer.keys.len())
 }
 
-fn move_layer(editor: &Rc<Editor>, index: usize, delta: i32) {
-    let target = index as i32 + delta;
-    if target < 0 {
-        return;
+pub fn button_title(button: &dfr_config::ButtonConfig) -> String {
+    if let Some(text) = &button.text {
+        return text.clone();
     }
-    let target = target as usize;
+    if let Some(icon) = &button.icon {
+        return match &button.action {
+            dfr_config::ButtonAction::VolumeSlider => "Volume".into(),
+            dfr_config::ButtonAction::BrightnessSlider => "Brightness".into(),
+            _ => match icon.as_str() {
+                "play_pause" => "Play/Pause".into(),
+                "fast_rewind" => "Previous Track".into(),
+                "fast_forward" => "Next Track".into(),
+                _ => icon.replace(['_', '-'], " "),
+            },
+        };
+    }
+    button_kind(button).label().into()
+}
+
+pub fn action_summary(action: &dfr_config::ButtonAction) -> String {
+    match ActionForm::of(action) {
+        ActionForm::SwitchLayer(layer) => format!("Open {layer} layer"),
+        ActionForm::Command(command) => format!("Run {command}"),
+        ActionForm::CommandLayer { command, layer } => format!("Run {command} · then open {layer}"),
+        ActionForm::Keys(keys) => keys_label(&keys),
+        ActionForm::ApplyTheme(theme) => format!("Use {theme} theme"),
+        ActionForm::ApplyThemeLayer { theme, layer } => {
+            format!("Use {theme} theme · then open {layer}")
+        }
+        other => other.label().into(),
+    }
+}
+
+fn new_button() -> dfr_config::ButtonConfig {
+    dfr_config::ButtonConfig {
+        text: Some("Button".into()),
+        ..Default::default()
+    }
+}
+
+fn edit_button(
+    editor: &Rc<Editor>,
+    layer: usize,
+    index: usize,
+    change: impl FnOnce(&mut dfr_config::ButtonConfig),
+) {
     {
         let mut doc = editor.doc.borrow_mut();
-        let layers = doc.layers_mut();
-        if target < layers.len() {
-            layers.swap(index, target);
+        if let Some(button) = doc
+            .layers()
+            .get_mut(layer)
+            .and_then(|l| l.keys.get_mut(index))
+        {
+            change(button);
         }
     }
-    *editor.selection.borrow_mut() = Selection {
-        layer: target,
-        button: None,
-    };
+    editor.run_pipeline();
+}
+
+fn move_button(editor: &Rc<Editor>, layer: usize, index: usize, delta: i32) {
+    let count = editor.doc.borrow().layer_snapshot()[layer].keys.len();
+    let target = index as i32 + delta;
+    if target < 0 || target as usize >= count {
+        return;
+    }
+    editor.doc.borrow_mut().layers()[layer]
+        .keys
+        .swap(index, target as usize);
+    editor.selection.borrow_mut().button = Some(target as usize);
     editor.restructured();
 }
 
-/// One button's card: a summary, reordering, selection, removal.
-fn button_card(
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    button: &dfr_config::ButtonConfig,
-) -> gtk4::Widget {
-    let frame = gtk4::Frame::new(None);
-    frame.set_valign(gtk4::Align::Start);
-    let box_ = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-    box_.set_margin_top(6);
-    box_.set_margin_bottom(6);
-    box_.set_margin_start(8);
-    box_.set_margin_end(8);
-    let kind = button_kind(button);
-    let summary = match kind {
-        ButtonKind::Text => button.text.clone().unwrap_or_default(),
-        ButtonKind::Icon => format!("icon: {}", button.icon.clone().unwrap_or_default()),
-        ButtonKind::Time => format!("clock ({})", button.time.clone().unwrap_or_default()),
-        ButtonKind::Battery => "battery".to_owned(),
-        ButtonKind::Waveform => "waveform".to_owned(),
-        ButtonKind::Visualizer => "visualizer".to_owned(),
-        ButtonKind::NowPlaying => "now playing".to_owned(),
-        ButtonKind::Spacer => "spacer".to_owned(),
+fn layer_options(editor: &Rc<Editor>, parent: &gtk4::Button) {
+    let index = editor.selection.borrow().layer;
+    let layers = editor.doc.borrow().layer_snapshot();
+    let Some(layer) = layers.get(index) else {
+        return;
     };
-    let kind_label = gtk4::Label::new(Some(kind.label()));
-    kind_label.add_css_class("dim-label");
-    let label = gtk4::Label::new(Some(&summary));
-    label.set_width_chars(12);
-    label.set_max_width_chars(14);
-    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    box_.append(&kind_label);
-    box_.append(&label);
-    if button.stretch.unwrap_or(1) > 1 {
-        box_.append(&gtk4::Label::new(Some(&format!(
-            "stretch ×{}",
-            button.stretch.unwrap_or(1)
-        ))));
+    let dialog = adw::Dialog::builder()
+        .title("Layer Options")
+        .content_width(480)
+        .content_height(520)
+        .build();
+    let page = adw::PreferencesPage::new();
+    let group = ui::group("Layer Name");
+    let name = ui::entry("Name", &layer.name);
+    name.set_show_apply_button(true);
+    let feedback = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Rename updates all layer links together")
+        .build();
+    name.connect_apply(glib::clone!(
+        #[strong]
+        editor,
+        #[weak]
+        feedback,
+        move |entry| {
+            let result = editor.doc.borrow_mut().rename_layer(index, &entry.text());
+            match result {
+                Ok(()) => {
+                    feedback.set_title("Renamed");
+                    editor.restructured();
+                    editor.select(index, None);
+                }
+                Err(error) => feedback.set_title(&error.to_string()),
+            }
+        }
+    ));
+    group.add(&name);
+    group.add(&feedback);
+    page.add(&group);
+    let assignments = ui::group("Assignments");
+    let link = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Startup and Fn Layers")
+        .subtitle("Choose them in Behavior → Layer Switching")
+        .activatable(true)
+        .build();
+    link.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+    link.connect_activated(glib::clone!(
+        #[weak]
+        dialog,
+        move |row| {
+            let _ = row.activate_action("win.show-behavior", None);
+            dialog.close();
+        }
+    ));
+    assignments.add(&link);
+    page.add(&assignments);
+    let order = ui::group("Order");
+    for (title, delta) in [("Move Earlier", -1), ("Move Later", 1)] {
+        let row = adw::ActionRow::builder()
+            .use_markup(false)
+            .title(title)
+            .activatable(true)
+            .build();
+        let target = index as i32 + delta;
+        row.set_sensitive(target >= 0 && (target as usize) < layers.len());
+        row.connect_activated(glib::clone!(
+            #[strong]
+            editor,
+            #[weak]
+            dialog,
+            move |_| {
+                editor
+                    .doc
+                    .borrow_mut()
+                    .layers()
+                    .swap(index, target as usize);
+                editor.selection.borrow_mut().layer = target as usize;
+                editor.restructured();
+                editor.select(target as usize, None);
+                dialog.close();
+            }
+        ));
+        order.add(&row);
     }
-    let action_label = gtk4::Label::new(Some(ActionForm::of(&button.action).label()));
-    action_label.add_css_class("dim-label");
-    action_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    action_label.set_max_width_chars(14);
-    box_.append(&action_label);
-
-    let controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
-    let left = gtk4::Button::from_icon_name("go-previous-symbolic");
-    left.set_tooltip_text(Some("Move left"));
-    left.add_css_class("flat");
-    let right = gtk4::Button::from_icon_name("go-next-symbolic");
-    right.set_tooltip_text(Some("Move right"));
-    right.add_css_class("flat");
-    let remove = gtk4::Button::from_icon_name("user-trash-symbolic");
-    remove.set_tooltip_text(Some("Remove button"));
-    remove.add_css_class("flat");
-    controls.append(&left);
-    controls.append(&right);
-    controls.append(&remove);
-    box_.append(&controls);
-    frame.set_child(Some(&box_));
-
-    let clickable = gtk4::GestureClick::new();
-    clickable.connect_pressed(glib::clone!(
-        #[strong]
-        editor,
-        move |_, _, _, _| {
-            *editor.selection.borrow_mut() = Selection {
-                layer: layer_index,
-                button: Some(button_index),
-            };
-            editor.selection_changed();
-        }
+    page.add(&order);
+    let delete = ui::group("Delete Layer");
+    let links = editor.doc.borrow().incoming_links(index);
+    let (startup, function) = editor.doc.borrow().layer_roles();
+    let needs_repair =
+        startup == layer.name || function.as_deref() == Some(&layer.name) || !links.is_empty();
+    delete.set_description(Some(if needs_repair {
+        "This layer has assignments or incoming links. Choose where they should go before deleting it."
+    } else { "This removes the layer and its buttons from the draft." }));
+    for (from, button, name) in links {
+        let row = adw::ActionRow::builder()
+            .use_markup(false)
+            .title(format!("{name} · button {}", button + 1))
+            .subtitle("Open the button that links here")
+            .activatable(true)
+            .build();
+        row.connect_activated(glib::clone!(
+            #[strong]
+            editor,
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+                editor.select(from, Some(button));
+            }
+        ));
+        delete.add(&row);
+    }
+    let mut replacements = vec!["Choose…".to_owned()];
+    replacements.extend(
+        layers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, l)| l.name.clone()),
+    );
+    let strings: Vec<&str> = replacements.iter().map(String::as_str).collect();
+    let replacement = ui::combo("Move Links and Assignments To", &strings, 0);
+    if needs_repair {
+        delete.add(&replacement);
+    }
+    let remove = gtk4::Button::with_label("Delete Layer");
+    remove.add_css_class("destructive-action");
+    remove.set_sensitive(layers.len() > 1 && !needs_repair);
+    let can_delete = layers.len() > 1;
+    replacement.connect_selected_notify(glib::clone!(
+        #[weak]
+        remove,
+        move |row| remove.set_sensitive(can_delete && row.selected() > 0)
     ));
-    frame.add_controller(clickable);
-
-    left.connect_clicked(glib::clone!(
-        #[strong]
-        editor,
-        move |_| {
-            move_button(&editor, layer_index, button_index, -1);
-        }
-    ));
-    right.connect_clicked(glib::clone!(
-        #[strong]
-        editor,
-        move |_| {
-            move_button(&editor, layer_index, button_index, 1);
-        }
-    ));
+    let remove_row = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Delete This Layer")
+        .build();
+    remove.set_valign(gtk4::Align::Center);
+    remove_row.add_suffix(&remove);
+    delete.add(&remove_row);
+    page.add(&delete);
     remove.connect_clicked(glib::clone!(
         #[strong]
         editor,
-        move |_| {
-            {
-                let mut doc = editor.doc.borrow_mut();
-                if let Some(layer) = doc.layers_mut().get_mut(layer_index) {
-                    if button_index < layer.keys.len() {
-                        layer.keys.remove(button_index);
-                    }
-                }
-            }
-            *editor.selection.borrow_mut() = Selection {
-                layer: layer_index,
-                button: None,
+        #[weak]
+        dialog,
+        move |button| {
+            let target = if needs_repair {
+                replacements
+                    .get(replacement.selected() as usize)
+                    .filter(|_| replacement.selected() > 0)
+                    .map(String::as_str)
+            } else {
+                None
             };
-            editor.restructured();
+            let result = editor.doc.borrow_mut().delete_layer(index, target);
+            match result {
+                Ok(()) => {
+                    let layer = index.saturating_sub(1);
+                    *editor.selection.borrow_mut() = Selection {
+                        layer,
+                        button: None,
+                    };
+                    editor.restructured();
+                    editor.select(layer, None);
+                    dialog.close();
+                }
+                Err(error) => ui::error_dialog(button, "Cannot Delete Layer", &error.to_string()),
+            }
         }
     ));
-
-    let is_selected = {
-        let selection = editor.selection.borrow();
-        selection.button == Some(button_index) && selection.layer == layer_index
-    };
-    if is_selected {
-        frame.add_css_class("selected-frame");
-    }
-    frame.upcast()
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&page));
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(parent));
 }
 
-fn move_button(editor: &Rc<Editor>, layer_index: usize, button_index: usize, delta: i32) {
-    let target = button_index as i32 + delta;
-    if target < 0 {
-        return;
-    }
-    let target = target as usize;
-    {
-        let mut doc = editor.doc.borrow_mut();
-        if let Some(layer) = doc.layers_mut().get_mut(layer_index) {
-            if target < layer.keys.len() {
-                layer.keys.swap(button_index, target);
-            }
-        }
-    }
-    *editor.selection.borrow_mut() = Selection {
-        layer: layer_index,
-        button: Some(target),
-    };
-    editor.restructured();
-}
-
-/// The full button editor: content kind, per-kind fields, size and
-/// accent, and the action editor with key capture.
 fn button_editor(
     editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
+    layer: usize,
+    index: usize,
     button: &dfr_config::ButtonConfig,
-) -> gtk4::Widget {
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
-
-    // ---- content kind ----
-    let kind_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    kind_row.append(&gtk4::Label::new(Some("Content:")));
-    let kinds: Vec<&str> = ButtonKind::ALL.iter().map(|k| k.label()).collect();
-    let kind_dropdown = gtk4::DropDown::from_strings(&kinds);
-    kind_dropdown.set_selected(
-        ButtonKind::ALL
-            .iter()
-            .position(|k| *k == button_kind(button))
-            .unwrap_or(0) as u32,
+) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let appearance = ui::group("Appearance");
+    let kinds: Vec<&str> = ButtonKind::ALL.iter().map(|kind| kind.label()).collect();
+    let kind = button_kind(button);
+    let content = ui::combo(
+        "Content",
+        &kinds,
+        ButtonKind::ALL.iter().position(|k| *k == kind).unwrap_or(0) as u32,
     );
-    kind_row.append(&kind_dropdown);
-    outer.append(&kind_row);
-
-    // ---- per-kind fields ----
-    let fields = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    outer.append(&fields);
-
-    // ---- size and accent ----
-    let size_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    size_row.append(&gtk4::Label::new(Some("Stretch:")));
-    let stretch = gtk4::SpinButton::with_range(1.0, 20.0, 1.0);
-    stretch.set_value(button.stretch.unwrap_or(1) as f64);
-    size_row.append(&stretch);
-    size_row.append(&gtk4::Label::new(Some("Accent:")));
-    let mut accent_names: Vec<&str> = vec!["auto"];
-    accent_names.extend_from_slice(ACCENTS);
-    let accent = gtk4::DropDown::from_strings(&accent_names);
-    let accent_value = button
-        .accent
-        .map(|a| a.name().to_owned())
-        .unwrap_or_else(|| "auto".into());
-    accent.set_selected(
-        accent_names
-            .iter()
-            .position(|name| *name == accent_value)
-            .unwrap_or(0) as u32,
-    );
-    size_row.append(&accent);
-    size_row.append(&gtk4::Label::new(Some("Icon size:")));
-    let icon_width = gtk4::SpinButton::with_range(8.0, 256.0, 1.0);
-    icon_width.set_value(button.icon_width.unwrap_or(40) as f64);
-    let icon_height = gtk4::SpinButton::with_range(8.0, 256.0, 1.0);
-    icon_height.set_value(button.icon_height.unwrap_or(40) as f64);
-    size_row.append(&icon_width);
-    size_row.append(&gtk4::Label::new(Some("×")));
-    size_row.append(&icon_height);
-    outer.append(&size_row);
-
-    // ---- action editor ----
-    outer.append(&action_editor(
-        editor,
-        layer_index,
-        button_index,
-        &button.action,
-    ));
-
-    // ---- plumbing ---------------------------------------------
-    rebuild_kind_fields(
-        &fields,
-        editor,
-        layer_index,
-        button_index,
-        button_kind(button),
-        button,
-    );
-
-    kind_dropdown.connect_selected_notify(glib::clone!(
+    appearance.add(&content);
+    content.connect_selected_notify(glib::clone!(
         #[strong]
         editor,
-        #[strong]
-        fields,
-        #[strong]
-        kind_dropdown,
-        move |_| {
-            let Some(index) = kind_dropdown.selected().checked_sub(0) else {
-                return;
-            };
-            let kind = ButtonKind::ALL[index as usize];
-            editor.edit_selected_button(|button| set_button_kind(button, kind));
-            let snapshot = editor.selected_button();
-            if let Some(button) = snapshot {
-                rebuild_kind_fields(&fields, &editor, layer_index, button_index, kind, &button);
-            }
+        move |row| {
+            edit_button(&editor, layer, index, |button| {
+                set_button_kind(button, ButtonKind::ALL[row.selected() as usize])
+            });
             editor.restructured();
         }
     ));
-
-    stretch.connect_value_changed(glib::clone!(
-        #[strong]
-        editor,
-        move |spin| {
-            let value = spin.value() as usize;
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.stretch = (value > 1).then_some(value);
-            });
-        }
-    ));
-
-    accent.connect_selected_notify(glib::clone!(
-        #[strong]
-        editor,
-        #[strong]
-        accent,
-        move |_| {
-            let index = accent.selected() as usize;
-            let name = accent_names[index];
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.accent = if name == "auto" {
-                    None
-                } else {
-                    accent_from_name(name)
-                };
-            });
-        }
-    ));
-
-    icon_width.connect_value_changed(glib::clone!(
-        #[strong]
-        editor,
-        move |spin| {
-            let value = spin.value() as i32;
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.icon_width = (value != 40).then_some(value);
-            });
-        }
-    ));
-    icon_height.connect_value_changed(glib::clone!(
-        #[strong]
-        editor,
-        move |spin| {
-            let value = spin.value() as i32;
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.icon_height = (value != 40).then_some(value);
-            });
-        }
-    ));
-
-    outer.upcast()
-}
-
-/// The per-kind fields for the current content kind of `button`.
-fn rebuild_kind_fields(
-    fields: &gtk4::Box,
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    kind: ButtonKind,
-    button: &dfr_config::ButtonConfig,
-) {
-    let mut child = fields.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        fields.remove(&widget);
-    }
-
     match kind {
         ButtonKind::Text => {
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            row.append(&gtk4::Label::new(Some("Label:")));
-            let entry = gtk4::Entry::new();
-            entry.set_text(button.text.as_deref().unwrap_or(""));
-            entry.set_hexpand(true);
-            row.append(&entry);
-            fields.append(&row);
+            let entry = ui::entry("Label", button.text.as_deref().unwrap_or_default());
             entry.connect_changed(glib::clone!(
                 #[strong]
                 editor,
-                move |entry| {
-                    let text = entry.text().to_string();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.text = (!text.is_empty()).then(|| text.clone());
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        button.text = Some(row.text().into())
                     });
                 }
             ));
+            appearance.add(&entry);
         }
         ButtonKind::Icon => {
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            row.append(&gtk4::Label::new(Some("Icon name:")));
-            let entry = gtk4::Entry::new();
-            entry.set_text(button.icon.as_deref().unwrap_or(""));
-            entry.set_hexpand(true);
-            row.append(&entry);
-            fields.append(&row);
-            entry.connect_changed(glib::clone!(
+            let row = adw::ActionRow::builder()
+                .use_markup(false)
+                .title("Icon")
+                .subtitle(button.icon.as_deref().unwrap_or("Choose an icon"))
+                .activatable(true)
+                .build();
+            row.add_prefix(&ui::icon(button));
+            row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
+            row.connect_activated(glib::clone!(
                 #[strong]
                 editor,
-                move |entry| {
-                    let name = entry.text().to_string();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.icon = (!name.is_empty()).then(|| name.clone());
-                    });
-                }
+                move |row| icon_chooser(&editor, row, layer, index)
             ));
-
-            let theme_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            theme_row.append(&gtk4::Label::new(Some("XDG icon theme:")));
-            let theme = gtk4::Entry::new();
-            theme.set_text(button.theme.as_deref().unwrap_or(""));
-            theme.set_placeholder_text(Some("e.g. Adwaita (optional)"));
-            theme_row.append(&theme);
-            fields.append(&theme_row);
-            theme.connect_changed(glib::clone!(
-                #[strong]
-                editor,
-                move |entry| {
-                    let name = entry.text().to_string();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.theme = (!name.is_empty()).then(|| name.clone());
-                    });
-                }
-            ));
+            appearance.add(&row);
         }
         ButtonKind::Time => {
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            row.append(&gtk4::Label::new(Some("Format:")));
-            let formats = ["24hr", "12hr", "custom"];
-            let dropdown = gtk4::DropDown::from_strings(&formats);
             let current = button.time.as_deref().unwrap_or("24hr");
-            let selected = if current == "24hr" || current == "12hr" {
-                current
-            } else {
-                "custom"
-            };
-            dropdown.set_selected(formats.iter().position(|f| *f == selected).unwrap_or(0) as u32);
-            row.append(&dropdown);
-            let custom = gtk4::Entry::new();
-            custom.set_placeholder_text(Some("%H:%M"));
-            if selected == "custom" {
-                custom.set_text(current);
-            }
-            custom.set_hexpand(true);
-            row.append(&custom);
-            fields.append(&row);
-
-            fn write_format(
-                editor: &Rc<Editor>,
-                layer_index: usize,
-                button_index: usize,
-                format: String,
-            ) {
-                edit_button(editor, layer_index, button_index, |button| {
-                    button.time = Some(format);
-                });
-            }
-            dropdown.connect_selected_notify(glib::clone!(
-                #[strong]
-                custom,
+            let format = ui::combo(
+                "Clock Format",
+                &["24 Hour", "12 Hour", "Custom"],
+                match current {
+                    "24hr" => 0,
+                    "12hr" => 1,
+                    _ => 2,
+                },
+            );
+            let custom = ui::entry(
+                "Custom Format",
+                if current == "24hr" || current == "12hr" {
+                    "%H:%M"
+                } else {
+                    current
+                },
+            );
+            custom.set_visible(format.selected() == 2);
+            format.connect_selected_notify(glib::clone!(
                 #[strong]
                 editor,
-                move |dropdown| {
-                    let format = if dropdown.selected() == 2 {
-                        let text = custom.text().to_string();
-                        (!text.is_empty())
-                            .then(|| text)
-                            .unwrap_or_else(|| "%H:%M".into())
-                    } else {
-                        formats[dropdown.selected() as usize].to_owned()
+                #[weak]
+                custom,
+                move |row| {
+                    custom.set_visible(row.selected() == 2);
+                    let value = match row.selected() {
+                        0 => "24hr".into(),
+                        1 => "12hr".into(),
+                        _ => custom.text().to_string(),
                     };
-                    write_format(&editor, layer_index, button_index, format);
+                    edit_button(&editor, layer, index, |button| button.time = Some(value));
                 }
             ));
             custom.connect_changed(glib::clone!(
                 #[strong]
-                dropdown,
-                #[strong]
                 editor,
-                move |entry| {
-                    if dropdown.selected() == 2 {
-                        let text = entry.text().to_string();
-                        if !text.is_empty() {
-                            write_format(&editor, layer_index, button_index, text);
-                        }
-                    }
-                }
-            ));
-
-            let locale_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            locale_row.append(&gtk4::Label::new(Some("Locale:")));
-            let locale = gtk4::Entry::new();
-            locale.set_text(button.locale.as_deref().unwrap_or(""));
-            locale.set_placeholder_text(Some("e.g. en_US (optional)"));
-            locale_row.append(&locale);
-            fields.append(&locale_row);
-            locale.connect_changed(glib::clone!(
-                #[strong]
-                editor,
-                move |entry| {
-                    let name = entry.text().to_string();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.locale = (!name.is_empty()).then(|| name.clone());
-                    });
-                }
-            ));
-        }
-        ButtonKind::Battery => {
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            row.append(&gtk4::Label::new(Some("Mode:")));
-            let modes = ["both", "icon", "percentage"];
-            let dropdown = gtk4::DropDown::from_strings(&modes);
-            let current = button.battery.as_deref().unwrap_or("both");
-            dropdown.set_selected(modes.iter().position(|m| *m == current).unwrap_or(0) as u32);
-            row.append(&dropdown);
-            fields.append(&row);
-            dropdown.connect_selected_notify(glib::clone!(
-                #[strong]
-                editor,
-                move |dropdown| {
-                    let mode = modes[dropdown.selected() as usize].to_owned();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.battery = Some(mode.clone())
-                    });
-                }
-            ));
-        }
-        ButtonKind::Waveform | ButtonKind::Visualizer => {
-            let is_wave = kind == ButtonKind::Waveform;
-            let style_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            style_row.append(&gtk4::Label::new(Some("Style:")));
-            let styles = ["line", "bars"];
-            let dropdown = gtk4::DropDown::from_strings(&styles);
-            let current = if is_wave {
-                button.waveform_style.as_deref()
-            } else {
-                button.visualizer_style.as_deref()
-            }
-            .unwrap_or("line");
-            dropdown.set_selected(styles.iter().position(|s| *s == current).unwrap_or(0) as u32);
-            style_row.append(&dropdown);
-            fields.append(&style_row);
-            dropdown.connect_selected_notify(glib::clone!(
-                #[strong]
-                editor,
-                move |dropdown| {
-                    let style = styles[dropdown.selected() as usize].to_owned();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        if is_wave {
-                            button.waveform_style = Some(style.clone());
-                        } else {
-                            button.visualizer_style = Some(style.clone());
-                        }
-                    });
-                }
-            ));
-
-            let motion_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            motion_row.append(&gtk4::Label::new(Some("Smoothing ms:")));
-            let smoothing = gtk4::SpinButton::with_range(0.0, 5000.0, 50.0);
-            smoothing.set_value(
-                if is_wave {
-                    button.waveform_smoothing
-                } else {
-                    button.visualizer_smoothing
-                }
-                .unwrap_or(0) as f64,
-            );
-            motion_row.append(&smoothing);
-            motion_row.append(&gtk4::Label::new(Some("Lag ms:")));
-            let lag = gtk4::SpinButton::with_range(0.0, 500.0, 10.0);
-            lag.set_value(
-                if is_wave {
-                    button.waveform_lag
-                } else {
-                    button.visualizer_lag
-                }
-                .unwrap_or(0) as f64,
-            );
-            motion_row.append(&lag);
-            fields.append(&motion_row);
-            smoothing.connect_value_changed(glib::clone!(
-                #[strong]
-                editor,
-                move |spin| {
-                    let value = spin.value() as u32;
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        if is_wave {
-                            button.waveform_smoothing = (value > 0).then_some(value);
-                        } else {
-                            button.visualizer_smoothing = (value > 0).then_some(value);
-                        }
-                    });
-                }
-            ));
-            lag.connect_value_changed(glib::clone!(
-                #[strong]
-                editor,
-                move |spin| {
-                    let value = spin.value() as u32;
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        if is_wave {
-                            button.waveform_lag = (value > 0).then_some(value);
-                        } else {
-                            button.visualizer_lag = (value > 0).then_some(value);
-                        }
-                    });
-                }
-            ));
-        }
-        ButtonKind::NowPlaying | ButtonKind::Spacer => {
-            fields.append(&gtk4::Label::new(Some(
-                "This content kind has no additional knobs.",
-            )));
-        }
-    }
-}
-
-/// The action editor: one dropdown for the grammar's forms, per-form
-/// fields, and the key-capture button for combo actions.
-fn action_editor(
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    action: &dfr_config::ButtonAction,
-) -> gtk4::Widget {
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let frame = gtk4::Frame::new(Some("Action"));
-    frame.set_child(Some(&outer));
-
-    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    row.append(&gtk4::Label::new(Some("On press:")));
-    let forms = [
-        "None",
-        "Key combo",
-        "Switch to layer",
-        "Run command",
-        "Run command + switch layer",
-        "Apply theme",
-        "Apply theme + switch layer",
-        "Volume slider",
-        "Brightness slider",
-        "Cycle themes",
-    ];
-    let dropdown = gtk4::DropDown::from_strings(&forms);
-    let selected = match ActionForm::of(action) {
-        ActionForm::None => 0,
-        ActionForm::Keys(_) => 1,
-        ActionForm::SwitchLayer(_) => 2,
-        ActionForm::Command(_) => 3,
-        ActionForm::CommandLayer { .. } => 4,
-        ActionForm::ApplyTheme(_) => 5,
-        ActionForm::ApplyThemeLayer { .. } => 6,
-        ActionForm::VolumeSlider => 7,
-        ActionForm::BrightnessSlider => 8,
-        ActionForm::CycleTheme => 9,
-    };
-    dropdown.set_selected(selected as u32);
-    row.append(&dropdown);
-    outer.append(&row);
-
-    let fields = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    outer.append(&fields);
-
-    let (layer_names, theme_names) = {
-        let mut doc = editor.doc.borrow_mut();
-        (
-            doc.layers()
-                .iter()
-                .map(|l| l.name.clone())
-                .collect::<Vec<_>>(),
-            doc.known_themes(),
-        )
-    };
-
-    let rebuild = {
-        let editor = editor.clone();
-        let layer_names = layer_names.clone();
-        let theme_names = theme_names.clone();
-        move |form: &ActionForm, fields: &gtk4::Box| {
-            rebuild_action_fields(
-                fields,
-                &editor,
-                layer_index,
-                button_index,
-                form,
-                &layer_names,
-                &theme_names,
-            );
-        }
-    };
-    rebuild(&ActionForm::of(action), &fields);
-
-    dropdown.connect_selected_notify(glib::clone!(
-        #[strong]
-        editor,
-        #[strong]
-        fields,
-        #[strong]
-        dropdown,
-        move |_| {
-            let form = match dropdown.selected() {
-                0 => ActionForm::None,
-                1 => ActionForm::Keys(Vec::new()),
-                2 => ActionForm::SwitchLayer(String::new()),
-                3 => ActionForm::Command(String::new()),
-                4 => ActionForm::CommandLayer {
-                    command: String::new(),
-                    layer: String::new(),
-                },
-                5 => ActionForm::ApplyTheme(String::new()),
-                6 => ActionForm::ApplyThemeLayer {
-                    theme: String::new(),
-                    layer: String::new(),
-                },
-                7 => ActionForm::VolumeSlider,
-                8 => ActionForm::BrightnessSlider,
-                _ => ActionForm::CycleTheme,
-            };
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.action = form.to_action()
-            });
-            rebuild(&form, &fields);
-        }
-    ));
-
-    frame.upcast()
-}
-
-fn rebuild_action_fields(
-    fields: &gtk4::Box,
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    form: &ActionForm,
-    layer_names: &[String],
-    theme_names: &[String],
-) {
-    let mut child = fields.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        fields.remove(&widget);
-    }
-
-    match form {
-        ActionForm::None
-        | ActionForm::VolumeSlider
-        | ActionForm::BrightnessSlider
-        | ActionForm::CycleTheme => {}
-        ActionForm::Keys(keys) => {
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            let capture = gtk4::ToggleButton::with_label("Capture key combo");
-            let label = gtk4::Label::new(Some(&keys_label(keys)));
-            label.set_hexpand(true);
-            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            let clear = gtk4::Button::from_icon_name("edit-clear-symbolic");
-            clear.set_tooltip_text(Some("Clear keys"));
-            row.append(&capture);
-            row.append(&label);
-            row.append(&clear);
-            fields.append(&row);
-
-            // The capture toggle: while active, a key controller
-            // records pressed keys (one event per physical key, deduped
-            // in arrival order); toggling off commits the combo.
-            let captured: Rc<RefCell<Vec<Key>>> = Rc::new(RefCell::new(keys.clone()));
-            let controller = gtk4::EventControllerKey::new();
-            controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            controller.connect_key_pressed(glib::clone!(
-                #[strong]
-                captured,
-                #[strong]
-                label,
-                move |_, _, keycode, _| {
-                    match key_from_gdk(keycode) {
-                        Some(key) => {
-                            let mut keys = captured.borrow_mut();
-                            if !keys.contains(&key) {
-                                keys.push(key);
-                                label.set_text(&keys_label(&keys));
-                            }
-                            glib::Propagation::Stop
-                        }
-                        None => glib::Propagation::Proceed,
-                    }
-                }
-            ));
-            capture.add_controller(controller);
-
-            capture.connect_toggled(glib::clone!(
-                #[strong]
-                editor,
-                #[strong]
-                captured,
-                move |toggle| {
-                    if !toggle.is_active() {
-                        // Commit on release.
-                        let keys = captured.borrow().clone();
-                        edit_button(&editor, layer_index, button_index, |button| {
-                            button.action = ActionForm::Keys(keys.clone()).to_action();
+                #[weak]
+                format,
+                move |row| {
+                    if format.selected() == 2 {
+                        edit_button(&editor, layer, index, |button| {
+                            button.time = Some(row.text().into())
                         });
                     }
                 }
             ));
-            clear.connect_clicked(glib::clone!(
+            let locale = ui::entry("Clock Locale", button.locale.as_deref().unwrap_or("POSIX"));
+            locale.connect_changed(glib::clone!(
                 #[strong]
                 editor,
-                #[strong]
-                captured,
-                #[strong]
-                label,
-                move |_| {
-                    captured.borrow_mut().clear();
-                    label.set_text(&keys_label(&[]));
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.action = ActionForm::None.to_action();
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        button.locale = Some(row.text().into())
                     });
                 }
             ));
+            appearance.add(&format);
+            appearance.add(&custom);
+            appearance.add(&locale);
         }
-        ActionForm::SwitchLayer(_)
-        | ActionForm::CommandLayer { .. }
-        | ActionForm::ApplyThemeLayer { .. } => {
-            let mut names: Vec<String> = layer_names.to_vec();
-            names.push("pet".into());
-            names.push("themes".into());
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            row.append(&gtk4::Label::new(Some("Layer:")));
-            let strings: Vec<&str> = names.iter().map(String::as_str).collect();
-            let dropdown = gtk4::DropDown::from_strings(&strings);
-            let current = form.layer_target().unwrap_or_default().to_owned();
-            if let Some(index) = names.iter().position(|name| *name == current) {
-                dropdown.set_selected(index as u32);
-            }
-            row.append(&dropdown);
-            fields.append(&row);
-            dropdown.connect_selected_notify(glib::clone!(
+        ButtonKind::Battery => {
+            let mode = ui::combo(
+                "Battery Display",
+                &["Icon and Percentage", "Icon", "Percentage"],
+                match button.battery.as_deref() {
+                    Some("icon") => 1,
+                    Some("percentage") => 2,
+                    _ => 0,
+                },
+            );
+            mode.connect_selected_notify(glib::clone!(
                 #[strong]
                 editor,
-                #[strong]
-                names,
-                move |dropdown| {
-                    let name = names[dropdown.selected() as usize].clone();
-                    edit_button(&editor, layer_index, button_index, |button| {
-                        button.action = patch_layer_target(&button.action, &name).to_action();
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        button.battery =
+                            Some(["both", "icon", "percentage"][row.selected() as usize].into())
                     });
                 }
             ));
+            appearance.add(&mode);
+        }
+        ButtonKind::Waveform | ButtonKind::Visualizer => {
+            let wave = kind == ButtonKind::Waveform;
+            let style = ui::combo(
+                "Graph Style",
+                &["Line", "Bars"],
+                u32::from(
+                    if wave {
+                        button.waveform_style.as_deref()
+                    } else {
+                        button.visualizer_style.as_deref()
+                    } == Some("bars"),
+                ),
+            );
+            style.connect_selected_notify(glib::clone!(
+                #[strong]
+                editor,
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        let value = Some(["line", "bars"][row.selected() as usize].into());
+                        if wave {
+                            button.waveform_style = value;
+                        } else {
+                            button.visualizer_style = value;
+                        }
+                    });
+                }
+            ));
+            appearance.add(&style);
         }
         _ => {}
     }
-
-    if matches!(
-        form,
-        ActionForm::Command(_) | ActionForm::CommandLayer { .. }
-    ) {
-        fields.append(&command_field(
+    let width = ui::spin(
+        "Width in Button Spaces",
+        1.0,
+        u32::MAX as f64,
+        button.stretch.unwrap_or(1) as f64,
+    );
+    width.connect_value_notify(glib::clone!(
+        #[strong]
+        editor,
+        move |row| {
+            edit_button(&editor, layer, index, |button| {
+                button.stretch = Some(row.value() as usize)
+            });
+        }
+    ));
+    appearance.add(&width);
+    let mut accents = vec!["Automatic"];
+    accents.extend(ACCENTS);
+    let accent = ui::combo(
+        "Accent",
+        &accents,
+        button
+            .accent
+            .and_then(|a| ACCENTS.iter().position(|name| *name == a.name()))
+            .map(|i| i + 1)
+            .unwrap_or(0) as u32,
+    );
+    accent.connect_selected_notify(glib::clone!(
+        #[strong]
+        editor,
+        move |row| {
+            edit_button(&editor, layer, index, |button| {
+                button.accent = if row.selected() == 0 {
+                    None
+                } else {
+                    accent_from_name(ACCENTS[row.selected() as usize - 1])
+                }
+            });
+        }
+    ));
+    appearance.add(&accent);
+    page.add(&appearance);
+    page.add(&action_editor(editor, layer, index, &button.action));
+    let advanced_group = ui::group("");
+    let advanced = adw::ExpanderRow::builder()
+        .use_markup(false)
+        .title("Advanced")
+        .subtitle("Technical options for this content type")
+        .build();
+    if kind == ButtonKind::Icon || kind == ButtonKind::Battery {
+        for (title, is_width) in [("Icon Width (px)", true), ("Icon Height (px)", false)] {
+            let value = if is_width {
+                button.icon_width
+            } else {
+                button.icon_height
+            }
+            .unwrap_or(40);
+            let row = ui::spin(title, 8.0, 256.0, value as f64);
+            row.connect_value_notify(glib::clone!(
+                #[strong]
+                editor,
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        if is_width {
+                            button.icon_width = Some(row.value() as i32);
+                        } else {
+                            button.icon_height = Some(row.value() as i32);
+                        }
+                    });
+                }
+            ));
+            advanced.add_row(&row);
+        }
+        let theme = ui::entry("Icon Theme", button.theme.as_deref().unwrap_or_default());
+        theme.connect_changed(glib::clone!(
+            #[strong]
             editor,
-            layer_index,
-            button_index,
-            form.command().unwrap_or_default(),
+            move |row| {
+                edit_button(&editor, layer, index, |button| {
+                    button.theme = (!row.text().is_empty()).then(|| row.text().into())
+                });
+            }
         ));
+        advanced.add_row(&theme);
+        if kind == ButtonKind::Icon {
+            let resource = ui::entry(
+                "Icon Resource Name",
+                button.icon.as_deref().unwrap_or_default(),
+            );
+            resource.connect_changed(glib::clone!(
+                #[strong]
+                editor,
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        button.icon = Some(row.text().into())
+                    });
+                }
+            ));
+            advanced.add_row(&resource);
+        }
+    }
+    if kind == ButtonKind::Waveform || kind == ButtonKind::Visualizer {
+        let wave = kind == ButtonKind::Waveform;
+        for (title, smoothing, max) in [
+            ("Motion Smoothing (ms)", true, 5000.0),
+            ("Visual Delay (ms)", false, 500.0),
+        ] {
+            let value = match (wave, smoothing) {
+                (true, true) => button.waveform_smoothing,
+                (true, false) => button.waveform_lag,
+                (false, true) => button.visualizer_smoothing,
+                (false, false) => button.visualizer_lag,
+            }
+            .unwrap_or(0);
+            let row = ui::spin(title, 0.0, max, value as f64);
+            row.connect_value_notify(glib::clone!(
+                #[strong]
+                editor,
+                move |row| {
+                    edit_button(&editor, layer, index, |button| {
+                        let value = Some(row.value() as u32);
+                        match (wave, smoothing) {
+                            (true, true) => button.waveform_smoothing = value,
+                            (true, false) => button.waveform_lag = value,
+                            (false, true) => button.visualizer_smoothing = value,
+                            (false, false) => button.visualizer_lag = value,
+                        }
+                    });
+                }
+            ));
+            advanced.add_row(&row);
+        }
     }
     if matches!(
-        form,
-        ActionForm::ApplyTheme(_) | ActionForm::ApplyThemeLayer { .. }
+        kind,
+        ButtonKind::Icon | ButtonKind::Battery | ButtonKind::Waveform | ButtonKind::Visualizer
     ) {
-        fields.append(&theme_field(
-            editor,
-            layer_index,
-            button_index,
-            match form {
-                ActionForm::ApplyTheme(theme) | ActionForm::ApplyThemeLayer { theme, .. } => theme,
-                _ => "",
-            },
-            theme_names,
-        ));
+        advanced_group.add(&advanced);
+        page.add(&advanced_group);
     }
+    page
 }
 
+fn icon_chooser(editor: &Rc<Editor>, parent: &adw::ActionRow, layer: usize, index: usize) {
+    let dialog = adw::Dialog::builder()
+        .title("Choose an Icon")
+        .content_width(480)
+        .content_height(520)
+        .build();
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    ui::margins(&content, 18);
+    let search = gtk4::SearchEntry::new();
+    search.set_placeholder_text(Some("Search icon names"));
+    content.append(&search);
+    let mut names = std::collections::BTreeSet::new();
+    for directory in dfr_render::config::ICON_DIRS {
+        if let Ok(files) = std::fs::read_dir(directory) {
+            for file in files.flatten() {
+                let path = file.path();
+                if matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("svg" | "png")
+                ) {
+                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    let strings: Vec<&str> = names.iter().map(String::as_str).collect();
+    let model = gtk4::StringList::new(&strings);
+    let query = Rc::new(RefCell::new(String::new()));
+    let filter = gtk4::CustomFilter::new(glib::clone!(
+        #[strong]
+        query,
+        move |object| {
+            object
+                .downcast_ref::<gtk4::StringObject>()
+                .is_some_and(|name| {
+                    name.string()
+                        .to_lowercase()
+                        .contains(query.borrow().as_str())
+                })
+        }
+    ));
+    let filtered = gtk4::FilterListModel::new(Some(model), Some(filter.clone()));
+    let selection = gtk4::SingleSelection::new(Some(filtered.clone()));
+    let factory = gtk4::SignalListItemFactory::new();
+    factory.connect_bind(|_, object| {
+        let item = object.downcast_ref::<gtk4::ListItem>().unwrap();
+        let name = item
+            .item()
+            .and_downcast::<gtk4::StringObject>()
+            .unwrap()
+            .string();
+        let content = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        ui::margins(&content, 12);
+        content.append(&ui::icon(&dfr_config::ButtonConfig {
+            icon: Some(name.to_string()),
+            ..Default::default()
+        }));
+        let label = gtk4::Label::new(Some(&name));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        content.append(&label);
+        item.set_child(Some(&content));
+    });
+    let list = gtk4::ListView::new(Some(selection), Some(factory));
+    list.add_css_class("boxed-list");
+    list.connect_activate(glib::clone!(
+        #[strong]
+        editor,
+        #[weak]
+        dialog,
+        #[strong]
+        filtered,
+        move |_, position| {
+            let Some(name) = filtered.item(position).and_downcast::<gtk4::StringObject>() else {
+                return;
+            };
+            edit_button(&editor, layer, index, |button| {
+                button.icon = Some(name.string().into());
+                button.theme = None;
+            });
+            editor.restructured();
+            dialog.close();
+        }
+    ));
+    search.connect_search_changed(glib::clone!(
+        #[strong]
+        query,
+        #[weak]
+        filter,
+        move |entry| {
+            *query.borrow_mut() = entry.text().to_lowercase();
+            filter.changed(gtk4::FilterChange::Different);
+        }
+    ));
+    content.append(&ui::scroll(&list));
+    let help = gtk4::Label::new(Some(
+        "Use Advanced → Icon Resource Name and Icon Theme for XDG theme icons.",
+    ));
+    help.set_wrap(true);
+    help.add_css_class("dim-label");
+    content.append(&help);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(parent));
+}
 /// Retarget the layer a layer-bearing action points at, keeping the
 /// rest of the action intact.
 fn patch_layer_target(action: &dfr_config::ButtonAction, layer: &str) -> ActionForm {
@@ -1652,32 +1253,6 @@ fn keys_label(keys: &[Key]) -> String {
     }
 }
 
-fn command_field(
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    command: &str,
-) -> gtk4::Widget {
-    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    row.append(&gtk4::Label::new(Some("Command:")));
-    let entry = gtk4::Entry::new();
-    entry.set_text(command);
-    entry.set_placeholder_text(Some("e.g. systemctl --user toggle night-light"));
-    entry.set_hexpand(true);
-    row.append(&entry);
-    entry.connect_changed(glib::clone!(
-        #[strong]
-        editor,
-        move |entry| {
-            let command = entry.text().to_string();
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.action = patch_command(&button.action, &command).to_action();
-            });
-        }
-    ));
-    row.upcast()
-}
-
 fn patch_command(action: &dfr_config::ButtonAction, command: &str) -> ActionForm {
     match &ActionForm::of(action) {
         ActionForm::Command(_) => ActionForm::Command(command.to_owned()),
@@ -1689,37 +1264,6 @@ fn patch_command(action: &dfr_config::ButtonAction, command: &str) -> ActionForm
     }
 }
 
-fn theme_field(
-    editor: &Rc<Editor>,
-    layer_index: usize,
-    button_index: usize,
-    theme: &str,
-    theme_names: &[String],
-) -> gtk4::Widget {
-    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    row.append(&gtk4::Label::new(Some("Theme:")));
-    let strings: Vec<&str> = theme_names.iter().map(String::as_str).collect();
-    let dropdown = gtk4::DropDown::from_strings(&strings);
-    if let Some(index) = theme_names.iter().position(|name| name == theme) {
-        dropdown.set_selected(index as u32);
-    }
-    row.append(&dropdown);
-    let theme_names = theme_names.to_vec();
-    dropdown.connect_selected_notify(glib::clone!(
-        #[strong]
-        editor,
-        #[strong]
-        theme_names,
-        move |dropdown| {
-            let theme = theme_names[dropdown.selected() as usize].clone();
-            edit_button(&editor, layer_index, button_index, |button| {
-                button.action = patch_theme(&button.action, &theme).to_action();
-            });
-        }
-    ));
-    row.upcast()
-}
-
 fn patch_theme(action: &dfr_config::ButtonAction, theme: &str) -> ActionForm {
     match &ActionForm::of(action) {
         ActionForm::ApplyTheme(_) => ActionForm::ApplyTheme(theme.to_owned()),
@@ -1728,5 +1272,286 @@ fn patch_theme(action: &dfr_config::ButtonAction, theme: &str) -> ActionForm {
             layer: layer.clone(),
         },
         other => other.clone(),
+    }
+}
+
+fn action_editor(
+    editor: &Rc<Editor>,
+    layer: usize,
+    index: usize,
+    action: &dfr_config::ButtonAction,
+) -> adw::PreferencesGroup {
+    let group = ui::group("Action");
+    let forms = [
+        "None",
+        "Keyboard Shortcut",
+        "Open Layer",
+        "Run Command",
+        "Run Command, Then Open Layer",
+        "Use Theme",
+        "Use Theme, Then Open Layer",
+        "Volume Slider",
+        "Brightness Slider",
+        "Cycle Themes",
+    ];
+    let form = ActionForm::of(action);
+    let selected = match form {
+        ActionForm::None => 0,
+        ActionForm::Keys(_) => 1,
+        ActionForm::SwitchLayer(_) => 2,
+        ActionForm::Command(_) => 3,
+        ActionForm::CommandLayer { .. } => 4,
+        ActionForm::ApplyTheme(_) => 5,
+        ActionForm::ApplyThemeLayer { .. } => 6,
+        ActionForm::VolumeSlider => 7,
+        ActionForm::BrightnessSlider => 8,
+        ActionForm::CycleTheme => 9,
+    };
+    let row = ui::combo("When Pressed", &forms, selected);
+    group.add(&row);
+    let fields = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    // PreferencesGroup accepts ordinary children, so each conditional field remains a native row.
+    group.add(&fields);
+    rebuild_action_fields(&fields, editor, layer, index, &form);
+    row.connect_selected_notify(glib::clone!(
+        #[strong]
+        editor,
+        #[weak]
+        fields,
+        move |row| {
+            let form = match row.selected() {
+                0 => ActionForm::None,
+                1 => ActionForm::Keys(Vec::new()),
+                2 => ActionForm::SwitchLayer(String::new()),
+                3 => ActionForm::Command(String::new()),
+                4 => ActionForm::CommandLayer {
+                    command: String::new(),
+                    layer: String::new(),
+                },
+                5 => ActionForm::ApplyTheme(String::new()),
+                6 => ActionForm::ApplyThemeLayer {
+                    theme: String::new(),
+                    layer: String::new(),
+                },
+                7 => ActionForm::VolumeSlider,
+                8 => ActionForm::BrightnessSlider,
+                _ => ActionForm::CycleTheme,
+            };
+            edit_button(&editor, layer, index, |button| {
+                button.action = form.to_action()
+            });
+            // Rebuild only the dependent action fields; preserve the choice widget and focus.
+            rebuild_action_fields(&fields, &editor, layer, index, &form);
+        }
+    ));
+    group
+}
+
+fn rebuild_action_fields(
+    fields: &gtk4::Box,
+    editor: &Rc<Editor>,
+    layer: usize,
+    index: usize,
+    form: &ActionForm,
+) {
+    ui::clear(fields);
+    let group = ui::group("");
+    add_action_fields(&group, editor, layer, index, form);
+    fields.append(&group);
+}
+
+fn add_action_fields(
+    group: &adw::PreferencesGroup,
+    editor: &Rc<Editor>,
+    layer: usize,
+    index: usize,
+    form: &ActionForm,
+) {
+    if let ActionForm::Keys(keys) = form {
+        let row = adw::ActionRow::builder()
+            .use_markup(false)
+            .title("Keyboard Shortcut")
+            .subtitle(keys_label(keys))
+            .build();
+        let capture = gtk4::ToggleButton::with_label("Record");
+        let finish = gtk4::Button::with_label("Finish");
+        let cancel = gtk4::Button::with_label("Cancel");
+        for button in [
+            capture.clone().upcast::<gtk4::Widget>(),
+            finish.clone().upcast(),
+            cancel.clone().upcast(),
+        ] {
+            button.set_valign(gtk4::Align::Center);
+            row.add_suffix(&button);
+        }
+        finish.set_visible(false);
+        cancel.set_visible(false);
+        let captured = Rc::new(RefCell::new(Vec::<Key>::new()));
+        let original = keys_label(keys);
+        capture.connect_toggled(glib::clone!(
+            #[weak]
+            row,
+            #[weak]
+            finish,
+            #[weak]
+            cancel,
+            #[strong]
+            captured,
+            move |toggle| {
+                finish.set_visible(toggle.is_active());
+                cancel.set_visible(toggle.is_active());
+                if toggle.is_active() {
+                    captured.borrow_mut().clear();
+                    toggle.set_label("Listening…");
+                    toggle.grab_focus();
+                    row.set_subtitle("Press your shortcut, then choose Finish or Cancel");
+                } else {
+                    toggle.set_label("Record");
+                }
+            }
+        ));
+        let controller = gtk4::EventControllerKey::new();
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        controller.connect_key_pressed(glib::clone!(
+            #[weak]
+            capture,
+            #[weak]
+            row,
+            #[strong]
+            captured,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, _, keycode, _| {
+                if !capture.is_active() {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(key) = key_from_gdk(keycode) {
+                    let mut keys = captured.borrow_mut();
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                    row.set_subtitle(&keys_label(&keys));
+                }
+                glib::Propagation::Stop
+            }
+        ));
+        capture.add_controller(controller);
+        finish.connect_clicked(glib::clone!(
+            #[strong]
+            editor,
+            #[weak]
+            capture,
+            #[weak]
+            row,
+            #[strong]
+            captured,
+            move |_| {
+                let keys = captured.borrow().clone();
+                capture.set_active(false);
+                row.set_subtitle(&keys_label(&keys));
+                edit_button(&editor, layer, index, |button| {
+                    button.action = ActionForm::Keys(keys).to_action()
+                });
+            }
+        ));
+        cancel.connect_clicked(glib::clone!(
+            #[weak]
+            capture,
+            #[weak]
+            row,
+            move |_| {
+                capture.set_active(false);
+                row.set_subtitle(&original);
+            }
+        ));
+        group.add(&row);
+    }
+    if let Some(current) = form.layer_target() {
+        let doc = editor.doc.borrow();
+        let mut names: Vec<String> = vec!["Choose…".into()];
+        names.extend(doc.layer_snapshot().into_iter().map(|l| l.name));
+        let effective = doc.effective().unwrap();
+        if effective.pet_enabled.unwrap_or(true) && !names.iter().any(|n| n == "pet") {
+            names.push("pet".into());
+        }
+        if effective.themes_enabled.unwrap_or(true) && !names.iter().any(|n| n == "themes") {
+            names.push("themes".into());
+        }
+        if !current.is_empty() && !names.iter().any(|n| n == current) {
+            names.push(current.into());
+        }
+        drop(doc);
+        let strings: Vec<&str> = names.iter().map(String::as_str).collect();
+        let row = ui::combo(
+            "Open Layer",
+            &strings,
+            names.iter().position(|n| n == current).unwrap_or(0) as u32,
+        );
+        if current.is_empty() {
+            row.set_subtitle("Choose a destination to complete this action");
+        }
+        row.connect_selected_notify(glib::clone!(
+            #[strong]
+            editor,
+            move |row| {
+                let target = if row.selected() == 0 {
+                    ""
+                } else {
+                    &names[row.selected() as usize]
+                };
+                edit_button(&editor, layer, index, |button| {
+                    button.action = patch_layer_target(&button.action, target).to_action()
+                });
+                row.set_subtitle(if target.is_empty() {
+                    "Choose a destination to complete this action"
+                } else {
+                    ""
+                });
+            }
+        ));
+        group.add(&row);
+    }
+    if let Some(command) = form.command() {
+        let row = ui::entry("Command", command);
+        row.connect_changed(glib::clone!(
+            #[strong]
+            editor,
+            move |row| {
+                edit_button(&editor, layer, index, |button| {
+                    button.action = patch_command(&button.action, &row.text()).to_action()
+                });
+            }
+        ));
+        group.add(&row);
+    }
+    if let ActionForm::ApplyTheme(current) | ActionForm::ApplyThemeLayer { theme: current, .. } =
+        form
+    {
+        let mut names = vec!["Choose…".to_owned()];
+        names.extend(editor.doc.borrow().known_themes());
+        if !current.is_empty() && !names.contains(current) {
+            names.push(current.clone());
+        }
+        let strings: Vec<&str> = names.iter().map(String::as_str).collect();
+        let row = ui::combo(
+            "Color Theme",
+            &strings,
+            names.iter().position(|n| n == current).unwrap_or(0) as u32,
+        );
+        row.connect_selected_notify(glib::clone!(
+            #[strong]
+            editor,
+            move |row| {
+                let target = if row.selected() == 0 {
+                    ""
+                } else {
+                    &names[row.selected() as usize]
+                };
+                edit_button(&editor, layer, index, |button| {
+                    button.action = patch_theme(&button.action, target).to_action()
+                });
+            }
+        ));
+        group.add(&row);
     }
 }

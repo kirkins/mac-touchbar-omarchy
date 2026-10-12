@@ -200,8 +200,24 @@ impl SaveFeedback {
     }
 }
 
+/// One-shot bypass prevents Discard from re-entering the close dialog.
+#[derive(Default)]
+pub struct CloseGuard {
+    bypass: bool,
+    pub dialog_open: bool,
+}
+impl CloseGuard {
+    pub fn request(&mut self, dirty: bool) -> bool {
+        self.bypass || !dirty
+    }
+    pub fn discard(&mut self) {
+        self.bypass = true;
+    }
+}
+
 /// The editing document: the base file it overlays, the user file it
 /// will install, and the overlay being edited.
+#[derive(Clone)]
 pub struct Document {
     /// Kept for diagnostics and re-open paths; the frozen text is
     /// what the model parses.
@@ -212,7 +228,7 @@ pub struct Document {
     base_text: String,
     user: ConfigProxy,
     /// Set when the overlay differs from what the file on disk holds.
-    dirty: bool,
+    saved_text: String,
     /// The session writes one timestamped backup before the first
     /// install over an existing user file.
     backed_up: bool,
@@ -242,8 +258,8 @@ impl Document {
             _base_path: base_path.to_owned(),
             user_path: user_path.to_owned(),
             base_text,
+            saved_text: to_user_toml(&user),
             user,
-            dirty: false,
             backed_up: false,
         })
     }
@@ -257,12 +273,11 @@ impl Document {
     }
 
     pub fn user_mut(&mut self) -> &mut ConfigProxy {
-        self.dirty = true;
         &mut self.user
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.candidate_text() != self.saved_text
     }
 
     pub fn has_override(&self, name: &str) -> bool {
@@ -278,7 +293,6 @@ impl Document {
         self.user = value
             .try_into()
             .expect("removing an optional setting preserves the schema");
-        self.dirty = true;
     }
 
     pub fn base_text(&self) -> &str {
@@ -367,7 +381,7 @@ impl Document {
         fs::rename(&stage, &self.user_path).with_context(|| {
             format!("installing the configuration {}", self.user_path.display())
         })?;
-        self.dirty = false;
+        self.saved_text = self.candidate_text();
         Ok(())
     }
 
@@ -379,41 +393,173 @@ impl Document {
     /// documents).
     pub fn layers(&mut self) -> &mut Vec<LayerConfig> {
         if self.user.layers.is_none() {
-            let mut migrated: Vec<LayerConfig> = Vec::new();
-            let (primary, media) = {
-                let mut effective = toml::from_str::<ConfigProxy>(&self.base_text)
-                    .expect("the base document parses");
-                effective.merge(self.user.clone());
-                (
-                    effective.primary_layer_keys.unwrap_or_default(),
-                    effective.media_layer_keys.unwrap_or_default(),
-                )
-            };
-            if !primary.is_empty() || !media.is_empty() {
-                let media_default = self.user.media_layer_default.unwrap_or(false);
-                migrated.push(LayerConfig {
-                    name: "primary".into(),
-                    keys: primary,
-                });
-                migrated.push(LayerConfig {
-                    name: "media".into(),
-                    keys: media,
-                });
-                let (default, function) = if media_default {
-                    ("media", "primary")
-                } else {
-                    ("primary", "media")
-                };
-                self.user.default_layer = Some(default.into());
-                self.user.fn_layer = Some(function.into());
-                self.user.primary_layer_keys = None;
-                self.user.media_layer_keys = None;
-                self.user.media_layer_default = None;
-                self.dirty = true;
-            }
-            self.user.layers = Some(migrated);
+            let (startup, function) = self.layer_roles();
+            self.user.layers = Some(self.layer_snapshot());
+            self.user.default_layer = Some(startup);
+            self.user.fn_layer = function;
+            self.user.primary_layer_keys = None;
+            self.user.media_layer_keys = None;
+            self.user.media_layer_default = None;
         }
         self.user.layers.as_mut().expect("layers present")
+    }
+
+    /// Inspection never materializes or dirties an inherited layer list.
+    pub fn layer_snapshot(&self) -> Vec<LayerConfig> {
+        let effective = self.effective().expect("the base document parses");
+        effective.layers.unwrap_or_else(|| {
+            vec![
+                LayerConfig {
+                    name: "primary".into(),
+                    keys: effective.primary_layer_keys.unwrap_or_default(),
+                },
+                LayerConfig {
+                    name: "media".into(),
+                    keys: effective.media_layer_keys.unwrap_or_default(),
+                },
+            ]
+        })
+    }
+
+    pub fn layer_roles(&self) -> (String, Option<String>) {
+        let effective = self.effective().expect("the base document parses");
+        if effective.layers.is_some() {
+            (
+                effective.default_layer.unwrap_or_default(),
+                effective.fn_layer,
+            )
+        } else if effective.media_layer_default.unwrap_or(false) {
+            ("media".into(), Some("primary".into()))
+        } else {
+            ("primary".into(), Some("media".into()))
+        }
+    }
+
+    pub fn set_layer_role(&mut self, name: Option<String>, startup: bool) {
+        self.layers();
+        if startup {
+            self.user.default_layer = name;
+        } else {
+            self.user.fn_layer = name;
+        }
+    }
+
+    pub fn rename_layer(&mut self, index: usize, name: &str) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("Enter a layer name.");
+        }
+        let layers = self.layer_snapshot();
+        let old = layers.get(index).context("Choose a layer.")?.name.clone();
+        if layers
+            .iter()
+            .enumerate()
+            .any(|(i, layer)| i != index && layer.name == name)
+        {
+            bail!("A layer named {name:?} already exists.");
+        }
+        self.layers()[index].name = name.into();
+        self.retarget_layer(&old, name);
+        Ok(())
+    }
+
+    fn retarget_layer(&mut self, old: &str, new: &str) {
+        if self.user.default_layer.as_deref() == Some(old) {
+            self.user.default_layer = Some(new.into());
+        }
+        if self.user.fn_layer.as_deref() == Some(old) {
+            self.user.fn_layer = Some(new.into());
+        }
+        for layer in self.layers() {
+            for button in &mut layer.keys {
+                match &mut button.action {
+                    ButtonAction::SwitchLayer(target)
+                    | ButtonAction::CommandLayer { layer: target, .. }
+                    | ButtonAction::ApplyThemeLayer { layer: target, .. }
+                        if target == old =>
+                    {
+                        *target = new.into()
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn incoming_links(&self, index: usize) -> Vec<(usize, usize, String)> {
+        let layers = self.layer_snapshot();
+        let Some(target) = layers.get(index) else {
+            return Vec::new();
+        };
+        layers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .flat_map(|(i, layer)| {
+                layer
+                    .keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, button)| {
+                        button.action.layer_target() == Some(target.name.as_str())
+                    })
+                    .map(|(b, _)| (i, b, layer.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub fn delete_layer(&mut self, index: usize, replacement: Option<&str>) -> Result<()> {
+        let layers = self.layer_snapshot();
+        if layers.len() <= 1 {
+            bail!("Keep at least one layer.");
+        }
+        let name = &layers.get(index).context("Choose a layer.")?.name;
+        let (startup, function) = self.layer_roles();
+        let needs_repair = startup == *name
+            || function.as_deref() == Some(name)
+            || !self.incoming_links(index).is_empty();
+        if needs_repair && replacement.is_none() {
+            bail!("Choose a replacement for this layer’s assignments and incoming links.");
+        }
+        if let Some(replacement) = replacement {
+            if replacement == name || !layers.iter().any(|layer| layer.name == replacement) {
+                bail!("Choose another existing layer.");
+            }
+            self.layers();
+            self.retarget_layer(name, replacement);
+        }
+        self.layers().remove(index);
+        Ok(())
+    }
+
+    pub fn setting(&self, name: &str) -> toml::Value {
+        let effective = self.effective().expect("the base document parses");
+        if let Some(value) = toml::Value::try_from(effective)
+            .ok()
+            .and_then(|value| value.get(name).cloned())
+        {
+            return value;
+        }
+        let knob = dfr_config::KNOBS
+            .iter()
+            .find(|k| k.name == name)
+            .expect("registered setting");
+        match knob.kind {
+            "bool" => toml::Value::Boolean(knob.default == "true"),
+            "u32" => toml::Value::Integer(knob.default.parse().unwrap_or(0)),
+            _ => toml::Value::String(knob.default.trim_matches('"').into()),
+        }
+    }
+
+    pub fn set_setting(&mut self, name: &str, setting: Option<toml::Value>) {
+        let mut value = toml::Value::try_from(&self.user).expect("serializable overlay");
+        let table = value.as_table_mut().expect("overlay table");
+        if let Some(setting) = setting {
+            table.insert(name.into(), setting);
+        } else {
+            table.remove(name);
+        }
+        self.user = value.try_into().expect("typed setting");
     }
 
     /// Names every layer reachable from `DefaultLayer` through layer
@@ -424,15 +570,16 @@ impl Document {
         let Ok(effective) = self.effective() else {
             return Vec::new();
         };
-        let Some(layers) = &effective.layers else {
-            return Vec::new();
-        };
-        let start = effective.default_layer.clone().unwrap_or_default();
+        let layers = self.layer_snapshot();
+        let (start, function) = self.layer_roles();
         let themes_enabled = effective.themes_enabled.unwrap_or(true);
         let mut seen: Vec<String> = Vec::new();
         let mut queue = vec![start];
+        if let Some(function) = function {
+            queue.push(function);
+        }
         while let Some(name) = queue.pop() {
-            if seen.contains(&name) || name == "themes" {
+            if seen.contains(&name) {
                 continue;
             }
             if let Some(layer) = layers.iter().find(|layer| layer.name == name) {
@@ -456,7 +603,7 @@ impl Document {
         let mut names = dfr_config::themes::builtin_themes()
             .map(|set| set.names)
             .unwrap_or_default();
-        if let Some(themes) = &self.user.themes {
+        if let Some(themes) = self.effective().ok().and_then(|proxy| proxy.themes) {
             for name in themes.keys() {
                 if !names.contains(name) {
                     names.push(name.clone());
@@ -470,39 +617,32 @@ impl Document {
     /// Define or replace a user theme, refusing to exceed the picker's
     /// theme budget.
     pub fn set_theme(&mut self, name: &str, theme: ThemeConfig) -> Result<()> {
-        if !self
-            .user
-            .themes
-            .as_ref()
-            .is_some_and(|themes| themes.contains_key(name))
+        if !self.known_themes().iter().any(|known| known == name)
             && self.known_themes().len() >= MAX_THEMES
         {
             bail!("at most {MAX_THEMES} themes may be defined");
         }
+        if self.user.themes.is_none() {
+            self.user.themes = self.effective()?.themes;
+        }
         let themes = self.user.themes.get_or_insert_with(Default::default);
         themes.insert(name.to_owned(), theme);
-        self.dirty = true;
         Ok(())
     }
 
     /// Remove a user-defined theme (built-ins cannot be removed, only
     /// overridden; removing an override restores the built-in).
     pub fn remove_theme(&mut self, name: &str) {
-        if let Some(themes) = &mut self.user.themes {
-            if themes.remove(name).is_some() {
-                self.dirty = true;
-            }
+        if self.user.themes.is_none() {
+            self.user.themes = self.effective().ok().and_then(|p| p.themes);
         }
-    }
-
-    /// One band editor row's worth of state, for the day-cycle list.
-    pub fn bands(&self) -> Option<&Vec<BandConfig>> {
-        self.user.day_cycle_bands.as_ref()
+        if let Some(themes) = &mut self.user.themes {
+            themes.remove(name);
+        }
     }
 
     pub fn set_bands(&mut self, bands: Vec<BandConfig>) {
         self.user.day_cycle_bands = Some(bands);
-        self.dirty = true;
     }
 }
 
@@ -562,6 +702,214 @@ mod tests {
         };
         let doc = Document::open(&base, &user_path).unwrap();
         (tmp, doc)
+    }
+
+    #[test]
+    fn inspecting_inherited_named_layers_does_not_create_a_draft() {
+        let tmp = TempDir::new("inherited-named");
+        let base = tmp.write("base.toml", MULTIBAR);
+        let mut doc = Document::open(&base, &tmp.0.join("config.toml")).unwrap();
+        assert_eq!(doc.layer_snapshot().len(), 5);
+        assert_eq!(doc.layer_roles().0, "home");
+        assert!(!doc.is_dirty());
+        doc.layers()[0].keys[0].stretch = Some(3);
+        assert_eq!(doc.layer_snapshot().len(), 5);
+        assert!(doc.is_dirty());
+        assert!(doc.validate().is_empty(), "{:?}", doc.validate());
+    }
+
+    #[test]
+    fn scalar_controls_use_base_values_and_code_defaults_without_writing_them() {
+        let tmp = TempDir::new("scalars");
+        let base = tmp.write(
+            "base.toml",
+            &format!("{BASE}\nAdaptiveBrightness = true\nActiveBrightness = 207\n"),
+        );
+        // Avoid duplicating a key the shipped sample already sets.
+        let proxy: ConfigProxy = toml::from_str(BASE).unwrap();
+        let mut base_proxy = proxy;
+        base_proxy.adaptive_brightness = Some(true);
+        base_proxy.active_brightness = Some(207);
+        std::fs::write(&base, to_user_toml(&base_proxy)).unwrap();
+        let mut doc = Document::open(&base, &tmp.0.join("config.toml")).unwrap();
+        assert_eq!(doc.setting("AdaptiveBrightness").as_bool(), Some(true));
+        assert_eq!(doc.setting("ActiveBrightness").as_integer(), Some(207));
+        assert_eq!(doc.setting("PetEnabled").as_bool(), Some(true));
+        assert!(!doc.is_dirty());
+        doc.set_setting("ActiveBrightness", Some(toml::Value::Integer(128)));
+        assert_eq!(doc.setting("ActiveBrightness").as_integer(), Some(128));
+        doc.reset_global("ActiveBrightness");
+        assert_eq!(doc.setting("ActiveBrightness").as_integer(), Some(207));
+        assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn rename_retargets_roles_and_every_combined_action_atomically() {
+        let (_tmp, mut doc) = document("rename", Some(MULTIBAR));
+        let old = doc.layer_snapshot()[0].name.clone();
+        doc.layers()[1].keys = vec![
+            ButtonConfig {
+                text: Some("Go".into()),
+                action: ButtonAction::SwitchLayer(old.clone()),
+                ..Default::default()
+            },
+            ButtonConfig {
+                text: Some("Run".into()),
+                action: ButtonAction::CommandLayer {
+                    command: "true".into(),
+                    layer: old.clone(),
+                },
+                ..Default::default()
+            },
+            ButtonConfig {
+                text: Some("Theme".into()),
+                action: ButtonAction::ApplyThemeLayer {
+                    theme: "Default".into(),
+                    layer: old.clone(),
+                },
+                ..Default::default()
+            },
+        ];
+        doc.set_layer_role(Some(old), false);
+        doc.rename_layer(0, "Renamed").unwrap();
+        assert_eq!(
+            doc.layer_roles(),
+            ("Renamed".into(), Some("Renamed".into()))
+        );
+        assert!(doc.layer_snapshot()[1]
+            .keys
+            .iter()
+            .all(|b| b.action.layer_target() == Some("Renamed")));
+        assert!(doc.validate().is_empty(), "{:?}", doc.validate());
+        let before = doc.candidate_text();
+        let duplicate = doc.layer_snapshot()[1].name.clone();
+        assert!(doc.rename_layer(0, &duplicate).is_err());
+        assert_eq!(before, doc.candidate_text());
+    }
+
+    #[test]
+    fn deletion_requires_an_explicit_repair_and_keeps_valid_references() {
+        let (_tmp, mut doc) = document("delete", Some(MULTIBAR));
+        let before = doc.candidate_text();
+        assert!(!doc.incoming_links(0).is_empty());
+        assert!(doc.delete_layer(0, None).is_err());
+        assert_eq!(before, doc.candidate_text());
+        let replacement = doc.layer_snapshot()[1].name.clone();
+        doc.delete_layer(0, Some(&replacement)).unwrap();
+        assert_eq!(doc.layer_roles().0, replacement);
+        assert!(doc.validate().is_empty(), "{:?}", doc.validate());
+        while doc.layer_snapshot().len() > 1 {
+            let target = doc.layer_snapshot()[0].name.clone();
+            let index = doc.layer_snapshot().len() - 1;
+            doc.delete_layer(index, Some(&target)).unwrap();
+        }
+        assert!(doc.delete_layer(0, None).is_err());
+    }
+
+    #[test]
+    fn fn_assigned_layers_are_reachable() {
+        let (_tmp, doc) = document("fn-reachability", Some(MULTIBAR));
+        let function = doc.layer_roles().1.unwrap();
+        assert!(doc.reachable_layers().contains(&function));
+    }
+
+    #[test]
+    fn an_authored_theme_layer_can_link_to_another_layer() {
+        let (_tmp, mut doc) = document("authored-theme-reachability", Some(MULTIBAR));
+        let start = doc.layer_roles().0;
+        let index = doc
+            .layer_snapshot()
+            .iter()
+            .position(|layer| layer.name == start)
+            .unwrap();
+        doc.rename_layer(index, "themes").unwrap();
+        doc.layers().push(LayerConfig {
+            name: "Linked".into(),
+            keys: vec![ButtonConfig {
+                text: Some("Linked".into()),
+                ..Default::default()
+            }],
+        });
+        doc.layers()[index].keys[0].action = ButtonAction::SwitchLayer("Linked".into());
+        assert!(doc.reachable_layers().contains(&"Linked".into()));
+    }
+
+    #[test]
+    fn all_ten_action_forms_round_trip_through_the_ui_model() {
+        let forms = [
+            ActionForm::None,
+            ActionForm::Keys(vec![input_linux::Key::LeftMeta, input_linux::Key::L]),
+            ActionForm::SwitchLayer("home".into()),
+            ActionForm::Command("true".into()),
+            ActionForm::CommandLayer {
+                command: "true".into(),
+                layer: "home".into(),
+            },
+            ActionForm::ApplyTheme("Default".into()),
+            ActionForm::ApplyThemeLayer {
+                theme: "Default".into(),
+                layer: "home".into(),
+            },
+            ActionForm::VolumeSlider,
+            ActionForm::BrightnessSlider,
+            ActionForm::CycleTheme,
+        ];
+        for form in forms {
+            let button = ButtonConfig {
+                text: Some("Test".into()),
+                action: form.to_action(),
+                ..Default::default()
+            };
+            let parsed: ButtonConfig = toml::from_str(&toml::to_string(&button).unwrap()).unwrap();
+            assert_eq!(ActionForm::of(&parsed.action), form);
+        }
+    }
+
+    #[test]
+    fn editing_and_deleting_the_last_inherited_theme_preserves_map_semantics() {
+        let tmp = TempDir::new("base-theme");
+        let mut base: ConfigProxy = toml::from_str(BASE).unwrap();
+        base.themes = Some(std::collections::BTreeMap::from([(
+            "Inherited".into(),
+            ThemeConfig::default(),
+        )]));
+        let base_path = tmp.write("base.toml", &to_user_toml(&base));
+        let mut doc = Document::open(&base_path, &tmp.0.join("config.toml")).unwrap();
+        assert!(doc.known_themes().contains(&"Inherited".into()));
+        doc.set_theme("Default", ThemeConfig::default()).unwrap();
+        assert!(doc.known_themes().contains(&"Inherited".into()));
+        doc.remove_theme("Default");
+        doc.remove_theme("Inherited");
+        let parsed: ConfigProxy = toml::from_str(&doc.candidate_text()).unwrap();
+        assert_eq!(parsed.themes, Some(Default::default()));
+        assert!(!doc.known_themes().contains(&"Inherited".into()));
+        assert!(doc.validate().is_empty());
+        doc.reset_global("Themes");
+        assert!(doc.known_themes().contains(&"Inherited".into()));
+    }
+
+    #[test]
+    fn overriding_a_builtin_is_permitted_at_the_theme_limit() {
+        let (_tmp, mut doc) = document("theme-limit", None);
+        while doc.known_themes().len() < MAX_THEMES {
+            let name = format!("Extra {}", doc.known_themes().len());
+            doc.set_theme(&name, ThemeConfig::default()).unwrap();
+        }
+        assert!(doc
+            .set_theme("One Too Many", ThemeConfig::default())
+            .is_err());
+        doc.set_theme("Default", ThemeConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn cancel_and_discard_have_distinct_close_guard_behaviors() {
+        let mut guard = CloseGuard::default();
+        assert!(!guard.request(true));
+        guard.dialog_open = true;
+        guard.dialog_open = false; // Cancel keeps the dirty guard armed.
+        assert!(!guard.request(true));
+        guard.discard();
+        assert!(guard.request(true)); // Discard can close a dirty document exactly once.
     }
 
     #[test]

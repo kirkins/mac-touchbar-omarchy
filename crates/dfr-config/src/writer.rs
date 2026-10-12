@@ -62,6 +62,9 @@ pub fn to_user_toml(proxy: &ConfigProxy) -> String {
         }
         first = false;
         emit_doc(&mut out, "Themes");
+        if themes.is_empty() {
+            out.push_str("[Themes]\n");
+        }
         for (name, theme) in themes {
             let _ = writeln!(out, "[Themes.{}]", key(name));
             if let Some(accents) = &theme.accents {
@@ -258,6 +261,19 @@ mod tests {
 
     fn parse(text: &str) -> ConfigProxy {
         toml::from_str(text).expect("fixture parses")
+    }
+
+    #[test]
+    fn an_empty_theme_map_keeps_inherited_custom_themes_removed() {
+        let base = format!("{BASE}\n[Themes.Inherited]\n");
+        let overlay = ConfigProxy {
+            themes: Some(Default::default()),
+            ..Default::default()
+        };
+        let written = to_user_toml(&overlay);
+        assert_eq!(parse(&written).themes, overlay.themes);
+        let loaded = parse_config(&base, Some(&written), 2008).unwrap();
+        assert!(!loaded.themes.contains("Inherited"));
     }
 
     #[test]

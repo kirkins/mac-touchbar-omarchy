@@ -160,22 +160,107 @@ Run it with:
 cargo run -p dfr-configurator -- [--config PATH] [--base PATH]
 ```
 
-The app edits whatever `--config` file it is pointed at (default
-`/etc/tiny-dfr/config.toml`, overlaid on the default base
-`/usr/share/tiny-dfr/config.toml`) — the same base-plus-user merge the
-daemon loads — and never writes anywhere else: no state, no caches, no
-touched daemon. The **Deck** page edits the named bars (button grid,
-add/remove/reorder, per-button action editor with live key-combo
-capture); the **Knobs** page exposes every registry knob with the
-validated input the config contract demands; the preview strip renders
-the real bar for each layer through the same `dfr-render` draw path the
-daemon uses, so what you see is what the glass shows. Save is disabled
-while the configuration is invalid; when it is valid, one click backs
-up the file once (`.bak-<epoch>` beside it), writes the canonical
-`dfr-config` TOML to a staged file, and renames it into place — the
-atomic save the daemon's inotify watcher reloads live, no restart. The
-headless model underneath (open/edit/validate/save) is unit-tested in
-`crates/dfr-configurator/src/model.rs` without a display.
+The app edits the file supplied by `--config` (default
+`/etc/tiny-dfr/config.toml`), over the `--base` file (default
+`/usr/share/tiny-dfr/config.toml`). All pages share one staged document.
+Opening or inspecting inherited layers does not create changes. Save or
+Ctrl+S writes a valid changed draft, or deliberately creates a missing
+user file. Nothing is installed by the configurator redesign task;
+deployment remains with the documented [reviewed installation
+flow](#reversible-device-installation-after-review).
+
+**Layers** opens with a bounded collection sidebar, a compact contextual
+preview, and ordered, keyboard-activatable button rows. Selecting a row
+opens Button Properties inside the layer workspace; native Back returns
+to the list. Add Button stays beside the list heading. Button Options
+provides Move Earlier/Later and deletion, while Layer Options provides
+rename, reordering, and deletion. Rename commits on the entry's Apply
+button and updates Startup/Fn assignments and every incoming action
+together. Deleting a linked or assigned layer requires an explicit
+replacement; incoming links can be opened for repair. The final layer
+and final button cannot be deleted.
+
+**Appearance** groups Color Theme, Background, and Button Style. It
+includes fixed versus remembered startup themes, built-in palette
+overrides and custom themes, native color pickers with validated hex
+entries, named hourly background bands, and typography. **Behavior**
+groups Layer Switching, Display, Battery, and Pet. Ordinary controls use
+familiar labels and units; Advanced disclosures keep fontconfig, XDG
+icon themes, icon dimensions, waveform/visualizer smoothing and lag,
+and pixel shift available. Every existing content kind and all ten
+supported action forms remain editable. Shortcut capture has a distinct
+listening state plus explicit Finish and Cancel.
+
+Settings show their effective base-plus-user value, with **Using Base
+Setting** or **Customized** and a reset action that removes the user
+override. Explicit values equal to a code default are still saved when
+they override a different base value. Since an absent overlay value
+inherits the base, it cannot erase a base-pinned startup theme or Fn
+assignment: the UI explains the former and offers Fn **None** only
+when the base permits it. Theme tables follow the same whole-map
+replacement contract; an explicit empty map is preserved by the writer.
+
+The preview calls the unchanged `dfr-render` Cairo path. Enlarge opens a
+native adaptive dialog with Fit/1:1 scale, horizontal scrolling, both
+2008/2170 geometries, layer and theme choices, background-hour audition,
+and accessible rendered button identities. Generated Pet, theme, Home,
+and Esc controls are identified separately from authored buttons.
+Authored slots can open their properties; preview interactions never
+execute actions. Theme/hour audition affects only a cloned in-memory
+candidate, never the document or persisted theme state. A remembered
+on-device theme is not read: the caption labels that fallback. Feed data,
+hardware brightness, and action execution are not simulated. Preview
+refresh cancels superseded debounce work; invalid drafts show accessible
+diagnostics rather than an old valid frame. Temporary render files are
+removed after use.
+
+The shell uses GTK4/libadwaita only, with system styling and a single
+primary Save action. It follows native [NavigationSplitView sizing and
+collapse](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.NavigationSplitView.html)
+and [NavigationView Back
+navigation](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.NavigationView.html).
+At narrow widths, the collection becomes a navigation page and the
+switcher moves to the bottom. Native preference pages supply their own
+clamp and scrolling. Where the wireframes suggest a bespoke arrangement,
+native conventions take precedence: HeaderBar supplies Back, the
+properties page keeps stable identity, and Adw.Dialog chooses its
+presentation from the actual host window and available space. The
+baseline remains GTK 4.10/libadwaita 1.5.
+
+Validation still uses the shared `dfr-config` parse path at **both** bar
+geometries, including icon resolution. Invalid drafts disable Save;
+field diagnostics and Review Issue direct repair. A valid Save backs up
+an existing file once per session (`.bak-<epoch>`), stages canonical TOML,
+and renames it atomically. The daemon's watcher reloads that rename
+without a restart. A success toast says **Saved**, without claiming daemon
+acknowledgement. Write failures stay visible with Retry Save until a
+successful save or dismissal. Closing a dirty draft offers
+Cancel/Discard and, when valid, Save and Close.
+
+Headless regression tests cover merge/reset and round-trip semantics,
+all action forms, rename/deletion dependencies, theme limits, failed
+save retention, atomic saving, and the close guard. A display-dependent
+native acceptance test exercises selection, repeated structure changes,
+save feedback, Enlarge, inherited controls, and wide/short/narrow/large
+text allocations against disposable configuration files:
+
+```sh
+cargo test --locked -p dfr-configurator -- --test-threads=1
+G_DEBUG=fatal-criticals cargo test --locked -p dfr-configurator \
+  native_selection_structure_save_feedback_and_layouts -- --ignored --test-threads=1
+```
+
+Set `DFR_CONFIGURATOR_PROOF_DIR` to a scratch directory to save native
+layout captures. The native test uses the application's resizable
+window and waits for mapped widgets and GTK paint; fixed sleeps or
+forced allocation immediately before a cached snapshot can observe
+stale UI. No test writes the live configuration or drives a service.
+
+The redesign's validation host exceeded the renderer's unchanged 2 ms
+debug waveform repaint budget on both the recorded base and the branch,
+using separate builds under identical limits. This remains a timing
+acceptance gap; the renderer and threshold were retained. The functional
+configuration, renderer and native UI checks are reported separately.
 
 ## Configuration reference
 
