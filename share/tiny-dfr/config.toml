@@ -103,12 +103,11 @@ DayCycleEnabled = true
 # Color = "#04060D"
 
 # The named color themes the bar can wear. With this enabled (the
-# default) the quick-keys "more" bar gains two buttons: a compact Theme
-# button that applies the next theme on each tap (briefly showing which
-# one applied), and a Themes button that opens the picker - a bar-sized
-# takeover listing every theme's name; tapping one applies it and
-# returns home. Applying is live: the accent palette and the background
-# bands repaint on the spot, with no service restart, and the choice is
+# default) the theme picker is available as a layer. To add controls to
+# a bar, configure buttons explicitly: Action = "CycleTheme" cycles in
+# place, and Action = { Layer = "themes" } opens the picker. Applying is
+# live: the accent palette and background bands repaint on the spot, with
+# no service restart, and the choice is
 # remembered in /var/lib/tiny-dfr/active-theme across restarts.
 ThemesEnabled = true
 # Pin the startup theme here if you want the config file (not the last

@@ -164,8 +164,9 @@ Keys = [
 # pet layer (or the home bar if no "more" bar exists), unless a layer named
 # "pet" is defined here. A visible button targeting "pet" on that bar keeps
 # its configured label and position.
-# With ThemesEnabled (see config.toml) this more bar also gains a Theme
-# cycle button and a Themes opener to the daemon's own theme picker layer,
-# unless it carries visible equivalents; a [Themes.Name] table there adds
-# or overrides a named color theme (accents and day-cycle bands), and the
-# active theme is remembered across restarts.
+# ThemesEnabled (see config.toml) makes the daemon's theme picker layer
+# available, but does not add buttons to this bar. Opt in by adding entries
+# such as { Text = "Theme", Action = "CycleTheme" } or
+# { Text = "Themes", Action = { Layer = "themes" } } to Keys; a
+# [Themes.Name] table in config.toml adds or overrides a named color theme.
+# The active theme is remembered across restarts.

@@ -156,11 +156,8 @@ impl ConfigProxy {
         // The theme picker takes over its own layer - the full-bar surface
         // the captain described - listing every theme name as a button that
         // applies it and returns home. A user-defined layer named "themes"
-        // replaces the synthesized picker, and the quick-keys "more" bar
-        // carries the two compact activation surfaces: a Theme button that
-        // cycles to the next theme in place, and a Themes button opening
-        // the picker. Configs without a "more" bar stay untouched; their
-        // authors reach the picker by naming the layer in their own button.
+        // replaces the synthesized picker. Theme activation buttons are
+        // opt-in and must be configured on a bar by the author.
         if themes.enabled {
             if names.insert(THEMES_LAYER.to_owned()) {
                 let mut keys = vec![ButtonConfig {
@@ -180,36 +177,6 @@ impl ConfigProxy {
                     name: THEMES_LAYER.into(),
                     keys,
                 });
-            }
-            let visible = |button: &ButtonConfig| {
-                button.text.as_deref().map_or(
-                    button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
-                    |text| !text.trim().is_empty(),
-                )
-            };
-            let more = layers.iter().position(|layer| layer.name == "more");
-            if let Some(more) = more {
-                let more_layer = &mut layers[more];
-                let has_cycle = more_layer.keys.iter().any(|button| {
-                    matches!(button.action, ButtonAction::CycleTheme) && visible(button)
-                });
-                let has_picker = more_layer.keys.iter().any(|button| {
-                    button.action.layer_target() == Some(THEMES_LAYER) && visible(button)
-                });
-                if !has_cycle {
-                    more_layer.keys.push(ButtonConfig {
-                        text: Some("Theme".into()),
-                        action: ButtonAction::CycleTheme,
-                        ..ButtonConfig::default()
-                    });
-                }
-                if !has_picker {
-                    more_layer.keys.push(ButtonConfig {
-                        text: Some("Themes".into()),
-                        action: ButtonAction::SwitchLayer(THEMES_LAYER.into()),
-                        ..ButtonConfig::default()
-                    });
-                }
             }
         }
         for layer in &layers {

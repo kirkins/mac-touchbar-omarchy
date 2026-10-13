@@ -51,7 +51,7 @@ PetEnergy = "rowdy"
 # Tint the strip by time of day; false keeps the plain black background.
 DayCycleEnabled = false
 
-# Enable the color-theme system: the picker layer and the more bar's two theme buttons.
+# Enable the color-theme system and picker layer; add CycleTheme or a themes-layer button explicitly to show theme controls.
 ThemesEnabled = true
 
 # Pin the startup theme instead of the last choice made on the glass.

@@ -308,7 +308,7 @@ ignore. Defaults are code-level: a stripped base file still loads.
 | `DayCycleEnabled` | bool | `true` | - | Tint the strip by time of day; false keeps the plain black background. |
 | `DayCycleBands` | list of tables | `four shipped bands` | at least one band; unique names and 0-23 hours | Replace the default bands: each [[DayCycleBands]] entry has Name, StartHour, and a "#RRGGBB" Color. |
 | **Themes** | | | | |
-| `ThemesEnabled` | bool | `true` | - | Enable the color-theme system: the picker layer and the more bar's two theme buttons. |
+| `ThemesEnabled` | bool | `true` | - | Enable the color-theme system and picker layer; configure theme buttons explicitly on a bar. |
 | `ActiveTheme` | string | `the remembered choice` | must name a defined theme | Pin the startup theme instead of the last choice made on the glass. |
 | `Themes` | table map | `the thirteen built-ins` | at most 21 themes in total | Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]]. |
 | **Layers** | | | | |
@@ -628,8 +628,19 @@ bands reject the candidate configuration on reload, keeping the current one,
 like every other knob. The alarm colors that must never follow a theme (the
 waveform's dead-feed red) keep their shipped values.
 
-Two activation surfaces reach the themes from the glass, both synthesized
-onto the quick-keys `more` bar (default on, exactly like the pet button):
+Theme activation buttons are opt-in. Add them to any named layer's `Keys`
+list, for example:
+
+```toml
+[[Layers]]
+Name = "more"
+Keys = [
+  { Text = "Theme", Action = "CycleTheme" },
+  { Text = "Themes", Action = { Layer = "themes" } },
+]
+```
+
+The two available actions are:
 
 - A compact `Theme` cycle button: each tap applies the next theme in the
   seeded order, wrapping, and the button briefly wears the applied theme's
@@ -649,7 +660,8 @@ it, and a remembered name that no longer exists falls back to the first
 theme and heals the file, so a stale file can never wedge the bar. Up to 21
 themes fit the picker bar; more reject the candidate configuration.
 
-Authors reach the picker from other bars with their own buttons:
+Authors can place these buttons on any bar. The picker can also be reached
+from other bars with their own buttons:
 `Action = { Layer = "themes" }` opens it (a user-defined `[[Layers]]` entry
 named `themes` replaces the synthesized picker, like the pet's layer),
 `Action = "CycleTheme"` cycles in place, and

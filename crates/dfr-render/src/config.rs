@@ -1109,10 +1109,9 @@ DoublePressSwitchLayers = 200
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        // Home, the shipped quick keys (Screenshot, Settings, Lock, Pet), and the two
-        // synthesized theme buttons: the compact cycle button and the
-        // picker opener.
-        assert_eq!(more.keys.len(), 7);
+        // Home, the shipped quick keys (Screenshot, Settings, Lock), and
+        // the synthesized Pet opener. Theme buttons remain opt-in.
+        assert_eq!(more.keys.len(), 5);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1499,10 +1498,9 @@ Keys = [\n\
     }
 
     #[test]
-    fn the_theme_picker_takes_over_its_own_layer_and_the_more_bar_gains_both_buttons() {
+    fn the_theme_picker_is_synthesized_but_theme_buttons_are_opt_in() {
         // With the theme system on (the default), a `themes` layer is
-        // synthesized listing every theme, and the quick-keys `more` bar
-        // gains the compact Theme cycle button and the Themes opener.
+        // synthesized listing every theme. Activation buttons are opt-in.
         let (_, layout) = parse_config(BASE, Some(NAMED_WITH_MORE), 2008).unwrap();
         let picker = layout
             .layers
@@ -1535,20 +1533,12 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        let theme = more.keys.last().unwrap();
-        assert_eq!(theme.text.as_deref(), Some("Themes"));
-        assert_eq!(theme.action, ButtonAction::SwitchLayer("themes".into()));
-        assert_eq!(
-            more.keys[more.keys.len() - 2].text.as_deref(),
-            Some("Theme")
-        );
-        assert_eq!(
-            more.keys[more.keys.len() - 2].action,
-            ButtonAction::CycleTheme
-        );
+        assert!(!more.keys.iter().any(|key| {
+            matches!(key.action, ButtonAction::CycleTheme)
+                || key.action.layer_target() == Some("themes")
+        }));
         // A user layer named `themes` replaces the synthesized picker,
-        // and the more bar still gains the openers unless it carries its
-        // own visible buttons for both surfaces.
+        // while the default more bar remains free of theme controls.
         let config = format!(
             "{NAMED_WITH_MORE}\n\
 [[Layers]]\n\
@@ -1563,7 +1553,7 @@ Keys = [{{ Text = \"P1\" }}]"
             .unwrap();
         assert_eq!(picker.keys.len(), 2);
         assert_eq!(picker.keys[1].text.as_deref(), Some("P1"));
-        // Author-provided visible buttons suppress both syntheses.
+        // Explicitly configured buttons render on the more bar.
         let config = NAMED_WITH_MORE.replace(
             "    { Text = \"Sync\", Action = { Layer = \"home\" } },",
             "    { Text = \"Sync\", Action = { Layer = \"home\" } },\n    { Text = \"Palette\", Action = \"CycleTheme\" },\n    { Text = \"Looks\", Action = { Layer = \"themes\" } },",
@@ -1574,6 +1564,14 @@ Keys = [{{ Text = \"P1\" }}]"
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
+        assert!(more
+            .keys
+            .iter()
+            .any(|key| matches!(key.action, ButtonAction::CycleTheme)));
+        assert!(more
+            .keys
+            .iter()
+            .any(|key| { key.action.layer_target() == Some("themes") }));
         assert_eq!(
             more.keys
                 .iter()

@@ -99,7 +99,7 @@ pub const KNOBS: &[Knob] = &[
     // ---- Global: themes
     Knob { name: "ThemesEnabled", kind: "bool", scope: Scope::Global, group: "Themes",
         default: "true", constraint: None,
-        doc: "Enable the color-theme system: the picker layer and the more bar's two theme buttons." },
+        doc: "Enable the color-theme system and picker layer; add CycleTheme or a themes-layer button explicitly to show theme controls." },
     Knob { name: "ActiveTheme", kind: "string", scope: Scope::Global, group: "Themes",
         default: "the remembered choice", constraint: Some("must name a defined theme"),
         doc: "Pin the startup theme instead of the last choice made on the glass." },
