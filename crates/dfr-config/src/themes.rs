@@ -305,6 +305,11 @@ mod tests {
                 "Forest",
                 "Solarized",
                 "Mono",
+                "Daybreak",
+                "Tidal",
+                "Arcade",
+                "Gilded",
+                "Orchard",
             ]
         );
         // The live palette ships as the first theme with no overrides of
@@ -343,7 +348,12 @@ mod tests {
             ("Rosewater", "Forest"),
             ("Forest", "Solarized"),
             ("Solarized", "Mono"),
-            ("Mono", "Default"),
+            ("Mono", "Daybreak"),
+            ("Daybreak", "Tidal"),
+            ("Tidal", "Arcade"),
+            ("Arcade", "Gilded"),
+            ("Gilded", "Orchard"),
+            ("Orchard", "Default"),
         ] {
             themes.active = Some(from.into());
             assert_eq!(themes.cycle_next().as_deref(), Some(next), "after {from}");
@@ -432,6 +442,11 @@ Color = "#002211"
                 "Forest",
                 "Solarized",
                 "Mono",
+                "Daybreak",
+                "Tidal",
+                "Arcade",
+                "Gilded",
+                "Orchard",
                 "Aloe",
                 "Zephyr",
             ]
@@ -517,7 +532,7 @@ Color = "#002211"
         }
         // The picker bar's button budget caps the theme count.
         let mut many = String::new();
-        for i in 0..(MAX_THEMES - 8) {
+        for i in 0..(MAX_THEMES - builtin_themes().unwrap().names.len()) {
             many.push_str(&format!("[Themes.T{i}]\n"));
         }
         let user = user_theme(&many);

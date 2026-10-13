@@ -224,3 +224,149 @@ Color = "#141517"
 Name = "night"
 StartHour = 21
 Color = "#0B0C0D"
+
+# An airy daylight palette: porcelain neutrals and clear, bright accents
+# over restrained dark bands so white labels and key fills stay legible.
+[[Theme]]
+Name = "Daybreak"
+[Theme.Accents]
+neutral = "#B5B3A7"
+cyan = "#6EC9D9"
+amber = "#F0B85A"
+blue = "#78A7E8"
+violet = "#AA91E8"
+orange = "#F28B5B"
+red = "#E84D8A"
+green = "#72CC9B"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#17191C"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#202328"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#211A19"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#0C1017"
+
+# Deep sea teal, sea-glass green, and coral over a blue-green ocean floor.
+[[Theme]]
+Name = "Tidal"
+[Theme.Accents]
+neutral = "#91B7B7"
+cyan = "#50D8D0"
+amber = "#F2C46C"
+blue = "#609FE8"
+violet = "#B095E8"
+orange = "#F08B56"
+red = "#E64B8C"
+green = "#75D68A"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#0C1B1C"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#102324"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#132122"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#071112"
+
+# Arcade neon: electric cyan and violet, lime green, and hot pink.
+[[Theme]]
+Name = "Arcade"
+[Theme.Accents]
+neutral = "#B5A8D9"
+cyan = "#31E6FF"
+amber = "#FFE05C"
+blue = "#4F84FF"
+violet = "#DF66FF"
+orange = "#FF7954"
+red = "#EA3E9E"
+green = "#8BFF63"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#151020"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#191126"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#21102B"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#090612"
+
+# Brass, lapis, and warm ivory over charcoal walnut.
+[[Theme]]
+Name = "Gilded"
+[Theme.Accents]
+neutral = "#C1A879"
+cyan = "#63D3C3"
+amber = "#F6C65B"
+blue = "#77A8E8"
+violet = "#BA91DA"
+orange = "#F28A4F"
+red = "#D84687"
+green = "#A5D77A"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#1B1711"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#201B13"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#21160E"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#100D09"
+
+# Botanical greens with berry and citrus accents over deep leaf tones.
+[[Theme]]
+Name = "Orchard"
+[Theme.Accents]
+neutral = "#B1B995"
+cyan = "#70D7C2"
+amber = "#EDC35D"
+blue = "#76ABE0"
+violet = "#B49BE1"
+orange = "#F18A50"
+red = "#D94F73"
+green = "#7ED36B"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#111A10"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#172218"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#1D1A0D"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#090F0A"

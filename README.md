@@ -310,7 +310,7 @@ ignore. Defaults are code-level: a stripped base file still loads.
 | **Themes** | | | | |
 | `ThemesEnabled` | bool | `true` | - | Enable the color-theme system: the picker layer and the more bar's two theme buttons. |
 | `ActiveTheme` | string | `the remembered choice` | must name a defined theme | Pin the startup theme instead of the last choice made on the glass. |
-| `Themes` | table map | `the eight built-ins` | at most 21 themes in total | Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]]. |
+| `Themes` | table map | `the thirteen built-ins` | at most 21 themes in total | Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]]. |
 | **Layers** | | | | |
 | `MediaLayerDefault` | bool | `false` | legacy syntax only | Legacy syntax: show the media keys without Fn pressed. |
 | `PrimaryLayerKeys` | list of tables | `the shipped F1-F12 bar` | legacy syntax; mutually exclusive with Layers | Legacy syntax: the primary layer's buttons. |
@@ -594,10 +594,18 @@ entry like any key combo button.
 
 The bar's colors come from named themes: presets of the knobs the config
 already expresses - the colors behind the accent names every button uses,
-and the time-of-day background bands. Eight tasteful built-ins ship seeded
+and the time-of-day background bands. Thirteen built-ins ship seeded
 - `Default` (the live palette exactly as the deck always rendered it),
-`Midnight`, `Nord`, `Ember`, `Rosewater`, `Forest`, `Solarized`, and `Mono` -
-and owners add or override themes with `[Themes.Name]` tables:
+`Midnight`, `Nord`, `Ember`, `Rosewater`, `Forest`, `Solarized`, `Mono`,
+`Daybreak`, `Tidal`, `Arcade`, `Gilded`, and `Orchard` - and owners add or
+override themes with `[Themes.Name]` tables. Every preset keeps its eight
+semantic accents bright and distinct over dark time bands, preserving white
+labels, dark button fills, and the cyan audio, amber brightness, violet
+navigation, orange warning, red critical, and green charging color roles.
+Daybreak brings a light, airy palette, while its dark bands keep label and
+surface contrast intact; Tidal uses deep sea bands, Arcade uses dark violet
+bands behind neon accents, Gilded keeps brass and lapis over walnut-dark
+bands, and Orchard keeps botanical greens and berry over leaf-dark bands.
 
 ```toml
 ThemesEnabled = true     # set false to remove the theme buttons and picker
