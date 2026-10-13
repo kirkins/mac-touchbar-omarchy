@@ -120,11 +120,13 @@ impl Preview {
         let dir =
             std::env::temp_dir().join(format!("dfr-configurator-preview-{}", std::process::id()));
         let render = (|| -> anyhow::Result<cairo::ImageSurface> {
-            let mut audition = doc.clone();
-            if let Some(theme) = self.theme.borrow().clone() {
-                audition.user_mut().active_theme = Some(theme);
-            }
-            let candidate = audition.candidate_text();
+            let audition = doc.clone();
+            let candidate = self
+                .theme
+                .borrow()
+                .as_deref()
+                .map(|theme| doc.candidate_text_for_theme(theme))
+                .unwrap_or_else(|| audition.candidate_text());
             let model =
                 dfr_config::parse_config(doc.base_text(), Some(&candidate), self.width.get())?;
             let layer = self.layer.borrow().clone();

@@ -313,6 +313,19 @@ impl Document {
         to_user_toml(&self.user)
     }
 
+    /// Render a theme audition against an isolated overlay. Previewing a
+    /// candidate must never change the editable document or its dirty state.
+    pub fn candidate_text_for_theme(&self, theme: &str) -> String {
+        let mut audition = self.user.clone();
+        audition.active_theme = Some(theme.to_owned());
+        to_user_toml(&audition)
+    }
+
+    /// Choose the fixed startup theme written by the configurator's Save path.
+    pub fn set_active_theme(&mut self, theme: &str) {
+        self.user.active_theme = Some(theme.to_owned());
+    }
+
     /// Validate the current overlay through the exact daemon path at
     /// both bar geometries (2008 and the esc-synthesizing 2170),
     /// including icon resolution against the daemon's search
@@ -1165,6 +1178,24 @@ mod tests {
         assert!(doc.known_themes().contains(&"Mine".to_owned()));
         doc.remove_theme("Mine");
         assert!(!doc.known_themes().contains(&"Mine".to_owned()));
+    }
+
+    #[test]
+    fn theme_candidate_preview_is_isolated_and_switch_saves_active_theme() {
+        let (_tmp, mut doc) = document("theme-switch", None);
+        let before = doc.candidate_text();
+        let candidate = doc.candidate_text_for_theme("Nord");
+        let audition: ConfigProxy = toml::from_str(&candidate).unwrap();
+        assert_eq!(audition.active_theme.as_deref(), Some("Nord"));
+        assert_eq!(doc.candidate_text(), before, "preview changed the draft");
+
+        doc.set_active_theme("Nord");
+        assert!(doc.is_dirty());
+        doc.save().unwrap();
+        let installed: ConfigProxy =
+            toml::from_str(&fs::read_to_string(doc.user_path()).unwrap()).unwrap();
+        assert_eq!(installed.active_theme.as_deref(), Some("Nord"));
+        assert!(!doc.is_dirty());
     }
 
     #[test]

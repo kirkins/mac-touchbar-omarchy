@@ -180,10 +180,13 @@ together. Deleting a linked or assigned layer requires an explicit
 replacement; incoming links can be opened for repair. The final layer
 and final button cannot be deleted.
 
-**Appearance** groups Color Theme, Background, and Button Style. It
-includes fixed versus remembered startup themes, built-in palette
-overrides and custom themes, native color pickers with validated hex
-entries, named hourly background bands, and typography. **Behavior**
+**Appearance** puts theme switching first: choose any available theme
+to audition it in the live configurator preview, then use **Switch to
+Theme** to save the valid draft and reload the Touch Bar. Color Theme,
+Background, and Button Style remain below, with fixed versus remembered
+startup themes, built-in palette overrides and custom themes, native
+color pickers with validated hex entries, named hourly background
+bands, and typography. **Behavior**
 groups Layer Switching, Display, Battery, and Pet. Ordinary controls use
 familiar labels and units; Advanced disclosures keep fontconfig, XDG
 icon themes, icon dimensions, waveform/visualizer smoothing and lag,

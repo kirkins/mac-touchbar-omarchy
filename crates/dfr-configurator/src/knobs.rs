@@ -56,6 +56,84 @@ impl SettingsPage {
         let page = adw::PreferencesPage::new();
         match self.kind {
             PageKind::Appearance => {
+                let switch = ui::group("Choose a Theme");
+                switch.set_description(Some(
+                    "Select a theme to preview it above. Switch saves the valid draft and reloads the Touch Bar.",
+                ));
+                let names = editor.doc.borrow().known_themes();
+                let strings: Vec<&str> = names.iter().map(String::as_str).collect();
+                let active = editor
+                    .doc
+                    .borrow()
+                    .effective()
+                    .ok()
+                    .and_then(|config| config.active_theme);
+                let selected = active
+                    .as_ref()
+                    .and_then(|theme| names.iter().position(|name| name == theme))
+                    .unwrap_or(0);
+                let chooser = ui::combo("Preview Theme", &strings, selected as u32);
+                let preview_names = names.clone();
+                let apply = gtk4::Button::with_label("Switch to Theme");
+                apply.add_css_class("suggested-action");
+                apply.set_valign(gtk4::Align::Center);
+                chooser.add_suffix(&apply);
+                if let Some(preview) = &self.preview {
+                    preview.audition_theme(names.get(selected).cloned());
+                    chooser.connect_selected_notify(glib::clone!(
+                        #[strong]
+                        editor,
+                        #[weak]
+                        preview,
+                        #[weak]
+                        apply,
+                        move |row| {
+                            let Some(name) = preview_names.get(row.selected() as usize).cloned()
+                            else {
+                                return;
+                            };
+                            preview.audition_theme(Some(name.clone()));
+                            apply.set_sensitive(
+                                editor
+                                    .doc
+                                    .borrow()
+                                    .effective()
+                                    .ok()
+                                    .and_then(|config| config.active_theme)
+                                    .as_deref()
+                                    != Some(name.as_str()),
+                            );
+                            editor.run_pipeline();
+                        }
+                    ));
+                    editor.run_pipeline();
+                }
+                apply.set_sensitive(
+                    names
+                        .get(selected)
+                        .is_some_and(|name| active.as_deref() != Some(name.as_str())),
+                );
+                apply.connect_clicked(glib::clone!(
+                    #[strong]
+                    editor,
+                    #[weak]
+                    chooser,
+                    move |_| {
+                        let Some(theme) = names.get(chooser.selected() as usize) else {
+                            return;
+                        };
+                        let result = {
+                            let mut doc = editor.doc.borrow_mut();
+                            doc.set_active_theme(theme);
+                            doc.save().map_err(|error| format!("{error:#}"))
+                        };
+                        editor.save_feedback.borrow_mut().record(result);
+                        editor.run_pipeline();
+                    }
+                ));
+                switch.add(&chooser);
+                page.add(&switch);
+
                 let color = ui::group("Color Theme");
                 self.scalar(&color, editor, "ThemesEnabled", "Color Themes");
                 self.theme_startup(&color, editor);
