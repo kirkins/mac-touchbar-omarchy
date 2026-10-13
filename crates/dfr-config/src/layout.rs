@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 /// Name of the pet's own layer. When the pet is enabled, a layer with this
 /// name is synthesized if the configuration does not define one, and the
-/// home bar gains a Pet button opening it.
+/// `more` bar (or home bar when no `more` bar exists) gains a Pet button.
 pub const PET_LAYER: &str = "pet";
 /// Free button spaces after the Home button inside the synthesized pet
 /// layer: open ground for the pet to wander.
@@ -99,10 +99,11 @@ impl ConfigProxy {
                 })
                 .transpose()?
         };
-        // The pet lives on its own layer, opened by a Pet button on the home
-        // bar whenever PetEnabled is on. A user-defined layer named "pet"
-        // replaces the synthesized playground, and an existing visible
-        // button targeting it replaces the synthesized Pet button.
+        // The pet lives on its own layer. When a quick-keys "more" bar is
+        // present, its Pet button lives there; otherwise it joins the home
+        // bar. A user-defined layer named "pet" replaces the synthesized
+        // playground, and an existing visible button targeting it replaces
+        // the synthesized Pet button.
         if self.pet_enabled.unwrap_or(defaults::PET_ENABLED) {
             if names.insert(PET_LAYER.to_owned()) {
                 layers.push(LayerConfig {
@@ -120,8 +121,12 @@ impl ConfigProxy {
                     ],
                 });
             }
-            let home_layer = &mut layers[home];
-            let has_pet_button = home_layer.keys.iter().any(|button| {
+            let opener = layers
+                .iter()
+                .position(|layer| layer.name == "more")
+                .unwrap_or(home);
+            let opener_layer = &mut layers[opener];
+            let has_pet_button = opener_layer.keys.iter().any(|button| {
                 button.action.layer_target() == Some(PET_LAYER)
                     && button.text.as_deref().map_or(
                         button.icon.is_some() || button.time.is_some() || button.battery.is_some(),
@@ -129,12 +134,16 @@ impl ConfigProxy {
                     )
             });
             if !has_pet_button {
-                let at = home_layer
-                    .keys
-                    .iter()
-                    .rposition(|button| matches!(button.action, ButtonAction::SwitchLayer(_)))
-                    .map_or(home_layer.keys.len(), |last| last + 1);
-                home_layer.keys.insert(
+                let at = if opener_layer.name == "more" {
+                    opener_layer.keys.len()
+                } else {
+                    opener_layer
+                        .keys
+                        .iter()
+                        .rposition(|button| matches!(button.action, ButtonAction::SwitchLayer(_)))
+                        .map_or(opener_layer.keys.len(), |last| last + 1)
+                };
+                opener_layer.keys.insert(
                     at,
                     ButtonConfig {
                         text: Some("Pet".into()),

@@ -251,7 +251,7 @@ mod tests {
 
     // Pixel digests of the golden frames (FNV-1a over the 64x2048
     // portrait buffer); see shipped_multibar_frames_match_the_pinned_pixel_digests.
-    const GOLDEN_HOME: u64 = 3187485570255027787;
+    const GOLDEN_HOME: u64 = 14136130584182235729;
     const GOLDEN_MEDIA: u64 = 9540707964474980499;
     const GOLDEN_FUNCTION: u64 = 8649432053679081575;
     const NAMED: &str = r#"
@@ -1025,7 +1025,7 @@ DoublePressSwitchLayers = 200
         // the remaining buttons.
         assert!(!home.keys.iter().any(|key| key.time.is_some()));
         assert!(home.keys.iter().any(|key| key.battery.is_some()));
-        for name in ["function", "media", "more", "pet"] {
+        for name in ["function", "media", "more"] {
             assert!(home
                 .keys
                 .iter()
@@ -1044,6 +1044,20 @@ DoublePressSwitchLayers = 200
                 1
             );
         }
+        assert!(!home
+            .keys
+            .iter()
+            .any(|key| key.action == ButtonAction::SwitchLayer("pet".into())));
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert!(more
+            .keys
+            .iter()
+            .any(|key| key.text.as_deref() == Some("Pet")
+                && key.action == ButtonAction::SwitchLayer("pet".into())));
         // The voice-dictation flow: the mic button starts recording and
         // opens the recording layer in one press; its Cancel and Stop
         // buttons visibly return home, so no extra Home button appears.
@@ -1095,10 +1109,10 @@ DoublePressSwitchLayers = 200
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        // Home, the shipped quick keys (Screenshot, Settings, Lock), and the two
+        // Home, the shipped quick keys (Screenshot, Settings, Lock, Pet), and the two
         // synthesized theme buttons: the compact cycle button and the
         // picker opener.
-        assert_eq!(more.keys.len(), 6);
+        assert_eq!(more.keys.len(), 7);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1112,9 +1126,9 @@ DoublePressSwitchLayers = 200
                 layer: "home".into()
             }
         );
-        // The Pet button joins the navigation cluster after Functions,
-        // Media, and More, matching their styling.
-        let positions: Vec<usize> = ["function", "media", "more", "pet"]
+        // Pet is tucked into More, leaving the home navigation cluster
+        // focused on the primary deck layers.
+        let positions: Vec<usize> = ["function", "media", "more"]
             .into_iter()
             .map(|name| {
                 home.keys
@@ -1123,7 +1137,7 @@ DoublePressSwitchLayers = 200
                     .unwrap()
             })
             .collect();
-        assert_eq!(positions, vec![3, 4, 5, 6]);
+        assert_eq!(positions, vec![3, 4, 5]);
         // The media bar keeps its existing controls and gains two
         // buttons: the now-playing row after the transport cluster, and
         // the opt-in music visualizer at the end, off by default every
@@ -1150,7 +1164,11 @@ DoublePressSwitchLayers = 200
         assert_eq!(viz.waveform, None);
         assert_eq!(viz.stretch, Some(2));
         assert_eq!(viz.action, ButtonAction::Keys(vec![]));
-        let pet_button = &home.keys[positions[3]];
+        let pet_button = more
+            .keys
+            .iter()
+            .find(|key| key.action == ButtonAction::SwitchLayer("pet".into()))
+            .unwrap();
         assert_eq!(pet_button.text.as_deref(), Some("Pet"));
         let function = layout
             .layers
@@ -1183,6 +1201,33 @@ DoublePressSwitchLayers = 200
                 .map(|key| ButtonAction::Keys(vec![key]))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn an_authored_more_pet_opener_overrides_the_synthesized_default() {
+        let example = include_str!("../../../share/tiny-dfr/multibar.toml");
+        let config = example.replace(
+            "{ Text = \"Home\", Action = { Layer = \"home\" } },\n    { Text = \"Screenshot\"",
+            "{ Text = \"Home\", Action = { Layer = \"home\" } },\n    { Text = \"My Pet\", Action = { Layer = \"pet\" } },\n    { Text = \"Screenshot\"",
+        );
+        let (_, layout) = parse_config(BASE, Some(&config), 2008).unwrap();
+        let more = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        let pet_openers: Vec<_> = more
+            .keys
+            .iter()
+            .filter(|key| key.action == ButtonAction::SwitchLayer("pet".into()))
+            .collect();
+        assert_eq!(pet_openers.len(), 1);
+        assert_eq!(pet_openers[0].text.as_deref(), Some("My Pet"));
+        let home = &layout.layers[layout.home];
+        assert!(!home
+            .keys
+            .iter()
+            .any(|key| key.action == ButtonAction::SwitchLayer("pet".into())));
     }
 
     #[test]
@@ -1299,7 +1344,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 6);
+        assert_eq!(more.keys.len(), 7);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1343,7 +1388,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 8);
+        assert_eq!(more.keys.len(), 9);
         assert_eq!(more.keys[2].icon.as_deref(), Some("search"));
         assert!(more.keys[2].text.is_none());
         assert_eq!(
@@ -1994,7 +2039,7 @@ Color = "301020"
             let ground = &pet.keys[offset + 1];
             assert_eq!(ground.stretch, Some(PET_LAYER_STRETCH));
             assert!(ground.text.is_none() && ground.icon.is_none());
-            // The home bar gains a Pet button right after its Functions nav.
+            // Without a More layer, the home bar keeps a Pet opener.
             let home = &layout.layers[layout.home];
             let functions = home
                 .keys

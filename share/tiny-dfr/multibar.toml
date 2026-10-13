@@ -160,8 +160,10 @@ Keys = [
 # touch-down with Action = { Command = "..." }, optionally combined with a
 # Layer switch as in the mic button above. Commands run through /bin/sh as
 # the daemon user; failures are logged to the journal. With PetEnabled (see
-# config.toml) the home bar also gains a Pet button opening the daemon's own
-# pet layer, unless a layer named "pet" is defined here.
+# config.toml) the "more" bar gains a Pet button opening the daemon's own
+# pet layer (or the home bar if no "more" bar exists), unless a layer named
+# "pet" is defined here. A visible button targeting "pet" on that bar keeps
+# its configured label and position.
 # With ThemesEnabled (see config.toml) this more bar also gains a Theme
 # cycle button and a Themes opener to the daemon's own theme picker layer,
 # unless it carries visible equivalents; a [Themes.Name] table there adds
