@@ -1,6 +1,13 @@
 # tiny-dfr
 The most basic dynamic function row daemon possible
 
+Runs on Apple Silicon Macs with a Touch Bar under Asahi Linux, on any
+Asahi Linux distribution that provides the Touch Bar DRM and backlight
+kernel devices the daemon expects. It uses DRM atomic modesetting, uinput,
+and the included udev and systemd setup. It is developed and daily-driven
+on Omarchy. The shipped quick keys include Omarchy-specific screenshot and
+settings actions; adapt those entries for another desktop environment.
+
 
 ## Dependencies
 cairo, libinput, freetype, fontconfig, librsvg 2.59 or later, uinput enabled in kernel config
