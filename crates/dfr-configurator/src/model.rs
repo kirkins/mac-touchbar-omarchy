@@ -1,8 +1,8 @@
 //! The configurator's headless document model: everything the UI edits
 //! lives here as typed state, every change is validated through the
 //! exact `dfr-config` path the daemon loads through, and saving means
-//! rendering the canonical user file and installing it atomically so
-//! the daemon's inotify reload applies it live. No GTK types appear in
+//! rendering the canonical user file and installing it atomically. Default
+//! drafts need a separate administrator apply to the watched overlay. No GTK types appear in
 //! this module, so the whole editing contract is testable headless.
 //!
 //! The editing state is the **user overlay** (`ConfigProxy`): the app
@@ -235,6 +235,43 @@ pub struct Document {
 }
 
 impl Document {
+    /// Default Settings workflow: load an existing draft, otherwise seed its
+    /// in-memory overlay from the installed deck or the shipped full deck.
+    /// Opening does not write anything; Save creates the user-owned draft.
+    pub fn open_draft(
+        base_path: &Path,
+        draft_path: &Path,
+        installed_path: &Path,
+        example_path: &Path,
+    ) -> Result<Self> {
+        if draft_path.try_exists()? {
+            return Self::open(base_path, draft_path);
+        }
+        let seed = if installed_path.try_exists()? {
+            installed_path
+        } else {
+            example_path
+        };
+        let mut doc = Self::open(base_path, seed)?;
+        // A missing example must not silently select the legacy base layout.
+        if !seed.try_exists()? {
+            bail!(
+                "the full-deck example {} is missing; see INSTALL.md",
+                seed.display()
+            );
+        }
+        doc.user_path = draft_path.to_owned();
+        Ok(doc)
+    }
+
+    pub fn save_message(&self) -> &'static str {
+        if self.user_path == Path::new("/etc/tiny-dfr/config.toml") {
+            "Saved — the Touch Bar reloads automatically"
+        } else {
+            "Saved draft — apply it using the installation guide"
+        }
+    }
+
     /// Open the document: the base file must parse; a missing or empty
     /// user file starts from an empty overlay (everything inherits the
     /// base, and the app's first save creates the user file).
@@ -715,6 +752,67 @@ mod tests {
         };
         let doc = Document::open(&base, &user_path).unwrap();
         (tmp, doc)
+    }
+
+    #[test]
+    fn settings_seed_is_read_only_and_save_creates_a_user_draft() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = TempDir::new("settings-draft");
+        let base = tmp.write("base.toml", BASE);
+        let protected = tmp.0.join("administrator");
+        fs::create_dir(&protected).unwrap();
+        let seed = protected.join("installed.toml");
+        fs::write(&seed, MULTIBAR).unwrap();
+        fs::set_permissions(&seed, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o555)).unwrap();
+        // Reproduce the ordinary-user failure of editing the protected overlay.
+        let mut direct = Document::open(&base, &seed).unwrap();
+        direct.user_mut().active_brightness = Some(201);
+        let result = direct.save();
+        let draft = tmp.0.join("user/dfr-deck/config.toml");
+        let mut doc =
+            Document::open_draft(&base, &draft, &seed, Path::new("/unused-example")).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
+        if seed.metadata().unwrap().uid() != 0 {
+            assert!(result.is_err());
+        }
+        assert!(!draft.exists());
+        assert_eq!(doc.layer_roles().0, "home");
+        assert_eq!(doc.user_path(), draft);
+        assert!(doc.save_message().contains("apply"));
+        doc.user_mut().active_brightness = Some(201);
+        doc.save().unwrap();
+        let reopened = Document::open(&base, &draft).unwrap();
+        assert_eq!(reopened.user().active_brightness, Some(201));
+        assert_eq!(fs::read_to_string(&seed).unwrap(), MULTIBAR);
+        if seed.metadata().unwrap().uid() != 0 {
+            assert_eq!(fs::read_dir(&protected).unwrap().count(), 1); // no seed backup/stage
+        }
+    }
+
+    #[test]
+    fn settings_preserves_existing_drafts_and_falls_back_to_full_deck() {
+        let (tmp, mut prior) = document("existing-draft", Some("ActiveBrightness = 201"));
+        let base = tmp.0.join("base.toml");
+        let seed = tmp.write("example.toml", MULTIBAR);
+        let reopened = Document::open_draft(&base, prior.user_path(), &seed, &seed).unwrap();
+        assert_eq!(reopened.user().active_brightness, Some(201));
+        let draft = tmp.0.join("new/config.toml");
+        let mut fresh = Document::open_draft(&base, &draft, &tmp.0.join("absent"), &seed).unwrap();
+        assert_eq!(fresh.layer_roles().0, "home");
+        fresh.save().unwrap();
+        assert_eq!(
+            Document::open(&base, &draft).unwrap().layer_roles().0,
+            "home"
+        );
+        prior.save().unwrap();
+        assert!(Document::open_draft(
+            &base,
+            &tmp.0.join("missing-draft"),
+            &tmp.0.join("absent"),
+            &tmp.0.join("missing-example")
+        )
+        .is_err());
     }
 
     #[test]

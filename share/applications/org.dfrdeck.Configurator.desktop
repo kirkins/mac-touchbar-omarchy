@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Touch Bar Settings
+Comment=Edit a Touch Bar draft, then apply it using the installation guide
+Exec=/usr/local/bin/dfr-configurator
+Icon=preferences-system
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupNotify=true

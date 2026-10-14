@@ -1,9 +1,9 @@
 //! dfr-configurator: the native GTK4/libadwaita configurator for the
 //! tiny-dfr Touch Bar deck. It edits whatever configuration file it is
-//! pointed at (default `/etc/tiny-dfr/config.toml`, per the README)
+//! pointed at (default a user-owned draft, per INSTALL.md)
 //! through the shared `dfr-config` model, previews the bar with the
-//! real `dfr-render` draw path, and saves through the canonical writer
-//! so the daemon's inotify reload applies changes live. Invalid states
+//! real `dfr-render` draw path, and saves through the canonical writer.
+//! User drafts are applied separately to the daemon's watched overlay. Invalid states
 //! are rejected in the UI before Save can ever write them.
 
 mod capture;
@@ -11,21 +11,43 @@ mod knobs;
 mod layers;
 mod model;
 mod preview;
+mod startup;
 mod ui;
 
 use gtk4::{glib, prelude::*};
 use layers::{Editor, LayersPage};
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 const APP_ID: &str = "org.dfrdeck.Configurator";
 
 fn main() -> anyhow::Result<()> {
-    let (base_path, user_path) = parse_args();
-    let doc = model::Document::open(&base_path, &user_path)?;
+    let Some(options) = startup::parse(
+        std::env::args().skip(1),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )?
+    else {
+        println!("usage: dfr-configurator [--config PATH] [--base PATH]\n\
+                  --config edits that file directly; by default Settings saves a user draft\n\
+                  at $XDG_CONFIG_HOME/dfr-deck/config.toml (or $HOME/.config/dfr-deck/config.toml)\n\
+                  --base defaults to /usr/share/tiny-dfr/config.toml\n\
+                  Apply saved drafts with the administrator steps in /usr/share/doc/tiny-dfr/INSTALL.md");
+        return Ok(());
+    };
+    let doc = if options.draft {
+        model::Document::open_draft(
+            &options.base,
+            &options.user,
+            Path::new("/etc/tiny-dfr/config.toml"),
+            Path::new("/usr/share/tiny-dfr/multibar.toml"),
+        )?
+    } else {
+        model::Document::open(&options.base, &options.user)?
+    };
 
     adw::init().expect("libadwaita initializes");
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -39,39 +61,6 @@ fn main() -> anyhow::Result<()> {
     // The app owns GTK argument parsing; ours are already consumed.
     app.run_with_args::<String>(&[]);
     Ok(())
-}
-
-fn parse_args() -> (PathBuf, PathBuf) {
-    let mut base = PathBuf::from("/usr/share/tiny-dfr/config.toml");
-    let mut user = PathBuf::from("/etc/tiny-dfr/config.toml");
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--config" | "-c" => {
-                if let Some(path) = args.next() {
-                    user = PathBuf::from(path);
-                }
-            }
-            "--base" | "-b" => {
-                if let Some(path) = args.next() {
-                    base = PathBuf::from(path);
-                }
-            }
-            "--help" | "-h" => {
-                eprintln!(
-                    "usage: dfr-configurator [--config PATH] [--base PATH]\n\
-                     --config edits that file (default /etc/tiny-dfr/config.toml)\n\
-                     --base loads that base configuration (default /usr/share/tiny-dfr/config.toml)"
-                );
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("unknown option {other}; see --help");
-                std::process::exit(2);
-            }
-        }
-    }
-    (base, user)
 }
 
 struct Workspace {
@@ -399,9 +388,7 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
             editor.save_feedback.borrow_mut().record(result.clone());
             editor.run_pipeline();
             if result.is_ok() {
-                toast.add_toast(adw::Toast::new(
-                    "Saved — the Touch Bar reloads automatically",
-                ));
+                toast.add_toast(adw::Toast::new(editor.doc.borrow().save_message()));
             }
         }
     ));
@@ -416,8 +403,9 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
                 &window,
                 "Configuration File",
                 &format!(
-                    "Editing {}. Changes stay in one draft until Save.",
-                    editor.doc.borrow().user_path().display()
+                    "Editing {}. Save writes this file.\n\n{}\n\nTo apply a user draft, validate it with tiny-dfr check, then have an administrator install it to /etc/tiny-dfr/config.toml. See /usr/share/doc/tiny-dfr/INSTALL.md. The GUI never elevates privileges.",
+                    editor.doc.borrow().user_path().display(),
+                    editor.doc.borrow().save_message()
                 ),
             );
         }

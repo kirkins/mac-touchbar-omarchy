@@ -5,11 +5,13 @@ BindsTo=dev-tiny_dfr_display.device dev-tiny_dfr_backlight.device
 Wants=dev-tiny_dfr_display_backlight.device
 
 [Service]
+ExecStartPre=/usr/bin/install -d -o nobody -g nobody -m 0755 /var/lib/tiny-dfr
 ExecStart=/usr/bin/tiny-dfr
 Restart=always
 
 NoNewPrivileges=true
 ProtectSystem=strict
+ReadWritePaths=/var/lib/tiny-dfr
 ProtectHome=true
 PrivateTmp=true
 PrivateIPC=true

@@ -1,3 +1,5 @@
+# Experimental legacy packaging, outside the supported INSTALL.md route.
+# Not qualified for the workspace/native Settings or fixed runtime asset paths.
 {
   description = "The most basic dynamic function row daemon possible";
   inputs = { nixpkgs.url = "github:nixos/nixpkgs/nixos-24.11"; };

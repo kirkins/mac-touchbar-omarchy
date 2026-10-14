@@ -794,6 +794,33 @@ Keys = [
         tap(&mut deck, "More", &mut commands);
         assert_eq!(deck.active, deck.names["more"]);
         render(&mut deck, "implemented-more.png");
+        // The shipped More bar has no theme controls. Opt in through the
+        // real configuration consumer before exercising those optional taps.
+        let mut themed: dfr_config::ConfigProxy =
+            toml::from_str(include_str!("../../../share/tiny-dfr/multibar.toml")).unwrap();
+        let more = themed
+            .layers
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        more.keys.extend([
+            dfr_config::ButtonConfig {
+                text: Some("Theme".into()),
+                action: ButtonAction::CycleTheme,
+                ..Default::default()
+            },
+            dfr_config::ButtonConfig {
+                text: Some("Themes".into()),
+                action: ButtonAction::SwitchLayer("themes".into()),
+                ..Default::default()
+            },
+        ]);
+        fs::write(&user_path, toml::to_string(&themed).unwrap()).unwrap();
+        let (_, themed_deck) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
+        deck = themed_deck;
+        deck.switch_to(deck.names["more"], &mut |_, _| {});
         // The theme system: the Themes opener switches into the picker, a
         // full-bar takeover listing every theme name; tapping one applies
         // it live - the palette and the day-cycle bands swap in place, no
@@ -1343,7 +1370,12 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 7);
+        assert_eq!(more.keys.len(), 5);
+        assert!(!more
+            .keys
+            .iter()
+            .any(|key| matches!(key.action, ButtonAction::CycleTheme)
+                || key.action.layer_target() == Some("themes")));
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1387,7 +1419,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 9);
+        assert_eq!(more.keys.len(), 7);
         assert_eq!(more.keys[2].icon.as_deref(), Some("search"));
         assert!(more.keys[2].text.is_none());
         assert_eq!(

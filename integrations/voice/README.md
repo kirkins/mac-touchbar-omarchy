@@ -1,48 +1,61 @@
-# Local Touch Bar dictation
+# Optional cloud Touch Bar dictation
 
-This optional integration is maintained in this private repository. Install it
-separately from the Touch Bar daemon. Python 3.11+, PipeWire `pw-cat`, `pactl`,
-`curl`, `wtype`, and `notify-send` must be available in the desktop session.
+Voice is separate from the daemon and native Settings. It requires Python
+3.11+, PipeWire `pw-cat`, `pactl`, coreutils `stdbuf`, `curl`, `wtype`, and
+`notify-send` in the desktop session, plus a deliberately supplied **Groq** API
+credential. No other application's configuration is discovered, read or migrated.
 
-The Mic command calls `/usr/local/bin/voice-dictate-user start`. This client
-uses a Linux abstract AF_UNIX socket named `dfr-voice-<desktop UID>` to reach
-`voice-dictate.service` in the desktop user's graphical session. Stop terminates
-capture, sends a WAV to Groq Whisper, and types the returned text into the
-focused window. Cancel terminates capture and discards it without a request
-or typing. Layer switching remains immediate, so notifications and the user
-service journal report recording, transcription, and insertion failures.
+**Privacy and interaction:** Start captures the selected microphone into temporary
+raw audio in the desktop runtime directory. **Stop uploads a WAV to Groq's
+transcription endpoint using `whisper-large-v3-turbo`**, then types the returned
+transcript into whichever window is focused when insertion occurs. Focus can
+change while transcription is running. **Cancel discards the capture without
+uploading or inserting anything.** Recording/request/header files are removed
+on Stop, Cancel or normal service shutdown; systemd clears the runtime directory
+on service stop. Groq receives audio and returns transcript text; local temporary
+cleanup does not control the provider's retention or account policy. Provider use
+can incur account charges. Read its current terms/settings before enabling this.
 
-The receiver accepts exactly `start`, `stop`, and `cancel`, authenticates
-`SO_PEERCRED` against the desktop UID and UID 65534 (`nobody`), and runs no shell
-commands from requests. The client also checks the receiver's UID. Other
-processes with either allowed UID can invoke these same three actions; this
-is an explicit local trust boundary. The abstract socket crosses the daemon's
-private mount namespace without making the desktop runtime directory public.
-The daemon keeps its internal privilege drop, `NoNewPrivileges`, and AF_UNIX /
-AF_NETLINK restriction. Neither `runuser` nor a privileged launcher is involved.
+Layer switching remains immediate. Notifications and the user-service journal
+report recording, transcription and insertion failures. A successful `wtype`
+exit does not establish that the intended window received the text.
 
-The same service also binds a second abstract socket, `dfr-voice-level-<desktop
-UID>`, for the Touch Bar's live recording waveform. Each one-shot `get` request
-returns the latest 0-100 input peak of the ongoing capture (`ok <n>`) or `idle`
-when no recording is active; anything else is rejected with `error`. The level
-reader passively tails the raw capture file the recorder is already writing,
-under the same `SO_PEERCRED` boundary, and never touches the recorder, its file
-descriptors, or the dictation flow; capture finishing forgets the path at once.
-A capture that stops growing for two seconds reports silence so a stalled bar
-cannot freeze loud. The recorder itself runs unbuffered - `stdbuf -o0`
-wraps `pw-cat` - so the tailed bytes trail the microphone by roughly one
-audio quantum instead of the quarter second an 8 KB stdio buffer would add;
-the captured file's content is unchanged. The daemon polls this endpoint only while its recording
-layer is displayed. Updating the installed helper and user service is enough
-to enable it; no new unit or permission is involved.
+## Independent credential setup (deliberate opt-in)
 
-## Install
+As the desktop user, create a new file for this integration only. Do not copy or
+reuse a private application's config. Never put a key into Git, command arguments,
+chat, logs or test fixtures. The following creates an empty template, refuses to
+clobber an existing file and does not request a key:
 
-Before replacing an existing helper, launcher, or voice-specific drop-in, keep
-one rollback copy in a private task directory outside the repository. Never
-commit credentials, audio, transcripts, or copies of personal configuration.
+```sh
+install -d -m700 "$HOME/.config/dfr-deck"
+(umask 077; set -C; printf '[groq]\napi_key = ""\n' > "$HOME/.config/dfr-deck/voice.toml")
+```
 
-Run these commands as the desktop user from the repository root:
+Edit that file privately with your own Groq key. The expected schema is:
+
+```toml
+[groq]
+api_key = "" # enter your own key privately; an empty template cannot record/upload
+```
+
+The file must be a regular, non-symlink file owned by the desktop user, readable
+only by that user (normally mode 0600). Missing/malformed files, blank/invalid
+keys or insecure file permissions fail with a generic error **before recording**
+and before upload. A locally valid key can still be rejected by the provider;
+that failure occurs at Stop and does not type text. No local key validation makes
+a provider call. The helper takes **only an explicit `--credential-file PATH`**;
+it has no credential default. The optional unit explicitly passes
+`%h/.config/dfr-deck/voice.toml`; an XDG override for the Settings draft does not
+change this separately chosen voice path. To choose another standalone file,
+change that user unit's explicit argument. The credential stays out of command
+arguments and travels to curl through a temporary mode-0600 header file.
+
+## Install after opting in
+
+First use the [complete daemon/Settings installation guide](../../INSTALL.md).
+Preserve previous helper/unit/client/drop-in files before an upgrade. From the
+repository root, as desktop UID **1000**:
 
 ```sh
 install -Dm755 integrations/voice/voice-dictate "$HOME/.local/bin/voice-dictate"
@@ -52,86 +65,73 @@ sudo install -Dm644 integrations/voice/voice.conf /etc/systemd/system/tiny-dfr.s
 systemctl --user daemon-reload
 systemctl --user enable --now voice-dictate.service
 sudo systemctl daemon-reload
-sudo systemctl restart tiny-dfr.service
 ```
 
-The client targets desktop UID 1000. The receiver derives its socket name
-from its own UID. If the daemon uses a different UID, adapt the receiver's
-allowed UID set after reviewing that boundary. Do not grant the daemon access
-to the user's home or runtime directory. The new drop-in restores the stock
-`ProtectHome` and `PrivateTmp` settings which the previous `runuser`
-deployment had relaxed.
+The shipped multibar Mic/Stop/Cancel actions already select this client. Restart
+only `tiny-dfr.service` if needed after installing a drop-in. Voice is unnecessary
+for the deck, Settings, Pet or themes. The user manager must already contain the
+current `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`.
 
-Use the existing mic / Stop / Cancel actions from
-[`share/tiny-dfr/multibar.toml`](../../share/tiny-dfr/multibar.toml) or change only
-those actions in the deployed configuration. Preserve other custom buttons.
-The service starts with `graphical-session.target`; its manager environment must
-already contain the current `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and
-`DBUS_SESSION_BUS_ADDRESS`. Inspect only those fields if troubleshooting.
-Re-login or restart only this voice service if the desktop environment changes.
+The client and daemon level reader pin desktop UID 1000; receivers derive their
+own UID. A different desktop UID requires coordinated source adaptation and
+qualification, not merely a service edit. The daemon remains nobody/65534 and
+cannot access the user's home or runtime sockets. This integration keeps the
+existing `ProtectHome`, `PrivateTmp`, `NoNewPrivileges` and AF_UNIX/AF_NETLINK
+restrictions. It uses no privileged launcher or environment import into nobody.
 
-The helper reads `[stt].api_key` from the existing private
-`~/.config/herdr-telegram-bridge/config.toml`. It uses Groq's transcription
-endpoint and `whisper-large-v3-turbo`. The key stays out of command arguments
-and travels in a temporary mode-0600 header file. Recording and request files
-live in the desktop runtime directory and are removed after Stop, Cancel, or
-service shutdown. An interrupted session is cleared by systemd on service stop.
+The receiver's Linux abstract AF_UNIX socket `dfr-voice-<desktop UID>` accepts
+only `start`, `stop`, `cancel` and authenticates `SO_PEERCRED` against its own
+UID and 65534. The client verifies the receiver UID. Other processes with either
+allowed UID can invoke those actions: this existing local trust boundary is
+unchanged. Requests supply no shell commands. A second authenticated socket,
+`dfr-voice-level-<desktop UID>`, serves only `get` with `ok <0-100>` or `idle`.
+It passively tails existing capture bytes for the recording waveform, forgets the
+path at capture completion and reports silence if growth stalls for two seconds.
+It neither starts capture nor reads credentials.
 
-Audio selection resolves `pactl get-default-source` by the name column in
-`pactl list sources short`. It rejects unavailable sources and speaker monitors.
-It does not select a headset simply because it appears first. If the intended
-mic differs from the session default, add an `Environment=VOICE_DICTATE_SOURCE=<name>`
-override to this user unit and restart only the voice service. Verify actual
-signal before declaring a source working. Start requires capture bytes within
-three seconds; it does not establish audible speech or transcription quality.
-The level feed reports capture peaks, not audibility or transcription quality.
+Microphone selection resolves `pactl get-default-source` by name in
+`pactl list sources short` and rejects speaker monitors/unavailable sources.
+If necessary set `Environment=VOICE_DICTATE_SOURCE=<name>` in this user unit.
+Start requires capture bytes within three seconds; this proves neither audible
+speech nor transcription quality.
 
-## Verification
+## Safe verification and separate live qualification
 
-These regressions run small executable adapters, actual subprocesses, and real
-AF_UNIX requests. They capture no microphone, send no HTTP request, and type
-nothing:
+These executable adapters/socket tests use **dummy credentials, synthetic audio
+and fake external tools**. They never access real keys, microphones, cloud services,
+focused windows or production sockets:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/voice -p 'test_*.py' -v
-systemd-analyze --user verify integrations/voice/voice-dictate.service
+python3 -B -m unittest discover -s integrations/voice -p 'test_*.py' -v
 ```
 
-First verify the receiver with a harmless marker handler and the client under
-the actual daemon UID, supplementary groups, session-free environment, mount
-namespace, and no-new-privileges restrictions. A same-user socket test alone
-does not reproduce the original root-only `runuser` failure. Never use a live
-Mic press for this first check if the receiver is configured to record.
+Missing/invalid credential tests assert that no capture/upload/insertion occurs;
+Cancel tests assert no request or typing; request/HTTP/JSON/insertion failures
+are exercised through mocks. A same-user test does not qualify the deployed
+nobody namespace, hardware, compositor or provider.
 
-Then isolate the provider with a small synthetic spoken WAV and the existing
-credential path:
+Live voice acceptance is a separate deliberate operator action after credential
+setup and disclosure review, never part of installation/offline tests. Focus a
+disposable field, use Mic then Stop, and confirm where returned text lands.
+Repeat Mic then Cancel: no upload or insertion should occur. If isolating provider
+transcription using a synthetic WAV is separately wanted, the explicit CLI is:
 
 ```sh
-"$HOME/.local/bin/voice-dictate" transcribe-file /private/task/synthetic.wav
-journalctl --user -u voice-dictate.service --since today --no-pager
+"$HOME/.local/bin/voice-dictate" transcribe-file /path/to/synthetic.wav \
+    --credential-file "$HOME/.config/dfr-deck/voice.toml"
 ```
 
-`transcribe-file` prints the transcript and never inserts it. Test actual
-insertion only after deliberately creating and focusing a disposable text field.
-Network errors, HTTP failures (including provider error messages), invalid JSON,
-empty transcripts, and `wtype` failures return errors. “Typed” is announced
-only after `wtype` exits successfully; that alone still cannot prove the intended
-window received the text.
+That command **uploads to Groq and prints the transcript**, without insertion;
+do not treat it as an offline test. Mic during transcription reports busy rather
+than queueing another recording. Inspect only this service's relevant errors;
+never print credential files.
 
-Finally coordinate a physical check: focus the disposable field, press Mic,
-speak a short phrase, observe the recording notification, press Stop, and
-observe the transcript in that field. Repeat with Mic then Cancel; the field
-must stay unchanged, and no transcription should run. Only this physical path
-can establish end-to-end dictation. Pressing Mic again during transcription
-reports busy; retry when transcription finishes. New actions are not queued
-to record unexpectedly after a slow request.
+## Rollback / uninstall
 
-## Rollback
-
-Stop and disable only `voice-dictate.service`. Restore the one saved helper,
-launcher, and voice drop-in, then reload both relevant managers and restart only
-`tiny-dfr.service`. Restore the voice button commands only if they were changed.
-Remove the newly added voice unit and reload the user manager. The original
-launcher is known to fail as `nobody`; restoring it restores the previous
-deployment, not working dictation. Remove superseded rollback copies once the
-repair is validated and durably recorded.
+Stop/disable only `voice-dictate.service`. Restore the prior helper, client, user
+unit and voice-specific drop-in, or remove only files newly added by this setup;
+reload the respective managers and restart only the daemon if its drop-in changed.
+Preserve other drop-ins and deck customizations. The standalone credential file
+is user-owned and separate: retain it privately or deliberately delete/revoke it
+through your provider account; do not migrate it elsewhere. Keep secrets, audio,
+transcripts and personal backups outside source control.

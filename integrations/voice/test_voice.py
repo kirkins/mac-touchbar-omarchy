@@ -91,7 +91,8 @@ class DictationTests(unittest.TestCase):
         })
         self.environment.start()
         credential = self.root / "credential.toml"
-        credential.write_text('[stt]\napi_key = "dummy-test-key"\n')
+        credential.write_text('[groq]\napi_key = "dummy-test-key"\n')
+        credential.chmod(0o600)
         self.engine = voice.Dictation(self.root / "state", credential)
 
     def tearDown(self):
@@ -102,6 +103,56 @@ class DictationTests(unittest.TestCase):
     def calls(self, name):
         log = self.root / (name + ".log")
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_no_implicit_credential_is_read_or_recording_started(self):
+        # Only this disposable home exists in the test. Never inspect a real key.
+        with patch.object(voice.Path, "home", return_value=self.root):
+            engine = voice.Dictation(self.root / "unconfigured")
+        self.addCleanup(engine.discard)
+        with self.assertRaises(voice.VoiceError):
+            engine.start()
+        self.assertEqual(self.calls("pactl"), [])
+        self.assertEqual(self.calls("pw-cat"), [])
+        self.assertEqual(self.calls("curl"), [])
+
+    def test_missing_credential_blocks_start_before_capture(self):
+        self.engine.credential_path.unlink()
+        with self.assertRaises(voice.VoiceError):
+            self.engine.start()
+        self.assertEqual(self.calls("pw-cat"), [])
+        self.assertEqual(self.calls("curl"), [])
+
+    def test_invalid_credentials_never_record_upload_type_or_disclose_contents(self):
+        path = self.engine.credential_path
+        for contents in ('[groq]\napi_key = ""', '[groq]\napi_key = " "',
+                         '[groq]\napi_key = 42', '[groq]\napi_key = "dummy\\nkey"',
+                         '[groq]\napi_key = "dummy\\rkey"',
+                         '[stt]\napi_key = "dummy-test-key"', 'not TOML'):
+            with self.subTest(contents=contents):
+                path.write_text(contents)
+                with self.assertRaises(voice.VoiceError) as error:
+                    self.engine.start()
+                self.assertNotIn(contents, str(error.exception))
+                with self.assertRaises(voice.VoiceError):
+                    self.engine.transcribe(self.root / "synthetic.wav")
+        self.assertEqual(self.calls("pactl"), [])
+        self.assertEqual(self.calls("pw-cat"), [])
+        self.assertEqual(self.calls("curl"), [])
+        self.assertEqual(self.calls("wtype"), [])
+
+    def test_insecure_or_symlinked_credential_is_rejected(self):
+        path = self.engine.credential_path
+        path.chmod(0o644)
+        with self.assertRaises(voice.VoiceError):
+            self.engine.start()
+        path.chmod(0o600)
+        link = self.root / "key-link"
+        link.symlink_to(path)
+        self.engine.credential_path = link
+        with self.assertRaises(voice.VoiceError):
+            self.engine.transcribe(self.root / "synthetic.wav")
+        self.assertEqual(self.calls("pw-cat"), [])
+        self.assertEqual(self.calls("curl"), [])
 
     def test_start_stop_records_default_by_name_then_inserts(self):
         self.engine.dispatch("start")

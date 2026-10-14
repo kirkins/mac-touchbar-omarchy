@@ -1,7 +1,8 @@
 # Touch Bar desktop-session actions
 
-This optional integration is maintained in this private repository. Install it
-separately from the Touch Bar daemon. Python 3.11+ and the Omarchy capture
+Install this optional receiver separately from the Touch Bar daemon.
+The [complete install guide](../../INSTALL.md) installs the native Settings
+binary/desktop launcher and the machine capture client. Python 3.11+ and the Omarchy capture
 flow (`omarchy capture screenshot`, with `grim`, `slurp`, `hyprpicker`,
 `wl-copy`, and `hyprctl`) must be available in the desktop session.
 
@@ -48,6 +49,9 @@ authenticates `SO_PEERCRED` against the desktop UID and UID 65534 (`nobody`),
 and never executes bytes from the wire. Each action selects a fixed argv on
 the session side: `omarchy capture screenshot`, or
 `systemd-run --user --collect --quiet /usr/local/bin/dfr-configurator`.
+The native app defaults to the desktop user's XDG draft. Save writes that draft;
+the explicit administrator Apply steps in the install guide update the daemon.
+Settings itself does not require Omarchy or elevated GUI privileges.
 There is no arbitrary command or argument channel. Other processes with
 either allowed UID can invoke these two actions; this is the explicit local
 trust boundary. The client checks the receiver's UID. The daemon keeps its
@@ -68,6 +72,8 @@ copy in a private task directory outside the repository. Never commit
 screenshots or copies of personal configuration.
 
 Run these commands as the desktop user from the repository root:
+
+First build/install the native GTK4/libadwaita app using [INSTALL.md](../../INSTALL.md).
 
 ```sh
 install -Dm755 integrations/capture/touchbar-capture "$HOME/.local/bin/touchbar-capture"
@@ -90,8 +96,9 @@ so after `sudo install -m644 share/tiny-dfr/multibar.toml
 customizations) run `sudo systemctl restart tiny-dfr.service`. The example's
 Settings key uses the `settings` verb and returns to Home after handing off.
 The client targets desktop UID 1000. The receiver derives its socket name from its own
-UID. If the daemon uses a different UID, adapt the receiver's allowed UID
-set after reviewing that boundary.
+UID. Both the shipped client and daemon target UID 1000; a different desktop UID
+requires coordinated source adaptation and qualification, not just editing the
+receiver. The daemon remains nobody/65534.
 
 The service starts with `graphical-session.target`; its manager environment
 must already contain the current `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.

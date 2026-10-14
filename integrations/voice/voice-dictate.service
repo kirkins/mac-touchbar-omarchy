@@ -4,7 +4,7 @@ PartOf=graphical-session.target
 After=graphical-session.target pipewire.service
 
 [Service]
-ExecStart=%h/.local/bin/voice-dictate serve
+ExecStart=%h/.local/bin/voice-dictate serve --credential-file %h/.config/dfr-deck/voice.toml
 Restart=on-failure
 RestartSec=2
 RuntimeDirectory=voice-dictate

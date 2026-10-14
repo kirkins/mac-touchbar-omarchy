@@ -39,7 +39,7 @@ BatteryWarningColor = "amber"
 # Accent painted below the critical threshold while not charging.
 BatteryCriticalColor = "red"
 
-# Keep the pet layer and its home-bar Pet button; false removes both.
+# Keep the pet layer and its More-bar Pet button (Home fallback); false removes both.
 PetEnabled = true
 
 # The pet's sprite: an orange tabby or a red fox.
@@ -51,7 +51,7 @@ PetEnergy = "rowdy"
 # Tint the strip by time of day; false keeps the plain black background.
 DayCycleEnabled = false
 
-# Enable the color-theme system and picker layer; add CycleTheme or a themes-layer button explicitly to show theme controls.
+# Enable the color-theme system and picker layer; configure theme buttons explicitly on a bar.
 ThemesEnabled = true
 
 # Pin the startup theme instead of the last choice made on the glass.

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -114,7 +115,8 @@ class Dictation:
     def __init__(self, state_dir=None, credential_path=None):
         self.state_dir = Path(state_dir or Path(os.environ["XDG_RUNTIME_DIR"]) / "voice-dictate")
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.credential_path = Path(credential_path or Path.home() / ".config/herdr-telegram-bridge/config.toml")
+        # Cloud voice is opt-in. Never discover another application's key.
+        self.credential_path = Path(credential_path) if credential_path else None
         self.recording = None
         self.recorder = None
         self.output = None
@@ -131,6 +133,7 @@ class Dictation:
                 notify("Already recording")
                 return
             self.discard()
+        self.credential()
         source = audio_source()
         self.recording = tempfile.TemporaryDirectory(prefix="recording-", dir=self.state_dir)
         raw = Path(self.recording.name) / "audio.raw"
@@ -203,14 +206,31 @@ class Dictation:
         finally:
             self.discard()
 
-    def transcribe(self, wav):
+    def credential(self):
+        if self.credential_path is None:
+            raise VoiceError("Cloud voice is not configured; supply --credential-file")
         try:
-            settings = tomllib.loads(self.credential_path.read_text())["stt"]
-            key = settings["api_key"]
-            if not isinstance(key, str) or not key or "\n" in key or "\r" in key:
+            fd = os.open(self.credential_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077 or info.st_size > 65536):
+                    raise ValueError("Invalid credential file")
+                contents = source.read(65537)
+                if len(contents) > 65536:
+                    raise ValueError("Credential file too large")
+            key = tomllib.loads(contents.decode("utf-8"))["groq"]["api_key"]
+            if (not isinstance(key, str) or not key
+                    or any(ord(char) <= 32 or ord(char) == 127 for char in key)):
                 raise ValueError("Invalid credential")
-        except (OSError, KeyError, ValueError, TypeError) as error:
-            raise VoiceError("Cannot read the private transcription credential") from error
+        except (OSError, KeyError, ValueError, TypeError):
+            raise VoiceError(
+                "Cannot read cloud voice credentials; use a user-owned mode-0600 "
+                "TOML file with [groq].api_key") from None
+        return key
+
+    def transcribe(self, wav):
+        key = self.credential()
         with tempfile.TemporaryDirectory(prefix="request-", dir=self.state_dir) as temporary:
             auth = Path(temporary) / "authorization"
             auth.write_text("Authorization: Bearer " + key + "\n")
@@ -357,8 +377,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("serve", "transcribe-file"))
     parser.add_argument("file", nargs="?")
+    parser.add_argument("--credential-file", metavar="PATH",
+                        help="explicit user-owned mode-0600 TOML file with [groq].api_key")
     args = parser.parse_args()
-    engine = Dictation()
+    engine = Dictation(credential_path=args.credential_file)
     if args.mode == "transcribe-file":
         if not args.file:
             parser.error("transcribe-file requires a WAV file")

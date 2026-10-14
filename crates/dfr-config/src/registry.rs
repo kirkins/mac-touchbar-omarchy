@@ -82,7 +82,7 @@ pub const KNOBS: &[Knob] = &[
     // ---- Global: pet
     Knob { name: "PetEnabled", kind: "bool", scope: Scope::Global, group: "Pet",
         default: "true", constraint: None,
-        doc: "Keep the pet layer and its home-bar Pet button; false removes both." },
+        doc: "Keep the pet layer and its More-bar Pet button (Home fallback); false removes both." },
     Knob { name: "PetVariant", kind: "enum", scope: Scope::Global, group: "Pet",
         default: "cat", constraint: Some("cat, fox"),
         doc: "The pet's sprite: an orange tabby or a red fox." },
@@ -99,12 +99,12 @@ pub const KNOBS: &[Knob] = &[
     // ---- Global: themes
     Knob { name: "ThemesEnabled", kind: "bool", scope: Scope::Global, group: "Themes",
         default: "true", constraint: None,
-        doc: "Enable the color-theme system and picker layer; add CycleTheme or a themes-layer button explicitly to show theme controls." },
+        doc: "Enable the color-theme system and picker layer; configure theme buttons explicitly on a bar." },
     Knob { name: "ActiveTheme", kind: "string", scope: Scope::Global, group: "Themes",
         default: "the remembered choice", constraint: Some("must name a defined theme"),
         doc: "Pin the startup theme instead of the last choice made on the glass." },
     Knob { name: "Themes", kind: "table map", scope: Scope::Global, group: "Themes",
-        default: "the eight built-ins", constraint: Some("at most 21 themes in total"),
+        default: "the thirteen built-ins", constraint: Some("at most 21 themes in total"),
         doc: "Define or override themes: [Themes.Name] with an Accents map of accent names to \"#RRGGBB\" and optional [[...DayCycleBands]]." },
     // ---- Global: layers
     Knob { name: "MediaLayerDefault", kind: "bool", scope: Scope::Global, group: "Layers",

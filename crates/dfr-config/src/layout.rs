@@ -29,6 +29,80 @@ pub const WAVEFORM_STYLES: &[&str] = &["line", "bars"];
 /// The battery widget's display modes.
 pub const BATTERY_MODES: &[&str] = &["icon", "percentage", "both"];
 
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    const BASE: &str = include_str!("../../../share/tiny-dfr/config.toml");
+    const DECK: &str = include_str!("../../../share/tiny-dfr/multibar.toml");
+
+    #[test]
+    fn first_install_pet_is_under_more_and_theme_controls_need_explicit_actions() {
+        let loaded = crate::parse_config(BASE, Some(DECK), 2008).unwrap();
+        let more = loaded
+            .layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert!(more
+            .keys
+            .iter()
+            .any(|button| button.action.layer_target() == Some("pet")));
+        let home = &loaded.layout.layers[loaded.layout.home];
+        assert!(!home
+            .keys
+            .iter()
+            .any(|button| button.action.layer_target() == Some("pet")));
+        assert!(!more
+            .keys
+            .iter()
+            .any(|button| matches!(button.action, ButtonAction::CycleTheme)
+                || button.action.layer_target() == Some("themes")));
+
+        let mut deck: ConfigProxy = toml::from_str(DECK).unwrap();
+        let more = deck
+            .layers
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        more.keys.push(ButtonConfig {
+            text: Some("Theme".into()),
+            action: ButtonAction::CycleTheme,
+            ..Default::default()
+        });
+        more.keys.push(ButtonConfig {
+            text: Some("Themes".into()),
+            action: ButtonAction::SwitchLayer("themes".into()),
+            ..Default::default()
+        });
+        let enabled = toml::to_string(&deck).unwrap();
+        let loaded = crate::parse_config(BASE, Some(&enabled), 2008).unwrap();
+        let more = loaded
+            .layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "more")
+            .unwrap();
+        assert!(more
+            .keys
+            .iter()
+            .any(|button| matches!(button.action, ButtonAction::CycleTheme)));
+        assert!(more
+            .keys
+            .iter()
+            .any(|button| button.action.layer_target() == Some("themes")));
+        assert!(loaded
+            .layout
+            .layers
+            .iter()
+            .any(|layer| layer.name == "themes"));
+        deck.themes_enabled = Some(false);
+        assert!(crate::parse_config(BASE, Some(&toml::to_string(&deck).unwrap()), 2008).is_err());
+    }
+}
+
 pub struct LayerLayout {
     pub layers: Vec<LayerConfig>,
     pub home: usize,

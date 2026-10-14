@@ -58,7 +58,7 @@ impl SettingsPage {
             PageKind::Appearance => {
                 let switch = ui::group("Choose a Theme");
                 switch.set_description(Some(
-                    "Select a theme to preview it above. Switch saves the valid draft and reloads the Touch Bar.",
+                    "Select a theme to preview it above. Switch saves a fixed startup theme in the draft. Apply the draft using the installation guide. Remember Last Touch Bar Choice uses the persisted on-glass choice instead.",
                 ));
                 let names = editor.doc.borrow().known_themes();
                 let strings: Vec<&str> = names.iter().map(String::as_str).collect();

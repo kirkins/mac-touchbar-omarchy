@@ -1,0 +1,254 @@
+# Install Super Touch Bar (tiny-dfr)
+
+This is the supported source installation procedure. It installs the native
+GTK4/libadwaita Settings app as well as the daemon. It does not install drivers,
+change kernel/boot configuration, or configure cloud voice. Commands below are
+for the operator of the target machine; development tests use staging and mocks.
+
+## Scope and prerequisites
+
+The daemon needs Linux Touch Bar DRM, touch-input, backlight and uinput support
+already provided by the distribution. The inherited udev rules name
+`MacBookPro17,1` and `Mac14,7`, DRM drivers `adp`/`appletbdrm`, and the
+`panel-summit`/`hid-appletb-bl` Touch Bar backlights. They also retain Intel/T2
+identifiers; their presence is not a qualification of Intel/T2 hardware.
+There is no fresh device or all-distribution Asahi acceptance claim here.
+
+The supplied desktop integrations target **desktop UID 1000** and the daemon's
+`nobody` UID 65534. Receivers derive their own socket UID but the daemon and
+clients pin 1000. A different user UID requires coordinated source changes and
+qualification; editing only a service is insufficient. The complete example
+targets an Omarchy Wayland session with a systemd user manager and PipeWire.
+Screenshot needs Omarchy; the lock key emits its `SUPER+CTRL+L` binding. The
+Settings application itself is a generic native app; its Touch Bar launch needs
+the capture receiver and the graphical user manager. Other desktops and hardware
+are adaptation work, outside the supplied full-deck qualification.
+
+The system daemon opens DRM, Touch Bar input/backlight and `/dev/uinput`, then
+drops to `nobody` with supplementary **input** and **video** groups. Those groups
+and the nobody account and **nobody group** must already exist (the stock unit
+uses both names to prepare theme state); the distribution's device/logind
+permissions must allow this existing model. Do not chmod devices, home/runtime
+directories or configuration world-writable to fix a permission error. The
+udev `SYSTEMD_ALIAS` entries create systemd device aliases, not necessarily
+filesystem symlinks named `/dev/tiny_dfr_*`.
+
+Build requirements: a Rust/Cargo toolchain compatible with `Cargo.lock`, a C
+compiler/linker, make, pkg-config, and development libraries for Cairo,
+libinput, FreeType, fontconfig, librsvg **2.59+**, GLib/GIO, Pango, GDK-Pixbuf,
+libdrm and libudev. A fontconfig-resolvable font (the example uses `:bold`)
+is needed for configuration validation/rendering. Native Settings additionally
+requires **GTK 4.10+ and libadwaita 1.5+**, at build and run time. Package names
+vary; on Arch the libraries are `cairo libinput freetype2 fontconfig librsvg
+glib2 pango gdk-pixbuf2 libdrm systemd-libs gtk4 libadwaita`, with `base-devel`
+and Rust/Cargo. On Fedora the GUI development packages are `gtk4-devel
+libadwaita-devel`; on Debian/Ubuntu `libgtk-4-dev libadwaita-1-dev`. Verify the
+minimum versions; an older distribution package is not sufficient.
+
+Nix/`flake.nix` is **experimental and unsupported** for this workspace/native
+Settings install: its legacy version, asset substitutions and GUI dependencies
+have not been qualified. Use the procedure here rather than `nix build`.
+
+## Build and stage without changing the machine
+
+From the repository root, as an ordinary user:
+
+```sh
+pkg-config --modversion gtk4 libadwaita-1 librsvg-2.0
+cargo build --locked --workspace --release -j1
+dfr_stage=$(mktemp -d)
+make install DESTDIR="$dfr_stage"
+target/release/tiny-dfr check --base "$dfr_stage/usr/share/tiny-dfr/config.toml" \
+    --icon-root "$dfr_stage/usr/share/tiny-dfr" "$dfr_stage/usr/share/tiny-dfr/multibar.toml"
+desktop-file-validate "$dfr_stage/usr/local/share/applications/org.dfrdeck.Configurator.desktop"
+```
+
+`make install` copies files only: no build, service start, audio, cloud request,
+credential setup or personal config overwrite. `DESTDIR` changes the staging
+root, not compiled runtime paths. Keep the stage for an installation manifest
+and uninstall reference. The installed files are `/usr/bin/tiny-dfr`,
+`/usr/local/bin/dfr-configurator`, the capture client, base/example TOML and all
+inherited SVGs under `/usr/share/tiny-dfr`, the udev rule and stock system unit,
+the desktop entry, both licenses and this guide/README. The base file is required;
+an `/etc` overlay cannot replace it. A daemon-only `cargo build -p tiny-dfr`
+is possible but does not provide the complete Settings route described here.
+
+## First installation
+
+If any destination in the stage is already installed or package-managed, use
+the upgrade section instead. Review the stage and the supplied udev/unit first.
+Check accounts/groups with `getent passwd nobody` and `getent group nobody input video`.
+As the machine administrator, from the same reviewed checkout:
+
+```sh
+sudo make install
+# Deliberately select the full named deck; the base alone is the legacy layout.
+sudo install -Dm644 /usr/share/tiny-dfr/multibar.toml /etc/tiny-dfr/config.toml
+/usr/bin/tiny-dfr check /etc/tiny-dfr/config.toml
+sudo systemctl daemon-reload
+sudo udevadm control --reload
+```
+
+The stock unit prepares `/var/lib/tiny-dfr` owned by `nobody` (0755) and allows
+writes only there through `ReadWritePaths`; `ProtectSystem=strict`, `ProtectHome`,
+`PrivateTmp`, `NoNewPrivileges` and its other restrictions remain enabled.
+This directory persists on-glass theme choice. No writable `/etc` is required.
+
+New rules need a device add event. Reboot at a suitable time after installation
+so the already connected devices are discovered with the new rules. The udev
+rules request `tiny-dfr.service`; the unit has no `[Install]` section and is
+not enabled with `systemctl enable`. Once the systemd device aliases are present,
+`sudo systemctl start tiny-dfr.service` can start it explicitly. Inspect
+`systemctl status tiny-dfr.service dev-tiny_dfr_display.device
+dev-tiny_dfr_backlight.device` and `journalctl -u tiny-dfr.service -b`.
+Missing driver/device aliases or groups are prerequisites to resolve with the
+distribution; this guide does not install a kernel or relax the sandbox.
+
+## Native Settings, Save and Apply
+
+Launch **Touch Bar Settings** from the desktop application menu, or run
+`/usr/local/bin/dfr-configurator` as the desktop user. Never run the GUI with
+sudo. The default draft is `$XDG_CONFIG_HOME/dfr-deck/config.toml` when that
+variable is absolute, otherwise `$HOME/.config/dfr-deck/config.toml`. Existing
+drafts are preserved. With no draft, Settings loads the current `/etc` overlay,
+or the installed `multibar.toml` example if no overlay exists, into memory.
+Opening does not write; Save/Ctrl+S creates the user-owned directory/file and
+later saves atomically with a first-save backup. Invalid drafts cannot be saved.
+
+**Save writes the draft. Apply installs that draft for the daemon.** Save alone
+does not change the running Touch Bar. The Configuration File menu and saved
+toast explain this contract. Explicit `--config PATH` edits that file directly;
+use it only with a writable file. `/etc` remains administrator-owned.
+
+After saving, run this separate handoff in a terminal as the desktop user:
+
+```sh
+dfr_config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+# If XDG_CONFIG_HOME is relative, use $HOME/.config as Settings does.
+case "$dfr_config_home" in /*) ;; *) dfr_config_home="$HOME/.config" ;; esac
+dfr_draft="$dfr_config_home/dfr-deck/config.toml"
+/usr/bin/tiny-dfr check "$dfr_draft" && \
+    sudo cp -a /etc/tiny-dfr/config.toml /etc/tiny-dfr/config.toml.before-settings && \
+    sudo install -m644 "$dfr_draft" /etc/tiny-dfr/config.toml
+```
+
+Retain an earlier `config.toml.before-settings` under a different backup name
+before applying again. The daemon watches its configuration and reloads valid
+changes; confirm the result in its journal. If it needs an explicit reload,
+`sudo systemctl restart tiny-dfr.service`. To undo, reinstall the retained
+overlay with `sudo install -m644 /etc/tiny-dfr/config.toml.before-settings
+/etc/tiny-dfr/config.toml`. For a manual first setup with no installed overlay,
+skip the backup copy and use `sudo install -Dm644` after validation. There is
+no privileged apply helper, sudo policy or home/runtime permission change.
+
+## Optional desktop receivers
+
+For the full deck's **Settings button**, install this receiver as desktop UID
+1000; the machine capture client is already supplied by `make install`:
+
+```sh
+install -Dm755 integrations/capture/touchbar-capture "$HOME/.local/bin/touchbar-capture"
+install -Dm644 integrations/capture/touchbar-capture.service "$HOME/.config/systemd/user/touchbar-capture.service"
+systemctl --user daemon-reload
+systemctl --user enable --now touchbar-capture.service
+```
+
+The receiver launches the same native app/default draft as the desktop entry.
+Its user-manager environment must contain `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`,
+`DBUS_SESSION_BUS_ADDRESS` and, for Omarchy screenshot, the compositor's session
+environment. Use the desktop's normal session-environment import/re-login
+mechanism. Screenshot additionally needs Omarchy's `grim`, `slurp`, `hyprpicker`,
+`wl-copy`, `hyprctl` flow. Settings needs neither a screenshot nor Omarchy itself.
+
+Each other integration is separately optional:
+
+| Directory / receiver | Prerequisites and effect |
+| --- | --- |
+| `audio` / `dfr-volume` | Python 3, `pactl`, PipeWire PulseAudio compatibility, `omarchy-audio-output-sink`; reads/writes output volume |
+| `brightness` / `dfr-brightness` | Python 3, `brightnessctl`, existing logind permissions and **apple-panel-bl** display; reads/writes display brightness |
+| `viz` / `dfr-viz` | Python 3, `pw-cat`, `pactl`, PipeWire; captures output-monitor peaks only while the visualizer is enabled |
+| `now-playing` / `dfr-now-playing` | Python 3 with `dbus-python` (Arch `python-dbus`), session bus and MPRIS player; reads title/artist |
+| `voice` / `voice-dictate` | Python 3.11+, `pw-cat`, `pactl`, `stdbuf`, `curl`, `wtype`, `notify-send`, deliberate standalone Groq credential setup; see its [privacy/setup guide](integrations/voice/README.md) before enabling |
+
+For a chosen non-voice receiver, substitute the directory/script from the table:
+
+```sh
+dfr_integration=audio
+dfr_receiver=dfr-volume
+install -Dm755 "integrations/$dfr_integration/$dfr_receiver" "$HOME/.local/bin/$dfr_receiver"
+install -Dm644 "integrations/$dfr_integration/$dfr_receiver.service" "$HOME/.config/systemd/user/$dfr_receiver.service"
+systemctl --user daemon-reload
+systemctl --user enable --now "$dfr_receiver.service"
+```
+
+User units deliberately use `%h/.config/systemd/user`/`%h/.local/bin` conventions;
+an XDG override for the Settings draft does not relocate these helper binaries.
+Read each integration README for its protocol/rollback. No receiver is started
+by `make install`. Without receivers, deck navigation still works, slider/quick
+key requests fail visibly/in the journal, now-playing is idle and an enabled
+visualizer reports `No feed`. Voice is unnecessary for Settings or the deck.
+
+## Safe checks and optional device smoke
+
+Offline: use the staged `tiny-dfr check` above, then validate the installed
+overlay and any draft before applying. Executable regression tests use dummy
+credentials, synthetic audio, fake external tools and unique sockets:
+
+```sh
+python3 -B -m unittest discover -s tests -v
+python3 -B -m unittest discover -s integrations/voice -v
+python3 -B -m unittest discover -s integrations/capture -v
+cargo test --locked --workspace -j1 -- --test-threads=1
+```
+
+These checks do not qualify live hardware, microphone/cloud behavior or desktop
+text insertion. A device owner can separately check Home → Functions → Home,
+Home → Media → Home, Fn press/release and key release across layer/config changes.
+With default `PetEnabled=true`, use **Home → More → Pet → Home**; a custom deck
+without More gets the Pet opener on Home unless it supplies its own opener.
+Open native Settings, Save a draft, apply it separately, and check the journal.
+Screenshot/Lock/volume/brightness tests need their stated prerequisites.
+
+Theme buttons are **opt-in**: with `ThemesEnabled=true`, add a More button
+with `Action = "CycleTheme"` and/or a button with `Action = { Layer = "themes" }`
+in Settings, then Save and Apply. Name those buttons Theme and Themes respectively.
+Only then test More → Theme and/or More → Themes → a name → Home. With **Remember Last Touch Bar Choice**
+(`ActiveTheme` absent), the on-glass selection persists through restart in
+`/var/lib/tiny-dfr/active-theme`. **Use a Fixed Theme**/Switch to Theme saves
+`ActiveTheme` in the draft, and the fixed name wins on startup/reload after Apply;
+on-glass changes can still occur in the session. `ThemesEnabled=false` disables
+theme application; selecting a startup theme then has no effect until enabled.
+Voice device/cloud tests require separate deliberate opt-in: Stop uploads audio
+and inserts returned text into the focused window; Cancel uploads/inserts nothing.
+Use a disposable focused field and read the voice disclosure first.
+
+## Upgrade, rollback and uninstall
+
+An existing/package-managed installation is an **upgrade**, not first install.
+Keep the previous source/package and one administrator-owned backup of every
+destination you will replace, the `/etc/tiny-dfr` overlay/custom icons, and any
+`tiny-dfr.service.d` drop-ins. Do not overwrite distro-owned files behind its
+package manager: use its packaging/rollback mechanism or resolve the collision
+first. Stage and validate the new binaries/assets as above. Stop only
+`tiny-dfr.service` during replacement, install the reviewed files, preserve the
+existing `/etc` overlay (the install target never overwrites it), check it with
+the new daemon, reload units/rules, then start that service. A legacy
+`multibar.conf` ExecStart override still selects `/usr/local/libexec/tiny-dfr-multibar`:
+back it up and remove that specific override if adopting `/usr/bin/tiny-dfr`.
+Preserve unrelated drop-ins. Sync a stale Settings draft deliberately using
+`--config` or by backing it up before reopening; upgrades do not overwrite drafts.
+
+To roll an upgrade back, stop the daemon, restore the previous destination files,
+overlay and drop-ins (remove only newly added files using the retained stage),
+reload the system manager/udev rules, then start the previous daemon. Retain theme
+state and user drafts for rollback. Stop/disable only optional user units you
+added and restore their prior files; reload the user manager.
+
+To uninstall a first install, first stop the daemon and any added user receivers.
+Using the retained stage as the exact file list, remove only the files installed
+by that stage from their corresponding absolute locations. Remove the selected
+`/etc/tiny-dfr/config.toml` only if it belongs to this install and has been backed
+up. Remove only your added user units/helpers and reload the relevant managers
+and udev rules. Empty installation directories can be removed with `rmdir`;
+keep custom icons, drafts, backups and `/var/lib/tiny-dfr/active-theme` unless
+you deliberately choose to discard them. No kernel/boot uninstall is involved.

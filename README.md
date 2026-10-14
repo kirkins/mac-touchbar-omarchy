@@ -1,16 +1,21 @@
 # tiny-dfr
 The most basic dynamic function row daemon possible
 
-Runs on Apple Silicon Macs with a Touch Bar under Asahi Linux, on any
-Asahi Linux distribution that provides the Touch Bar DRM and backlight
-kernel devices the daemon expects. It uses DRM atomic modesetting, uinput,
-and the included udev and systemd setup. It is developed and daily-driven
-on Omarchy. The shipped quick keys include Omarchy-specific screenshot and
-settings actions; adapt those entries for another desktop environment.
+Super Touch Bar builds on Asahi Linux's tiny-dfr. The supplied source targets
+Linux Touch Bar DRM/input/backlight drivers and an Omarchy Wayland desktop with
+UID 1000 for the optional session integrations. It is developed on Omarchy;
+this is not an all-distribution Asahi or Intel/T2 hardware qualification.
+Screenshot/Lock, audio and display helpers have specific desktop/device
+requirements; Settings is a native GTK4/libadwaita app. See the complete
+[installation guide and support boundary](INSTALL.md) before installing.
 
 
 ## Dependencies
-cairo, libinput, freetype, fontconfig, librsvg 2.59 or later, uinput enabled in kernel config
+cairo, libinput, freetype, fontconfig, librsvg 2.59 or later, uinput enabled in kernel config.
+The workspace/native Settings route also requires GTK **4.10+** and libadwaita
+**1.5+** development and runtime libraries. [INSTALL.md](INSTALL.md) lists the
+full build requirements, existing driver/device permissions and optional helpers.
+The legacy Nix flake is experimental and outside supported installation claims.
 
 ## Build and check
 
@@ -58,6 +63,8 @@ and the per-band frames
 `implemented-daycycle-morning.png`, `implemented-daycycle-day.png`,
 `implemented-daycycle-evening.png`, and `implemented-daycycle-night.png` of
 the same home bar over each time-of-day background.
+The theme frames explicitly add CycleTheme/picker actions to the example;
+those controls are absent from the shipped default More bar.
 These frames use the configured font and icon search paths; their battery
 display is illustrative and they do not prove physical touch or dictation.
 Running the full test suite with the variable set also exports the pet's
@@ -147,15 +154,14 @@ the problem instead of leaving it in the journal.
 ## Graphical configurator
 
 A native GTK4/libadwaita configurator lives in `crates/dfr-configurator`
-(`cargo build -p dfr-configurator`). It is a build-on-demand tool for
-people editing a deck, **not** part of the daemon install: nothing in
-`make install` or the service depends on it, and it never runs as root
-beyond whatever privileges you start it with — save installs the file
-with an atomic rename, so point it at a copy if your config needs
-elevated rights and install that copy yourself.
+(`cargo build -p dfr-configurator`). The complete `make install` route installs
+it at `/usr/local/bin/dfr-configurator` and adds **Touch Bar Settings** to the
+application menu. Run it as the ordinary desktop user. Save writes a user-owned
+draft; the separate administrator Apply steps in [INSTALL.md](INSTALL.md) validate
+and install that draft for the daemon. The GUI never elevates privileges.
 
-Building it needs the GTK 4 and libadwaita development packages at
-build time only (the daemon itself stays dependency-free of them):
+Building and running it needs GTK **4.10+** and libadwaita **1.5+** packages
+(the daemon itself does not depend on those GUI libraries):
 Arch `pacman -S gtk4 libadwaita`, Fedora `dnf install gtk4-devel
 libadwaita-devel`, Debian/Ubuntu `apt install libgtk-4-dev
 libadwaita-1-dev`. A checkout that lacks them still builds the daemon:
@@ -167,14 +173,15 @@ Run it with:
 cargo run -p dfr-configurator -- [--config PATH] [--base PATH]
 ```
 
-The app edits the file supplied by `--config` (default
-`/etc/tiny-dfr/config.toml`), over the `--base` file (default
+The app edits the file supplied by `--config`, over the `--base` file (default
 `/usr/share/tiny-dfr/config.toml`). All pages share one staged document.
+Without `--config`, it edits `$XDG_CONFIG_HOME/dfr-deck/config.toml` (or
+`$HOME/.config/dfr-deck/config.toml`), seeded in memory from the installed overlay
+or full-deck example when the draft is missing. Opening never writes that copy.
 Opening or inspecting inherited layers does not create changes. Save or
 Ctrl+S writes a valid changed draft, or deliberately creates a missing
-user file. Nothing is installed by the configurator redesign task;
-deployment remains with the documented [reviewed installation
-flow](#reversible-device-installation-after-review).
+user file. Save of the default draft does not change the live bar; Apply is
+the explicit terminal handoff in the [installation guide](INSTALL.md).
 
 **Layers** opens with a bounded collection sidebar, a compact contextual
 preview, and ordered, keyboard-activatable button rows. Selecting a row
@@ -189,7 +196,8 @@ and final button cannot be deleted.
 
 **Appearance** puts theme switching first: choose any available theme
 to audition it in the live configurator preview, then use **Switch to
-Theme** to save the valid draft and reload the Touch Bar. Color Theme,
+Theme** to save a fixed startup theme in the draft. Apply that draft separately
+using [INSTALL.md](INSTALL.md). Color Theme,
 Background, and Button Style remain below, with fixed versus remembered
 startup themes, built-in palette overrides and custom themes, native
 color pickers with validated hex entries, named hourly background
@@ -241,9 +249,9 @@ Validation still uses the shared `dfr-config` parse path at **both** bar
 geometries, including icon resolution. Invalid drafts disable Save;
 field diagnostics and Review Issue direct repair. A valid Save backs up
 an existing file once per session (`.bak-<epoch>`), stages canonical TOML,
-and renames it atomically. The daemon's watcher reloads that rename
-without a restart. A success toast says **Saved**, without claiming daemon
-acknowledgement. Write failures stay visible with Retry Save until a
+and renames it atomically. For a direct edit of the deployed overlay the daemon's
+watcher reloads it; the default user draft instead needs the separate Apply step.
+The toast distinguishes a saved draft from a directly saved daemon configuration. Write failures stay visible with Retry Save until a
 successful save or dismissal. Closing a dirty draft offers
 Cancel/Discard and, when valid, Save and Close.
 
@@ -301,7 +309,7 @@ ignore. Defaults are code-level: a stripped base file still loads.
 | `BatteryWarningColor` | enum | `orange` | neutral, cyan, amber, blue, violet, orange, red, green | Accent painted below the warning threshold while not charging. |
 | `BatteryCriticalColor` | enum | `red` | neutral, cyan, amber, blue, violet, orange, red, green | Accent painted below the critical threshold while not charging. |
 | **Pet** | | | | |
-| `PetEnabled` | bool | `true` | - | Keep the pet layer and its home-bar Pet button; false removes both. |
+| `PetEnabled` | bool | `true` | - | Keep the pet layer and its More-bar Pet button (Home fallback); false removes both. |
 | `PetVariant` | enum | `cat` | cat, fox | The pet's sprite: an orange tabby or a red fox. |
 | `PetEnergy` | enum | `calm` | calm, rowdy | Rowdy pets dash more and get hungry sooner; calm ones stroll and doze. |
 | **Background** | | | | |
@@ -531,7 +539,7 @@ holds a `Stop` button (runs `voice-dictate-user stop`, which stops recording and
 types the transcript into whatever window has focus) and a `Cancel` button
 (runs `voice-dictate-user cancel`, discarding a mis-start); both return home. The
 mic button has a bright cyan `Mic` label, and the recording layer's middle
-button is the live input waveform described below. The optional private
+button is the live input waveform described below. The optional
 [desktop-session integration](integrations/voice/README.md) supplies a client
 and recorder service. It crosses the daemon's unprivileged AF_UNIX boundary
 without changing its privilege drop or network restrictions. Install that
@@ -564,7 +572,7 @@ exits 0, so not even the journal would show it). Instead the key calls a thin
 client that hands the request to a small receiver running in the desktop
 session, which runs the real `omarchy capture screenshot` there - the same
 pattern as the voice integration below, with the command fixed on the
-session side and never taken from the wire. The optional private
+session side and never taken from the wire. The optional
 [desktop-session capture integration](integrations/capture/README.md)
 supplies that client and receiver; without it the press still returns home
 and the failed command is journalled. An entry without `Layer` stays on the
@@ -654,8 +662,8 @@ Applying is live and invisible to the service: the palette and the
 background bands swap on the next frame - buttons, slider fills, accents,
 the waveform tint, the strip - with no restart and no reload, the same
 inotify reload path staying available for config edits. The choice is
-remembered in `/var/lib/tiny-dfr/active-theme` (prepared by the install
-notes below): it survives restarts, a config `ActiveTheme` pin wins over
+remembered in `/var/lib/tiny-dfr/active-theme` (prepared by the stock unit or
+legacy upgrade drop-in): it survives restarts, a config `ActiveTheme` pin wins over
 it, and a remembered name that no longer exists falls back to the first
 theme and heals the file, so a stale file can never wedge the bar. Up to 21
 themes fit the picker bar; more reject the candidate configuration.
@@ -849,9 +857,9 @@ static background at every hour.
 
 A small virtual pet, in the spirit of the 2016 Touchbar Pet, lives on its own
 pet layer (a behavioral homage written from scratch - no original assets or
-code). With `PetEnabled = true` the home bar gains a Pet button beside the
-other navigation buttons - the same styling as Functions, Media, and More -
-that opens the pet layer, a bar carrying a Home button like every other
+code). With `PetEnabled = true` the More bar gains a Pet button, reached with
+Home → More → Pet. Decks without More get the opener on Home unless an existing
+opener supplies it. The Pet button opens the pet layer, a bar carrying a Home button like every other
 sub-bar
 and otherwise open ground. The pet exists and animates only inside its
 layer; it never renders on or interferes with the home bar or any other
@@ -901,7 +909,7 @@ PetEnergy = "calm"  # or "rowdy" for a faster, hungrier pet
 
 Invalid values are rejected like the other knobs, and configurations without
 pet keys keep the defaults above. A `[[Layers]]` entry named `pet` replaces
-the synthesized playground, and an existing visible home-bar button targeting
+the synthesized playground, and an existing visible button targeting
 `pet` replaces the synthesized Pet button. With the pet disabled the name
 `pet` no longer exists, so buttons still targeting it are rejected like any
 unknown layer. There is no scripting, network access, or persistence beyond
@@ -955,6 +963,11 @@ migration that needs a hook can introduce it then.
 
 ## Reversible device installation after review
 
+For a complete first install, native Settings, ordinary-user Save/administrator
+Apply, dependencies, optional helpers and upgrade/uninstall, use [INSTALL.md](INSTALL.md).
+The legacy alternate-binary recipe below is **upgrade-only** for an existing
+system installation; it does not install Settings or the base assets.
+
 Branch development and offline checks do not require installation. After review
 and approved landing, build on the target machine (or for its architecture) and
 use the following commands for an existing `/usr/bin/tiny-dfr` systemd install.
@@ -997,12 +1010,15 @@ sudo systemctl status tiny-dfr.service --no-pager
 On the device, check Home → Functions → Home and Home → Media → Home, all
 F1-F12/media controls, the battery, Home → More → Screenshot → Home (the
 screenshot flow runs and the bar returns home), Home → More → Lock (the
-compositor locks; unlock and check the bar again), Home → More → Theme
+compositor locks; unlock and check the bar again). Only after explicitly enabling
+`Action = "CycleTheme"` and/or a `{ Layer = "themes" }` button with themes enabled, check
+Home → More → Theme
 (each tap applies the next theme with the name flashing on the button; the
 palette and strip repaint at once) and Home → More → Themes → a theme name
 → Home (the picker lists every theme, the tap applies it and returns), then
-restart the service and confirm the last theme is still the one worn, then
-Home → Pet → pet
+restart the service and confirm the remembered choice only when `ActiveTheme`
+is absent. A saved/applied fixed startup theme wins on restart/reload. Then
+Home → More → Pet → pet
 wandering, feeding, and startling → Home, plus Fn press/release. With the
 desktop-session voice integration installed, check the mic button opens
 the recording layer while dictation starts, and that Stop types the
