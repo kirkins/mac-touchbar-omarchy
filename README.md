@@ -274,11 +274,15 @@ window and waits for mapped widgets and GTK paint; fixed sleeps or
 forced allocation immediately before a cached snapshot can observe
 stale UI. No test writes the live configuration or drives a service.
 
-The redesign's validation host exceeded the renderer's unchanged 2 ms
-debug waveform repaint budget on both the recorded base and the branch,
-using separate builds under identical limits. This remains a timing
-acceptance gap; the renderer and threshold were retained. The functional
-configuration, renderer and native UI checks are reported separately.
+Earlier base and first-install validation exceeded the unchanged 2 ms waveform
+repaint budget. Investigation traced the cold spike to Cairo's implicit default
+font resolution. The waveform widget now owns a retained default timer font,
+resolved during construction and reused by short-lived drawing contexts;
+configured layer fonts and custom font options remain authoritative. No text is
+measured or drawn during construction. Font resolution still costs startup time;
+the repaint assertion does not measure construction or promise on-device latency.
+The unchanged repaint test and font/transform pixel-equivalence checks cover the
+draw path separately from native GUI and hardware acceptance.
 
 ## Configuration reference
 

@@ -46,7 +46,9 @@
 //! consumer. See `integrations/viz/README.md`.
 
 use crate::appearance::{ButtonAccent, Palette};
-use cairo::{Context, LineCap, LineJoin};
+use cairo::{
+    Context, FontFace, FontOptions, FontSlant, FontWeight, LineCap, LineJoin, Matrix, ScaledFont,
+};
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
@@ -484,6 +486,11 @@ pub fn format_duration(duration: Duration) -> String {
 #[derive(Clone)]
 pub struct WaveformWidget {
     style: Style,
+    /// Retain the default timer font as a render resource. Resolving Cairo's
+    /// implicit toy face belongs to widget construction, rather than every
+    /// short-lived drawing context. No text is measured or drawn at setup.
+    /// Explicit layer fonts and custom font options still belong to the caller.
+    timer_font: ScaledFont,
     /// Whether this widget meters the microphone or visualizes music.
     mode: Mode,
     /// Live color of the recording dot, from the button's accent.
@@ -519,8 +526,17 @@ pub struct WaveformWidget {
 
 impl WaveformWidget {
     pub fn new(style: Style) -> Self {
+        let face = FontFace::toy_create("", FontSlant::Normal, FontWeight::Normal).unwrap();
+        let timer_font = ScaledFont::new(
+            &face,
+            &Matrix::new(TIMER_FONT, 0.0, 0.0, TIMER_FONT, 0.0, 0.0),
+            &Matrix::identity(),
+            &FontOptions::new().unwrap(),
+        )
+        .unwrap();
         Self {
             style,
+            timer_font,
             mode: Mode::Mic,
             live_rgb: ButtonAccent::Blue.rgb(),
             accent: None,
@@ -800,7 +816,7 @@ impl WaveformWidget {
         // Duration label beside the dot.
         let label = format_duration(self.elapsed(now));
         c.set_source_rgb(1.0, 1.0, 1.0);
-        c.set_font_size(TIMER_FONT);
+        self.set_timer_font(c);
         let extents = c.text_extents(&label).unwrap();
         c.move_to(
             left + layout.text_x,
@@ -844,6 +860,21 @@ impl WaveformWidget {
             c.set_source_rgb(0.42, 0.42, 0.42);
             c.rectangle(left + layout.bars.0, cy - 0.5, layout.bars.1, 1.0);
             c.fill().unwrap();
+        }
+    }
+
+    fn set_timer_font(&self, c: &Context) {
+        c.set_font_size(TIMER_FONT);
+        let face = c.font_face();
+        if face.type_() == cairo::FontType::FontTypeToy
+            && face.toy_get_family().as_deref() == Some("")
+            && face.toy_get_slant() == FontSlant::Normal
+            && face.toy_get_weight() == FontWeight::Normal
+            && c.font_options().unwrap() == self.timer_font.font_options().unwrap()
+        {
+            // Cairo adapts the retained font to the context's CTM. In
+            // particular the daemon's rotated context keeps its rotation.
+            c.set_scaled_font(&self.timer_font);
         }
     }
 
@@ -2314,6 +2345,61 @@ mod tests {
         );
         assert_ne!(loud, quiet);
         assert_ne!(idle, quiet);
+    }
+
+    #[test]
+    fn retained_timer_font_preserves_caller_fonts_options_and_transforms() {
+        let wave = WaveformWidget::new(Style::Line);
+        let library = freetype::Library::init().unwrap();
+        let (file, index) = dfr_config::fonts::match_font(":bold").unwrap();
+        let ft = library.new_face(file, index).unwrap();
+        let explicit = FontFace::create_from_ft(&ft).unwrap();
+        let serif = FontFace::toy_create("serif", FontSlant::Italic, FontWeight::Bold).unwrap();
+        for face in [None, Some(explicit), Some(serif)] {
+            for rotated in [false, true] {
+                for custom_options in [false, true] {
+                    let draw = |retained| {
+                        let mut surface = ImageSurface::create(Format::ARgb32, 120, 120).unwrap();
+                        {
+                            let c = Context::new(&surface).unwrap();
+                            if let Some(face) = &face {
+                                c.set_font_face(face);
+                            }
+                            if rotated {
+                                c.translate(100.0, 0.0);
+                                c.rotate(90.0_f64.to_radians());
+                                c.scale(1.1, 0.9);
+                            }
+                            if custom_options {
+                                let mut options = FontOptions::new().unwrap();
+                                options.set_antialias(cairo::Antialias::None);
+                                c.set_font_options(&options);
+                            }
+                            if retained {
+                                wave.set_timer_font(&c);
+                                if face.is_none() && !rotated && !custom_options {
+                                    // set_scaled_font installs Cairo's resolved backend
+                                    // face, rather than leaving the implicit toy face.
+                                    assert_eq!(c.font_face().type_(), wave.timer_font.type_());
+                                    assert_ne!(c.font_face().type_(), cairo::FontType::FontTypeToy);
+                                }
+                            } else {
+                                c.set_font_size(TIMER_FONT);
+                            }
+                            c.set_source_rgb(1.0, 1.0, 1.0);
+                            let label = "12:34";
+                            let extents = c.text_extents(label).unwrap();
+                            c.move_to(10.0, 50.0 - extents.y_bearing() - extents.height() / 2.0);
+                            c.show_text(label).unwrap();
+                        }
+                        let pixels = surface.data().unwrap().to_vec();
+                        assert!(pixels.iter().any(|byte| *byte != 0));
+                        pixels
+                    };
+                    assert_eq!(draw(true), draw(false), "timer appearance changed");
+                }
+            }
+        }
     }
 
     #[test]
