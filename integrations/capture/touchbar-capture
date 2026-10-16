@@ -27,10 +27,24 @@ class CaptureError(Exception):
 
 def notify(message):
     try:
-        subprocess.run(["notify-send", "-t", "2500", "Touch Bar capture", message],
+        subprocess.run(["notify-send", "-t", "8000", "Touch Bar", message],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
     except (OSError, subprocess.TimeoutExpired):
         pass
+
+
+SETTINGS_HELP = ("Open Touch Bar Settings from the application menu or run "
+                 "/usr/local/bin/dfr-configurator in a graphical terminal. "
+                 "See journalctl --user -u touchbar-capture.service -b and "
+                 "/usr/share/doc/tiny-dfr/INSTALL.md.")
+
+
+def settings_preflight():
+    if not os.access("/usr/local/bin/dfr-configurator", os.X_OK):
+        raise CaptureError("Settings app is missing or not executable; install the complete workspace. " + SETTINGS_HELP)
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")) or not all(
+            os.environ.get(name) for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")):
+        raise CaptureError("Settings needs the graphical user-manager environment; re-login/import the session environment and restart this receiver. " + SETTINGS_HELP)
 
 
 class Capture:
@@ -42,12 +56,13 @@ class Capture:
     launcher rather than a cancelled or ongoing capture.
     """
 
-    def __init__(self, launchers=None):
+    def __init__(self, launchers=None, settings_check=None):
         self.launchers = launchers or {
             "screenshot": ["omarchy", "capture", "screenshot"],
             "settings": ["systemd-run", "--user", "--collect", "--quiet",
-                         "/usr/local/bin/dfr-configurator"],
+                         "--property=Type=exec", "/usr/local/bin/dfr-configurator"],
         }
+        self.settings_check = settings_check or settings_preflight
         self.capture = None
 
     def dispatch(self, action):
@@ -55,15 +70,19 @@ class Capture:
             raise CaptureError("Invalid action")
         launcher = self.launchers[action]
         if action == "settings":
+            self.settings_check()
             try:
                 result = subprocess.run(
                     launcher, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+                    stderr=subprocess.DEVNULL, timeout=15, check=False)
             except (OSError, subprocess.TimeoutExpired) as error:
-                raise CaptureError("Cannot launch settings configurator") from error
+                raise CaptureError("Cannot submit Settings launch to the graphical user manager. " + SETTINGS_HELP) from error
             if result.returncode != 0:
                 raise CaptureError(
-                    f"Settings launcher failed (exit status: {result.returncode})")
+                    f"Settings launcher failed (exit status: {result.returncode}). " + SETTINGS_HELP)
+            # Type=exec waits for exec, not GTK readiness or a mapped window.
+            print("Settings launch submitted (not window confirmation); if no window appears, " + SETTINGS_HELP,
+                  flush=True)
             return
         if self.capture is not None and self.capture.poll() is None:
             raise CaptureError("A capture is already running")

@@ -67,8 +67,14 @@ systemctl --user enable --now voice-dictate.service
 sudo systemctl daemon-reload
 ```
 
-The shipped multibar Mic/Stop/Cancel actions already select this client. Restart
-only `tiny-dfr.service` if needed after installing a drop-in. Voice is unnecessary
+The consumer `multibar.toml` has **no Mic/Stop/Cancel or recording layer**.
+After this deliberate optional setup and privacy review, back up the installed
+overlay, validate `/usr/share/tiny-dfr/multibar-voice.toml` with `tiny-dfr check`,
+and have an administrator select that profile using the Apply procedure in
+[INSTALL.md](../../INSTALL.md), preserving custom settings. Its Mic/Stop/Cancel
+actions select this client; Settings remains in More. Merely installing the
+profile asset does not select it or start recording. Restart only
+`tiny-dfr.service` if needed after installing a drop-in. Voice is unnecessary
 for the deck, Settings, Pet or themes. The user manager must already contain the
 current `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`.
 

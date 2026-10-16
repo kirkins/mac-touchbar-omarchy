@@ -13,7 +13,10 @@ def request(action, uid=1000, address=None):
         raise ValueError("Invalid action")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(30)
-        connection.connect(address or "\0dfr-capture-" + str(uid))
+        try:
+            connection.connect(address or "\0dfr-capture-" + str(uid))
+        except OSError as error:
+            raise OSError("Desktop receiver unavailable. As graphical UID 1000, complete the user-session setup and check systemctl --user status touchbar-capture.service. For Settings use the application menu or /usr/local/bin/dfr-configurator; see /usr/share/doc/tiny-dfr/INSTALL.md") from error
         _, peer_uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if peer_uid != uid:
             raise ValueError("Unexpected desktop receiver UID")

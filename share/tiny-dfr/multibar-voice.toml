@@ -1,0 +1,176 @@
+# OPTIONAL VOICE PROFILE — not the consumer default. Deliberately select only
+# after reading integrations/voice/README.md and configuring its receiver.
+# Mic starts microphone capture; Stop uploads audio to Groq and inserts the
+# transcript into the focused window. Cancel discards. No credentials here.
+# After review/backup/validation, select as /etc/tiny-dfr/config.toml (INSTALL.md).
+# Global appearance/brightness options continue to inherit from config.toml.
+DefaultLayer = "home"
+# Optional: holding Fn temporarily shows this bar; releasing Fn returns to the
+# previous bar. Tapping a navigation button during Fn keeps the chosen bar open.
+FnLayer = "function"
+# The battery widget warns at a glance as its displayed charge runs low:
+# while not charging, below BatteryWarningThreshold percent it paints the
+# BatteryWarningColor accent, and below the lower BatteryCriticalThreshold
+# it paints BatteryCriticalColor. Colors use the accent names; thresholds
+# are percentages 0-100 with the critical one at or below the warning one.
+# Above the warning point the widget keeps its configured accent, and a
+# charging battery stays green at every level. Each displayed battery -
+# system or cycled device - escalates independently while it is shown.
+BatteryWarningThreshold = 25
+BatteryCriticalThreshold = 10
+BatteryWarningColor = "orange"
+BatteryCriticalColor = "red"
+
+[[Layers]]
+Name = "home"
+Keys = [
+    # The volume and brightness sliders are one pair of equal twins: give
+    # them the same Stretch so both buttons render the same width. Pressing
+    # either expands both spans, gap included, into the one shared slider.
+    { Icon = "volume_up", Stretch = 2, Action = "VolumeSlider" },
+    { Icon = "brightness_high", Stretch = 2, Action = "BrightnessSlider" },
+    { Icon = "play_pause", Action = "PlayPause" },
+    { Text = "F1-F12", Action = { Layer = "function" } },
+    { Text = "Media", Action = { Layer = "media" } },
+    { Text = "More", Action = { Layer = "more" } },
+    { Battery = "both", Stretch = 2 },
+    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } },
+]
+
+[[Layers]]
+Name = "function"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "F1", Action = "F1" },
+    { Text = "F2", Action = "F2" },
+    { Text = "F3", Action = "F3" },
+    { Text = "F4", Action = "F4" },
+    { Text = "F5", Action = "F5" },
+    { Text = "F6", Action = "F6" },
+    { Text = "F7", Action = "F7" },
+    { Text = "F8", Action = "F8" },
+    { Text = "F9", Action = "F9" },
+    { Text = "F10", Action = "F10" },
+    { Text = "F11", Action = "F11" },
+    { Text = "F12", Action = "F12" },
+]
+
+[[Layers]]
+Name = "media"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Icon = "fast_rewind", Action = "PreviousSong" },
+    { Icon = "play_pause", Action = "PlayPause" },
+    { Icon = "fast_forward", Action = "NextSong" },
+    { NowPlaying = true, Stretch = 2 },
+    { Icon = "volume_up", Stretch = 3, Action = "VolumeSlider" },
+    { Visualizer = true, Accent = "blue", Stretch = 2 },
+]
+
+# Now playing: the media bar shows what is actually sounding - the playing
+# track's title, and the artist as a small caption beneath it when the
+# player reports one - with long text truncated to the row's budgets and
+# then fitted, so an epic title never overflows the row or shrinks past
+# reading. Every
+# poll replaces the whole row: a track change lands within about a second,
+# and a player that pauses or stops clears the row instead of leaving the
+# last song behind. When nothing is playing, or metadata is unavailable,
+# the row rests on a dim `Nothing playing` label - never a stale track,
+# never a broken row. The feed is the optional desktop-session helper in
+# integrations/now-playing (see README): it reads the session bus's MPRIS
+# players and answers one-shot requests over the same abstract AF_UNIX and
+# peer-UID boundary as the volume, brightness, voice, and visualizer
+# receivers; without it the row stays in its empty state and the daemon
+# logs one line per arm so the missing install stays diagnosable. The
+# button is display-only: taps are consumed without firing any key.
+
+# Music visualizer: the media bar's last button is off by default - it
+# shows a small waveform glyph beside a centered Viz label until tapped.
+# A tap expands it into a
+# dedicated full-bar view: the same drawn line the recording layer uses,
+# rippling with the music actually playing on the default output, filling
+# the whole bar except one Off button at the end that toggles back to this
+# exact media bar; the toggle and exit are pure layer switches, so no key
+# ever fires and playback is never disturbed. Off by default every time:
+# the Off button, any navigation away, or reloading the configuration
+# leaves the view and stops the capture. The feed is the optional
+# desktop-session helper in integrations/viz (see README) - it must be
+# installed and its service enabled; a dead or missing helper shows an
+# unmissable red `No feed` marker where a quiet healthy feed would rest on
+# the calm dim baseline, and the daemon logs one line per enable. The line
+# reuses the recording waveform's motion knobs: VisualizerStyle = "bars" keeps
+# the bar graph. The line follows the level directly, unsmoothed; opt into a
+# calmer motion with VisualizerSmoothing (ms decay, attack a third of it) and
+# VisualizerLag (ms of visual delay, capped at 500).
+
+# Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
+# opens this recording layer in one press; the layer itself is the visual
+# state. The middle Waveform button shows the sound actually coming in: a
+# drawn line that rests flat while silent and ripples while speaking, a
+# recording dot that pulses with live level, and a duration timer counting
+# from entering the layer, all driven by the optional desktop-session level
+# feed (see README; a dead or missing feed shows an unmissable red slashed
+# dot and a `No feed` label, never the calm idle baseline of a quiet feed,
+# while the timer keeps counting). The line follows the level directly,
+# unsmoothed. Set
+# WaveformStyle = "bars" on the button to keep the previous scrolling bar
+# graph instead of the line, or opt into a calmer motion with
+# WaveformSmoothing (ms decay, attack a third of it) and WaveformLag (ms of
+# visual delay, capped at 500).
+# Stop keeps the recording and types the transcript into the focused
+# window, Cancel discards a mis-start; both run their command and return
+# home. Install the optional integrations/voice client and desktop-session
+# service separately (see README); without the receiver these presses still
+# switch layers and log the failed command.
+[[Layers]]
+Name = "recording"
+Keys = [
+    { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
+    { Waveform = true, Accent = "blue", Stretch = 3 },
+    { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
+]
+
+# Custom quick keys: the home bar's More button opens this bar, a parking
+# lot for one-press commands with room for as many entries as you like.
+# Each quick key is one entry: a Text label or an Icon glyph, and an Action
+# table with the Command to run. Add Layer = "home" to return to the home
+# bar after the press - as the shipped Screenshot key does - or leave Layer
+# off to stay here and fire several keys in a row; the Home button always
+# leaves without running anything. Labels, glyphs, accents, and Stretch
+# work as on any bar, and commands run through /bin/sh like any command
+# button (see the notes above and the README). Commands that need the
+# desktop session - like the shipped Screenshot and Settings keys - must go
+# through a session receiver client such as touchbar-capture-user, because
+# the daemon's unprivileged sandbox cannot reach the compositor or user manager.
+[[Layers]]
+Name = "more"
+Keys = [
+    { Text = "Home", Action = { Layer = "home" } },
+    { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
+    { Text = "Settings", Action = { Command = "touchbar-capture-user settings", Layer = "home" } },
+    # Lock: emits the compositor's lock bind - Omarchy's default
+    # SUPER+CTRL+L (omarchy-system-lock) - as a pure key chord, so it
+    # works inside the daemon's unprivileged sandbox with no shell and
+    # no desktop helper. No Layer switch: the bar stays put.
+    { Text = "Lock", Accent = "amber", Action = ["LeftMeta", "LeftCtrl", "L"] },
+]
+
+# To extend the deck, add another [[Layers]] with a unique Name and nonempty Keys,
+# then add a button with Action = { Layer = "that-name" } to a reachable bar.
+# For one-press commands, add entries to the "more" bar's Keys above instead;
+# the home bar's More button already opens it.
+# A Home button is inserted automatically on sub-bars that lack a visible
+# button targeting DefaultLayer; a button can also run a shell command on
+# touch-down with Action = { Command = "..." }, optionally combined with a
+# Layer switch as in the mic button above. Commands run through /bin/sh as
+# the daemon user; failures are logged to the journal. With PetEnabled (see
+# config.toml) the "more" bar gains a Pet button opening the daemon's own
+# pet layer (or the home bar if no "more" bar exists), unless a layer named
+# "pet" is defined here. A visible button targeting "pet" on that bar keeps
+# its configured label and position.
+# ThemesEnabled (see config.toml) makes the daemon's theme picker layer
+# available, but does not add buttons to this bar. Opt in by adding entries
+# such as { Text = "Theme", Action = "CycleTheme" } or
+# { Text = "Themes", Action = { Layer = "themes" } } to Keys; a
+# [Themes.Name] table in config.toml adds or overrides a named color theme.
+# The active theme is remembered across restarts.

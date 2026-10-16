@@ -415,6 +415,15 @@ Keys = [
 
     #[test]
     fn approved_multibar_preserves_voice_dispatch_and_renders_offline() {
+        render_multibar_profile_offline(true);
+    }
+
+    #[test]
+    fn consumer_multibar_settings_dispatch_and_renders_offline() {
+        render_multibar_profile_offline(false);
+    }
+
+    fn render_multibar_profile_offline(voice: bool) {
         use chrono::Timelike;
         let tmp = TempDir::new();
         let base_path = tmp.0.join("base.toml");
@@ -424,7 +433,13 @@ Keys = [
             .map(fs::read_to_string)
             .transpose()
             .unwrap()
-            .unwrap_or_else(|| include_str!("../../../share/tiny-dfr/multibar.toml").into());
+            .unwrap_or_else(|| {
+                if voice {
+                    include_str!("../../../share/tiny-dfr/multibar-voice.toml").into()
+                } else {
+                    include_str!("../../../share/tiny-dfr/multibar.toml").into()
+                }
+            });
         fs::write(&user_path, named).unwrap();
         let (mut cfg, mut deck) = load_config(2008, &base_path, Some(&user_path), None).unwrap();
 
@@ -460,7 +475,14 @@ Keys = [
                     c.set_source_surface(&portrait, 0.0, 0.0).unwrap();
                     c.paint().unwrap();
                     horizontal
-                        .write_to_png(&mut fs::File::create(Path::new(&dir).join(name)).unwrap())
+                        .write_to_png(
+                            &mut fs::File::create(Path::new(&dir).join(if voice {
+                                format!("voice-{name}")
+                            } else {
+                                name.to_owned()
+                            }))
+                            .unwrap(),
+                        )
                         .unwrap();
                 }
             };
@@ -489,7 +511,7 @@ Keys = [
         };
         let mut commands = Vec::new();
         assert!(matches!(&deck.current().buttons.last().unwrap().1.image,
-            crate::ButtonImage::Text(text) if text == "Mic"));
+            crate::ButtonImage::Text(text) if text == if voice { "Mic" } else { "Settings" }));
         for layer in [deck.home, deck.names["media"]] {
             assert_eq!(
                 deck.layers[layer]
@@ -727,67 +749,78 @@ Keys = [
         );
         render(&mut deck, "implemented-brightness-max.png");
         deck.touch_up(0, &mut emit);
-        // Mic stays reachable while the brightness overlay is still open.
-        tap(&mut deck, "Mic", &mut commands);
-        assert_eq!(deck.active, deck.names["recording"]);
-        // The waveform widget shows live levels and its duration timer while
-        // this layer is displayed; entering starts the session.
-        let mut feed_now = Instant::now();
-        let (activated, _) = deck.waveform_tick(None, feed_now);
-        assert!(activated);
-        for level in [
-            8, 24, 12, 40, 66, 88, 35, 19, 57, 74, 28, 90, 46, 61, 33, 15, 52, 70,
-        ] {
-            feed_now += Duration::from_millis(50);
+        if voice {
+            // Voice coverage deliberately selects the opt-in profile, never executes commands.
+            // Mic stays reachable while the brightness overlay is still open.
+            tap(&mut deck, "Mic", &mut commands);
+            assert_eq!(deck.active, deck.names["recording"]);
+            // The waveform widget shows live levels and its duration timer while
+            // this layer is displayed; entering starts the session.
+            let mut feed_now = Instant::now();
+            let (activated, _) = deck.waveform_tick(None, feed_now);
+            assert!(activated);
+            for level in [
+                8, 24, 12, 40, 66, 88, 35, 19, 57, 74, 28, 90, 46, 61, 33, 15, 52, 70,
+            ] {
+                feed_now += Duration::from_millis(50);
+                deck.waveform_tick(
+                    Some(crate::MicSample {
+                        level,
+                        live: true,
+                        dead: false,
+                    }),
+                    feed_now,
+                );
+            }
+            // Mid-period frame: the graph is caught halfway between two samples,
+            // with the newest level eased to half its measured value and the
+            // whole curve glided half a slot left of its sample positions.
+            let mid = Instant::now() - Duration::from_millis(25);
             deck.waveform_tick(
                 Some(crate::MicSample {
-                    level,
+                    level: 88,
                     live: true,
                     dead: false,
                 }),
-                feed_now,
+                mid,
             );
+            render(&mut deck, "implemented-recording-mid.png");
+            // Settled frame: a sample one full period old rests the interpolation,
+            // so the exported graph shows its sample positions and full heights.
+            let settled = Instant::now() - Duration::from_millis(60);
+            deck.waveform_tick(
+                Some(crate::MicSample {
+                    level: 70,
+                    live: true,
+                    dead: false,
+                }),
+                settled,
+            );
+            feed_now += Duration::from_secs(73);
+            deck.waveform_tick(None, feed_now);
+            render(&mut deck, "implemented-recording-live.png");
+            // Without the desktop level feed every poll fails: the widget shows
+            // the dead-feed state - the red slashed dot and the `No feed` label
+            // - never the calm idle look of a merely quiet feed.
+            for _ in 0..4 {
+                feed_now += Duration::from_millis(50);
+                deck.waveform_tick(Some(crate::MicSample::dead()), feed_now);
+            }
+            render(&mut deck, "implemented-recording-dead.png");
+            tap(&mut deck, "Stop", &mut commands);
+            assert_eq!(deck.active, deck.home);
+            tap(&mut deck, "Mic", &mut commands);
+            tap(&mut deck, "Cancel", &mut commands);
+            assert_eq!(deck.active, deck.home);
+        } else {
+            // Settings remains reachable while the slider is expanded; handoff
+            // is a captured string, not a subprocess or evidence of a mapped GUI.
+            tap(&mut deck, "Settings", &mut commands);
+            assert_eq!(deck.active, deck.home);
+            assert_eq!(commands, ["touchbar-capture-user settings"]);
+            assert!(!deck.waveform_active());
+            assert!(!deck.names.contains_key("recording"));
         }
-        // Mid-period frame: the graph is caught halfway between two samples,
-        // with the newest level eased to half its measured value and the
-        // whole curve glided half a slot left of its sample positions.
-        let mid = Instant::now() - Duration::from_millis(25);
-        deck.waveform_tick(
-            Some(crate::MicSample {
-                level: 88,
-                live: true,
-                dead: false,
-            }),
-            mid,
-        );
-        render(&mut deck, "implemented-recording-mid.png");
-        // Settled frame: a sample one full period old rests the interpolation,
-        // so the exported graph shows its sample positions and full heights.
-        let settled = Instant::now() - Duration::from_millis(60);
-        deck.waveform_tick(
-            Some(crate::MicSample {
-                level: 70,
-                live: true,
-                dead: false,
-            }),
-            settled,
-        );
-        feed_now += Duration::from_secs(73);
-        deck.waveform_tick(None, feed_now);
-        render(&mut deck, "implemented-recording-live.png");
-        // Without the desktop level feed every poll fails: the widget shows
-        // the dead-feed state - the red slashed dot and the `No feed` label
-        // - never the calm idle look of a merely quiet feed.
-        for _ in 0..4 {
-            feed_now += Duration::from_millis(50);
-            deck.waveform_tick(Some(crate::MicSample::dead()), feed_now);
-        }
-        render(&mut deck, "implemented-recording-dead.png");
-        tap(&mut deck, "Stop", &mut commands);
-        assert_eq!(deck.active, deck.home);
-        tap(&mut deck, "Mic", &mut commands);
-        tap(&mut deck, "Cancel", &mut commands);
-        assert_eq!(deck.active, deck.home);
         // The home bar's More button opens the quick-keys bar; its
         // Screenshot entry fires the screenshot flow and returns home in
         // one press.
@@ -935,12 +968,16 @@ Keys = [
         assert!(restored);
         tap(&mut deck, "Screenshot", &mut commands);
         assert_eq!(deck.active, deck.home);
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), if voice { 5 } else { 2 });
         let actions: Vec<_> = commands
             .iter()
             .map(|command| command.split_whitespace().last().unwrap())
             .collect();
-        assert_eq!(actions, ["start", "stop", "start", "cancel", "screenshot"]);
+        if voice {
+            assert_eq!(actions, ["start", "stop", "start", "cancel", "screenshot"]);
+        } else {
+            assert_eq!(actions, ["settings", "screenshot"]);
+        }
     }
 
     #[test]
@@ -1046,7 +1083,13 @@ DoublePressSwitchLayers = 200
             2008,
         )
         .unwrap();
-        assert_eq!(layout.layers.len(), 7);
+        assert_eq!(layout.layers.len(), 6);
+        assert!(layout.layers.iter().all(|layer| layer.name != "recording"
+            && layer.keys.iter().all(|key| key.waveform != Some(true)
+                && !key
+                    .action
+                    .command()
+                    .is_some_and(|command| command.contains("voice")))));
         let home = &layout.layers[layout.home];
         // The clock is gone from the shipped home bar; its width goes to
         // the remaining buttons.
@@ -1085,48 +1128,13 @@ DoublePressSwitchLayers = 200
             .iter()
             .any(|key| key.text.as_deref() == Some("Pet")
                 && key.action == ButtonAction::SwitchLayer("pet".into())));
-        // The voice-dictation flow: the mic button starts recording and
-        // opens the recording layer in one press; its Cancel and Stop
-        // buttons visibly return home, so no extra Home button appears.
-        let recording = layout
-            .layers
-            .iter()
-            .find(|layer| layer.name == "recording")
-            .unwrap();
-        assert_eq!(recording.keys.len(), 3);
+        assert_eq!(home.keys.len(), 8);
+        assert_eq!(home.keys[6].battery.as_deref(), Some("both"));
+        assert_eq!(home.keys[6].stretch, Some(2));
+        assert_eq!(home.keys[7].text.as_deref(), Some("Settings"));
         assert_eq!(
-            recording.keys[0].action,
-            ButtonAction::CommandLayer {
-                command: "voice-dictate-user cancel".into(),
-                layer: "home".into()
-            }
-        );
-        // The middle button is the live input-level waveform widget; the
-        // line style is the default, so no style in the shipped config.
-        assert_eq!(recording.keys[1].waveform, Some(true));
-        assert_eq!(recording.keys[1].waveform_style, None);
-        assert!(recording.keys[1].text.is_none());
-        assert_eq!(recording.keys[1].stretch, Some(3));
-        assert_eq!(
-            recording.keys[2].action,
-            ButtonAction::CommandLayer {
-                command: "voice-dictate-user stop".into(),
-                layer: "home".into()
-            }
-        );
-        let mic = home
-            .keys
-            .iter()
-            .position(|key| key.text.as_deref() == Some("Mic"))
-            .unwrap();
-        assert_eq!(mic, home.keys.len() - 1);
-        assert_eq!(home.keys[mic].accent, Some(ButtonAccent::Cyan));
-        assert_eq!(
-            home.keys[mic].action,
-            ButtonAction::CommandLayer {
-                command: "voice-dictate-user start".into(),
-                layer: "recording".into()
-            }
+            home.keys[7].action,
+            ButtonAction::Command("touchbar-capture-user settings".into())
         );
         // The quick-keys bar: its one shipped entry fires the screenshot
         // flow and returns home, behind an explicit Home button that
@@ -1136,9 +1144,9 @@ DoublePressSwitchLayers = 200
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        // Home, the shipped quick keys (Screenshot, Settings, Lock), and
-        // the synthesized Pet opener. Theme buttons remain opt-in.
-        assert_eq!(more.keys.len(), 5);
+        // Home, Screenshot, Lock, and the synthesized Pet opener.
+        // Settings is on Home; theme buttons remain opt-in.
+        assert_eq!(more.keys.len(), 4);
         assert_eq!(more.keys[0].text.as_deref(), Some("Home"));
         assert_eq!(
             more.keys[0].action,
@@ -1227,6 +1235,46 @@ DoublePressSwitchLayers = 200
                 .map(|key| ButtonAction::Keys(vec![key]))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn optional_voice_profile_preserves_recording_controls() {
+        let (_, layout) = parse_config(
+            BASE,
+            Some(include_str!("../../../share/tiny-dfr/multibar-voice.toml")),
+            2008,
+        )
+        .unwrap();
+        let home = &layout.layers[layout.home];
+        let mic = home.keys.last().unwrap();
+        assert_eq!(mic.text.as_deref(), Some("Mic"));
+        assert_eq!(mic.accent, Some(ButtonAccent::Cyan));
+        assert_eq!(
+            mic.action,
+            ButtonAction::CommandLayer {
+                command: "voice-dictate-user start".into(),
+                layer: "recording".into(),
+            }
+        );
+        let recording = layout
+            .layers
+            .iter()
+            .find(|layer| layer.name == "recording")
+            .unwrap();
+        assert_eq!(recording.keys.len(), 3);
+        for (index, command) in [(0, "cancel"), (2, "stop")] {
+            assert_eq!(
+                recording.keys[index].action,
+                ButtonAction::CommandLayer {
+                    command: format!("voice-dictate-user {command}"),
+                    layer: "home".into(),
+                }
+            );
+        }
+        assert_eq!(recording.keys[1].waveform, Some(true));
+        assert_eq!(recording.keys[1].waveform_style, None);
+        assert!(recording.keys[1].text.is_none());
+        assert_eq!(recording.keys[1].stretch, Some(3));
     }
 
     #[test]
@@ -2047,9 +2095,9 @@ Color = "301020"
         assert!(!deck.legacy);
         // The multibar's media bar carries the Viz button, so the deck
         // also synthesized its full-bar visualizer view; the named layers
-        // are home, function, media, recording, more, and pet, plus the
+        // are home, function, media, more, and pet, plus the
         // synthesized themes picker.
-        assert_eq!(deck.layers.len(), 8);
+        assert_eq!(deck.layers.len(), 7);
         assert!(deck.names.contains_key("visualizer:media"));
     }
 
@@ -2181,8 +2229,8 @@ Keys = [{{ Text = \"P1\" }}]\n"
     /// (home with its closed sliders, the media bar with its idle
     /// widgets, the function keys), rendered headless exactly as the
     /// review renderers do, with the pixel digest pinned. The layers a
-    /// wall clock or a live feed would move - the More bar's clock, the
-    /// recording bar's waveform, the pet - stay covered by their own
+    /// wall clock or a live feed would move - the pet and the optional
+    /// voice profile's recording waveform - stay covered by their own
     /// widget tests instead of this frame pin. Any change to the draw
     /// path that moves a single pixel of these frames breaks this test.
     #[test]

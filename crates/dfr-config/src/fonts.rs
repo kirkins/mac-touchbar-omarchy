@@ -85,6 +85,10 @@ fn throw_on_fcpattern_result(res: FcResult) {
 /// an unmatchable `FontTemplate` is a configuration error reported
 /// here, not a panic inside the renderer.
 pub fn match_font(pattern: &str) -> Result<(String, isize), String> {
+    // TOML strings can contain NUL; reject before CString/FFI rather than panic.
+    if pattern.as_bytes().contains(&0) {
+        return Err("FontTemplate must not contain NUL characters".into());
+    }
     let fontconfig = FontConfig::new();
     let mut parsed = Pattern::new(pattern);
     fontconfig.perform_substitutions(&mut parsed);

@@ -18,17 +18,45 @@ fn check(args: &[&str]) -> (Option<i32>, String, String) {
 }
 
 #[test]
-fn the_shipped_example_checks_clean_over_the_repo_share_directory() {
-    let (code, stdout, stderr) = check(&[
+fn the_shipped_examples_check_clean_at_both_geometries() {
+    for profile in ["multibar.toml", "multibar-voice.toml"] {
+        for width in ["2008", "2170"] {
+            let path = format!("share/tiny-dfr/{profile}");
+            let (code, stdout, stderr) = check(&[
+                "--base",
+                "share/tiny-dfr/config.toml",
+                "--icon-root",
+                "share/tiny-dfr",
+                "--width",
+                width,
+                &path,
+            ]);
+            assert_eq!(code, Some(0), "{path} at {width}: {stderr}");
+            assert!(stdout.contains("OK"), "{stdout}");
+            assert!(stdout.contains(profile), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn invalid_font_is_a_diagnostic_not_a_panic() {
+    let path =
+        std::env::temp_dir().join(format!("tiny-dfr-check-font-{}.toml", std::process::id()));
+    std::fs::write(&path, "FontTemplate = \"bad\\u0000font\"\n").unwrap();
+    let (code, _, stderr) = check(&[
         "--base",
         "share/tiny-dfr/config.toml",
         "--icon-root",
         "share/tiny-dfr",
-        "share/tiny-dfr/multibar.toml",
+        &path.to_string_lossy(),
     ]);
-    assert_eq!(code, Some(0), "stderr: {stderr}");
-    assert!(stdout.contains("OK"), "{stdout}");
-    assert!(stdout.contains("multibar.toml"), "{stdout}");
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("FontTemplate") && stderr.contains("NUL"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
 #[test]

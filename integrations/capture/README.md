@@ -1,147 +1,125 @@
-# Touch Bar desktop-session actions
+# Touch Bar Settings and screenshot session receiver
 
-Install this optional receiver separately from the Touch Bar daemon.
-The [complete install guide](../../INSTALL.md) installs the native Settings
-binary/desktop launcher and the machine capture client. Python 3.11+ and the Omarchy capture
-flow (`omarchy capture screenshot`, with `grim`, `slurp`, `hyprpicker`,
-`wl-copy`, and `hyprctl`) must be available in the desktop session.
+This receiver is **required for the consumer full deck's Home → Settings button**.
+It is not required to open Settings from the application menu or a graphical
+terminal. Use the [complete installation guide](../../INSTALL.md): system
+installation and ordinary-user session setup are distinct, copy-only steps;
+only the operator subsequently enables the user unit.
 
-## Why the quick keys need it
+## Requirements and setup
 
-The More bar's Screenshot and Settings keys are ordinary command buttons.
-Command buttons run inside the daemon's sandbox: the daemon keeps its internal
-privilege drop to `nobody` (`src/main.rs`), and the child inherits `ProtectHome`,
-`PrivateTmp`, `NoNewPrivileges`, and the restricted address families. Running
-`omarchy capture screenshot` there does not fail loudly - it silently no-ops.
-Reproduced on this machine (`sudo -u nobody env -i PATH=... /bin/sh -c
-'omarchy capture screenshot'`): the flow cannot resolve a screenshot
-directory without a home, cannot reach `hyprctl`, and the region picker
-returns no selection, so the script reaches its empty-selection
-`exit 0`. The daemon logs only nonzero exits and redirects the child's
-streams to `/dev/null`, so the press leaves no trace: no screenshot, no
-journal line.
+The supplied route supports graphical desktop **UID 1000**, daemon `nobody`
+UID 65534, Python 3.11+, a systemd user manager / `systemd-run`, and the installed
+native GTK4/libadwaita app and runtime libraries. `notify-send` is recommended
+for bounded failure notifications. Settings does not require Omarchy or audio.
+Screenshot separately requires `omarchy capture screenshot` and its `grim`,
+`slurp`, `hyprpicker`, `wl-copy`, `hyprctl` session flow.
 
-Importing the user's session environment does not help: with
-`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and
-`HYPRLAND_INSTANCE_SIGNATURE` all set, the flow still fails, because
-`/run/user/1000` is mode 0700 and `nobody` cannot open the Wayland or
-compositor sockets inside it. The wall is kernel permissions, not
-environment. `systemd-run --user --machine=<user>@.host` and `machinectl
-shell` fail too: the daemon user may not connect to the desktop user's
-manager bus (`Permission denied` on the machine transport) and no polkit
-authentication agent exists in that context. This integration therefore uses
-the same design as the voice integration: the real work runs in a tiny
-receiver inside the graphical session, and the button runs a thin
-unprivileged client.
-
-## Boundary
-
-The quick keys call `/usr/local/bin/touchbar-capture-user screenshot` or
-`/usr/local/bin/touchbar-capture-user settings`. The client uses a Linux
-abstract AF_UNIX socket named `dfr-capture-<desktop UID>` to reach
-`touchbar-capture.service` in the desktop user's graphical session.
-The abstract socket crosses the daemon's private mount and IPC namespaces
-without making the desktop runtime directory public; only AF_UNIX is needed,
-which the daemon already allows.
-
-The receiver accepts exactly the named actions `screenshot` and `settings`,
-authenticates `SO_PEERCRED` against the desktop UID and UID 65534 (`nobody`),
-and never executes bytes from the wire. Each action selects a fixed argv on
-the session side: `omarchy capture screenshot`, or
-`systemd-run --user --collect --quiet /usr/local/bin/dfr-configurator`.
-The native app defaults to the desktop user's XDG draft. Save writes that draft;
-the explicit administrator Apply steps in the install guide update the daemon.
-Settings itself does not require Omarchy or elevated GUI privileges.
-There is no arbitrary command or argument channel. Other processes with
-either allowed UID can invoke these two actions; this is the explicit local
-trust boundary. The client checks the receiver's UID. The daemon keeps its
-privilege drop, `NoNewPrivileges`, and AF_UNIX / AF_NETLINK restriction.
-Neither `runuser`, a privileged launcher, nor a grant of home or runtime
-directory access is involved.
-
-The receiver launches the picker detached in its own session, replies as
-soon as the flow is up (the picker can stay open for minutes), refuses a
-second capture while one is running, and reports a launcher that exits
-nonzero immediately (a broken session) as an error instead of
-acknowledging it.
-
-## Install
-
-Before replacing an existing helper or adding the button, keep one rollback
-copy in a private task directory outside the repository. Never commit
-screenshots or copies of personal configuration.
-
-Run these commands as the desktop user from the repository root:
-
-First build/install the native GTK4/libadwaita app using [INSTALL.md](../../INSTALL.md).
+After reviewing/staging/building and system installation per INSTALL.md, run
+from the reviewed checkout **as the ordinary desktop user, never sudo**:
 
 ```sh
-install -Dm755 integrations/capture/touchbar-capture "$HOME/.local/bin/touchbar-capture"
-install -Dm644 integrations/capture/touchbar-capture.service "$HOME/.config/systemd/user/touchbar-capture.service"
-sudo install -Dm755 integrations/capture/touchbar-capture-user /usr/local/bin/touchbar-capture-user
+id -u # supplied client/daemon require desktop UID 1000
+make install-user-session USER_HOME="$HOME"
 systemctl --user daemon-reload
 systemctl --user enable --now touchbar-capture.service
+systemctl --user status touchbar-capture.service
 ```
 
-Then point the Screenshot and Settings quick keys at the client. The shipped
-[`multibar.toml`](../../share/tiny-dfr/multibar.toml) already reads:
+For copy-only staging, add `DESTDIR="$dfr_stage"` to the make command. `USER_HOME`
+is explicit, absolute and normalized; no home is guessed from sudo. The target
+copies just `%h/.local/bin/touchbar-capture` and
+`%h/.config/systemd/user/touchbar-capture.service`, refuses preexisting files or
+dangling symlinks before copying, and never enables/starts a service or touches
+a draft. An XDG override for the Settings draft does not relocate these unit
+paths. On upgrade, stop only this receiver, preserve/review the two old files,
+move them aside deliberately before replacement, reload the user manager and
+start the receiver. Preserve backups for rollback.
+
+The graphical user-manager environment must include `WAYLAND_DISPLAY` (or
+`DISPLAY`), `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`; Screenshot also needs
+the compositor's session environment. Use the desktop's normal import/re-login
+mechanism and restart this receiver after environment changes. Other desktop
+UIDs require coordinated source adaptation and qualification, not just a unit edit.
+
+## Fixed actions and security boundary
+
+The [consumer deck](../../share/tiny-dfr/multibar.toml) uses:
 
 ```toml
-{ Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
-{ Text = "Settings", Action = { Command = "touchbar-capture-user settings", Layer = "home" } },
+# Home
+{ Text = "Settings", Action = { Command = "touchbar-capture-user settings" } }
+# More
+{ Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } }
 ```
 
-so after `sudo install -m644 share/tiny-dfr/multibar.toml
-/etc/tiny-dfr/config.toml` (or the same edit by hand, preserving other
-customizations) run `sudo systemctl restart tiny-dfr.service`. The example's
-Settings key uses the `settings` verb and returns to Home after handing off.
-The client targets desktop UID 1000. The receiver derives its socket name from its own
-UID. Both the shipped client and daemon target UID 1000; a different desktop UID
-requires coordinated source adaptation and qualification, not just editing the
-receiver. The daemon remains nobody/65534.
+The machine client is installed by `make install`. Commands run inside the
+daemon's sandbox: its privilege drop, `ProtectHome`, `PrivateTmp`,
+`NoNewPrivileges`, and restricted address families prevent direct compositor /
+user-manager access. Do not loosen them. A Linux abstract AF_UNIX socket named
+`dfr-capture-<desktop UID>` crosses that boundary without making the desktop's
+0700 runtime directory public.
 
-The service starts with `graphical-session.target`; its manager environment
-must already contain the current `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
-Re-login or restart only this service if the desktop environment changes.
+The receiver authenticates `SO_PEERCRED` against its own UID and UID 65534, and
+the client verifies the receiver UID. Other processes with either allowed UID
+can invoke these two fixed actions; this is the explicit local trust boundary.
+Only `screenshot` and `settings` are accepted; wire bytes are never executed as
+commands or arguments. Settings selects exactly:
 
-## Verification
+```text
+systemd-run --user --collect --quiet --property=Type=exec /usr/local/bin/dfr-configurator
+```
 
-These regressions run small executable adapters, real AF_UNIX requests, and
-detached fake launchers. They never open a picker, take a screenshot, or
-send a notification:
+`Type=exec` catches executable-launch failures, **not GTK readiness or a mapped
+window**. Repeated launches ask the same native application to present its
+existing window. Settings saves a user draft; administrator Apply is a separate
+terminal operation described in INSTALL.md. No GUI elevation/policy is supplied.
+
+Screenshot launches the fixed `omarchy capture screenshot` detached; a second
+capture while one is active is refused. An immediate nonzero launcher exit is
+reported. Neither its submission nor an exit code is proof of a completed image.
+
+## Errors and fallback
+
+- Missing receiver: the client exits nonzero; the daemon logs fixed setup and
+  app-menu fallback guidance in `journalctl -u tiny-dfr.service -b`. The sandbox
+  cannot notify the desktop by itself. No on-glass launch confirmation is claimed.
+- Missing app, launch failure or missing graphical environment: the receiver
+  returns an error and attempts a bounded notification. Read
+  `journalctl --user -u touchbar-capture.service -b` and `journalctl --user -b`
+  for transient app/runtime/display failures. If no window appears, open **Touch
+  Bar Settings** from the application menu or run
+  `/usr/local/bin/dfr-configurator` in the ordinary user's graphical terminal.
+- Unreadable/invalid base or draft: the native app shows a safe, bounded error
+  window when GTK can initialize, otherwise session-journal guidance. It changes
+  no files and does not quote configuration contents. Back up/repair the file;
+  run `tiny-dfr check --base BASE DRAFT` in a private terminal for detailed
+  diagnostics. Never run the GUI with sudo.
+
+There is no success notification pretending a submitted launch mapped. The
+operator must confirm the window. Without a receiver, navigation remains usable
+and Screenshot still returns Home, but its command has failed.
+
+## Safe regression checks
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/capture -p 'test_*.py' -v
-systemd-analyze --user verify integrations/capture/touchbar-capture.service
+python3 -B -m unittest discover -s integrations/capture -p 'test_*.py' -v
 ```
 
-The suite covers both fixed launcher lines, action allowlisting, busy refusal
-during an ongoing capture, immediate nonzero exit reporting, the wire reject of unknown and
-shell-like payloads, the `SO_PEERCRED` boundary, a session-free client
-process reaching the receiver, and the client CLI's rejection of arbitrary
-arguments before it connects.
-
-First verify the receiver with the client under the actual daemon UID,
-supplementary groups, session-free environment, mount namespace, and
-no-new-privileges restrictions:
-
-```sh
-sudo -u nobody env -i /usr/local/bin/touchbar-capture-user screenshot
-```
-
-with the receiver's real unit temporarily stopped (it would otherwise take a
-real screenshot) and a marker handler in its place if you need to avoid the
-real flow. A same-user socket test alone does not prove the daemon's
-namespace boundary. Then press the Touch Bar's More bar Screenshot key:
-the Omarchy picker must appear, and a completed selection must land in
-`~/Pictures` and the clipboard. Only the physical press establishes the
-end-to-end path.
+Tests use fake launchers, notifications/preflight and unique nonproduction
+AF_UNIX sockets. They cover fixed argv, repeated submissions, missing app/session/
+receiver, launcher exit/OS-error/timeout feedback, bounded failure text, action
+allowlisting, busy rejection and kernel peer-UID checks. They never capture a
+screen, open a native app, touch a production socket or send a real notification.
+These are not physical Touch Bar/namespace/fresh-install/display qualification.
+A device owner can separately verify Home → Settings and More → Screenshot only
+after setup and explicit approval for that live desktop test.
 
 ## Rollback
 
-Stop and disable only `touchbar-capture.service`. Restore the one saved
-helper and client, or delete them (`rm ~/.local/bin/touchbar-capture
-/usr/local/bin/touchbar-capture-user`), remove the user unit, and reload the
-user manager. Point the Screenshot quick key back at its previous command if
-it was changed. Without the receiver, presses still switch layers home and
-journal the failed command; the previous deployment silently no-oped.
+Stop/disable only the user unit you added. Restore the two retained user files
+(or remove only newly added files), reload the user manager, and restore the
+previous deck overlay if it was changed. The shared machine capture client and
+native app may still be needed by other configuration; do not blindly remove
+them. Retain user drafts, backups and theme state. The application menu remains
+the Settings fallback when the Touch Bar receiver is disabled.

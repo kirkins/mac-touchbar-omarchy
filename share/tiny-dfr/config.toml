@@ -249,8 +249,8 @@ PrimaryLayerKeys = [
     # BatteryCriticalThreshold (default 10) it paints BatteryCriticalColor
     # (default red); above the warning point it keeps its configured accent.
 
-    # Example of the live recording waveform (see the recording layer in
-    # share/tiny-dfr/multibar.toml):
+    # Optional live recording waveform (the consumer deck has none; see
+    # the deliberately selected share/tiny-dfr/multibar-voice.toml profile):
     # { Waveform = true, Stretch = 3 }
     # This will display a drawn line of recent microphone input - flat at
     # rest, rippling while speaking - with a recording dot and duration

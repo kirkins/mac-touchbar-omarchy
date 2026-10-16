@@ -35,20 +35,18 @@ The configuration model lives in the `dfr-config` crate
 (`crates/dfr-config`); the daemon binary is the root `tiny-dfr` package,
 so the check commands above build the whole workspace.
 
-For an offline visual check of the shipped named bars, the voice-dispatch test
-can also export actual Cairo frames without opening the Touch Bar or running
-the voice commands:
+For an offline visual check of the consumer named bars, export actual Cairo
+frames without opening the Touch Bar or running session commands:
 
 ```sh
 DFR_DECK_REVIEW_OUTPUT=/tmp/dfr-deck-review CARGO_BUILD_JOBS=1 \
-    cargo test --locked --bin tiny-dfr approved_multibar_preserves_voice_dispatch_and_renders_offline -- --test-threads=1
+    cargo test --locked -p dfr-render consumer_multibar_settings_dispatch_and_renders_offline -- --test-threads=1
 ```
 
 Inspect `implemented-home.png`, `implemented-home-muted.png` (the same bar
 with the closed-slider mute mark on the volume button),
 `implemented-volume-mid.png`,
-`implemented-brightness.png`, `implemented-recording-live.png`, and
-`implemented-recording-idle.png` in that directory, plus the quick-keys frame
+`implemented-brightness.png` in that directory, plus the quick-keys frame
 `implemented-more.png` (the More bar), the visualizer
 frames `implemented-media-viz.png` (the expanded full-bar view) and
 `implemented-media-off.png` (the restored plain media bar), the
@@ -65,6 +63,11 @@ and the per-band frames
 the same home bar over each time-of-day background.
 The theme frames explicitly add CycleTheme/picker actions to the example;
 those controls are absent from the shipped default More bar.
+The separate `approved_multibar_preserves_voice_dispatch_and_renders_offline`
+`dfr-render` test deliberately selects `multibar-voice.toml`, captures command
+strings without executing them and exports `voice-` prefixed frames (including
+`voice-implemented-recording-live.png` and `voice-implemented-recording-dead.png`).
+It does not opt the consumer default into recording.
 These frames use the configured font and icon search paths; their battery
 display is illustrative and they do not prove physical touch or dictation.
 Running the full test suite with the variable set also exports the pet's
@@ -158,7 +161,11 @@ A native GTK4/libadwaita configurator lives in `crates/dfr-configurator`
 it at `/usr/local/bin/dfr-configurator` and adds **Touch Bar Settings** to the
 application menu. Run it as the ordinary desktop user. Save writes a user-owned
 draft; the separate administrator Apply steps in [INSTALL.md](INSTALL.md) validate
-and install that draft for the daemon. The GUI never elevates privileges.
+and install that draft for the daemon. The persistent Save/Apply banner and
+post-save instructions make that boundary explicit; the GUI never elevates
+privileges. Home → Settings requires the **ordinary graphical UID1000 receiver
+setup in INSTALL.md**, in addition to system installation. The app-menu entry
+is the fallback. A submitted session launch is not proof a window mapped.
 
 Building and running it needs GTK **4.10+** and libadwaita **1.5+** packages
 (the daemon itself does not depend on those GUI libraries):
@@ -372,10 +379,14 @@ additive if a future migration needs a hook.
 
 The daemon merges `/etc/tiny-dfr/config.toml` over
 `/usr/share/tiny-dfr/config.toml`. The optional
-[multibar example](share/tiny-dfr/multibar.toml) defines a home bar with volume,
-brightness, play/pause, and battery controls, buttons opening F1-F12, media,
-and quick-key bars, and a mic button that starts voice dictation on a recording
-layer.
+[consumer full deck](share/tiny-dfr/multibar.toml) defines Home as Volume,
+Brightness, Play/Pause, F1–F12, Media, More, Battery, Settings. The sliders each
+retain Stretch=2 and Battery retains Stretch=2; Pet stays in More and theme
+actions are opt-in. The full deck is explicitly selected during installation;
+the base alone retains its legacy function/media behavior. The consumer deck
+has no voice command or recording layer. The separate
+[optional voice profile](share/tiny-dfr/multibar-voice.toml) restores Mic and a
+recording layer only after deliberate selection and separate privacy/setup review.
 
 ```toml
 DefaultLayer = "home"
@@ -464,7 +475,7 @@ The named-bar home has one cyan `VolumeSlider` button and one amber
 values - the shipped example gives each 2 - so the two buttons render
 identically. Pressing either reads its current hardware level and
 replaces their entire combined region, including the gap, with one slider for
-that control. Other controls stay accessible, with Mic at the far right.
+that control. Other controls stay accessible, with Settings at the far right.
 Adjacent slider actions share their span on any bar; a standalone action uses
 its own span. The media bar retains its single volume control.
 
@@ -535,7 +546,8 @@ combined action naming an unknown layer.
 Adding `Layer` to the table combines both effects in one press: the command
 runs first, then the named layer opens. Combined buttons count as visible
 navigation, so a sub-bar whose Stop or Done button returns home through a
-command gets no extra Home button. The [multibar example](share/tiny-dfr/multibar.toml)
+command gets no extra Home button. The explicitly selected
+[optional voice profile](share/tiny-dfr/multibar-voice.toml), not the consumer deck,
 uses this for voice dictation: the home-bar mic button runs
 `voice-dictate-user start` and opens a `recording` layer, which is the visual
 state for the ongoing recording. That layer
@@ -576,9 +588,9 @@ exits 0, so not even the journal would show it). Instead the key calls a thin
 client that hands the request to a small receiver running in the desktop
 session, which runs the real `omarchy capture screenshot` there - the same
 pattern as the voice integration below, with the command fixed on the
-session side and never taken from the wire. The optional
+session side and never taken from the wire. The
 [desktop-session capture integration](integrations/capture/README.md)
-supplies that client and receiver; without it the press still returns home
+supplies that client and receiver (required for Home → Settings); without it the press still returns home
 and the failed command is journalled. An entry without `Layer` stays on the
 bar so several keys can run in a row, and the leading `Home` button always
 leaves without running anything. Adding a quick key is a config edit, not a
@@ -685,7 +697,7 @@ the synthesized layer and buttons disappear and buttons still targeting
 ### Live recording waveform
 
 A button configured with `{ Waveform = true, Stretch = 3 }` - the middle of
-the multibar example's `recording` layer - replaces the old static
+the opt-in voice profile's `recording` layer - replaces the old static
 `● Recording` label with the sound actually coming in: a single drawn line
 that rests flat and silent until you speak, then ripples into a smooth
 traveling wave whose height follows the last two seconds of microphone
@@ -1024,7 +1036,8 @@ restart the service and confirm the remembered choice only when `ActiveTheme`
 is absent. A saved/applied fixed startup theme wins on restart/reload. Then
 Home → More → Pet → pet
 wandering, feeding, and startling → Home, plus Fn press/release. With the
-desktop-session voice integration installed, check the mic button opens
+separately selected `multibar-voice.toml` profile and desktop-session voice
+integration installed, check the mic button opens
 the recording layer while dictation starts, and that Stop types the
 transcript into the focused window while Cancel discards; without the receiver
 the layers still switch and the journal logs the failed command. Hold a key
@@ -1044,7 +1057,7 @@ else
     sudo rm -f /etc/tiny-dfr/config.toml
 fi
 sudo rm /etc/systemd/system/tiny-dfr.service.d/multibar.conf
-sudo rm -rf /var/lib/tiny-dfr
+# Retain /var/lib/tiny-dfr/active-theme and user drafts/backups for rollback.
 sudo systemctl daemon-reload
 sudo systemctl restart tiny-dfr.service
 sudo rm /usr/local/libexec/tiny-dfr-multibar

@@ -266,11 +266,13 @@ impl Document {
 
     pub fn save_message(&self) -> &'static str {
         if self.user_path == Path::new("/etc/tiny-dfr/config.toml") {
-            "Saved — the Touch Bar reloads automatically"
+            "Saved configuration — check the daemon journal for reload results"
         } else {
-            "Saved draft — apply it using the installation guide"
+            "Saved draft only — the running Touch Bar is unchanged; an administrator must apply it"
         }
     }
+
+    pub const APPLY_GUIDANCE: &'static str = "Save writes only the file shown in Configuration File; it does not apply a user draft to the running Touch Bar. After saving, validate the draft with tiny-dfr check, then ask an administrator to back up and install it to /etc/tiny-dfr/config.toml. See Native Settings, Save and Apply in /usr/share/doc/tiny-dfr/INSTALL.md for terminal steps and rollback. Never run Settings with sudo. This app does not elevate privileges.";
 
     /// Open the document: the base file must parse; a missing or empty
     /// user file starts from an empty overlay (everything inherits the
@@ -374,9 +376,11 @@ impl Document {
         for width in [2008u16, 2170] {
             match parse_config(&self.base_text, Some(&candidate), width) {
                 Ok(model) => {
-                    if let Err(err) = search.validate_layout(&model.layout) {
-                        diagnostics.push(format!("at width {width}: {err:#}"));
-                    }
+                    diagnostics.extend(
+                        dfr_config::check::check_resources(&model, &search)
+                            .into_iter()
+                            .map(|error| format!("at width {width}: {error}")),
+                    );
                 }
                 Err(err) => diagnostics.push(format!("at width {width}: {err:#}")),
             }
@@ -816,15 +820,38 @@ mod tests {
     }
 
     #[test]
+    fn font_validation_matches_offline_checks_and_blocks_save_without_panicking() {
+        let (_tmp, mut doc) = document("font-validation", Some(MULTIBAR));
+        doc.user_mut().font_template = Some("invalid\0font".into());
+        let diagnostics = doc.validate();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (width, diagnostic) in [2008, 2170].into_iter().zip(&diagnostics) {
+            assert!(diagnostic.contains(&format!("width {width}: FontTemplate")));
+            assert!(diagnostic.contains("NUL"));
+        }
+        fs::write(doc.user_path(), doc.candidate_text()).unwrap();
+        let offline = dfr_config::check::check_user_config(
+            &doc._base_path,
+            doc.user_path(),
+            2008,
+            &IconSearch::new(dfr_render::config::ICON_DIRS.iter().copied()),
+        );
+        assert_eq!(diagnostics[0], format!("at width 2008: {}", offline[0]));
+        assert!(doc.save().is_err());
+        doc.user_mut().font_template = Some(":bold".into());
+        assert!(doc.validate().is_empty(), "{:?}", doc.validate());
+    }
+
+    #[test]
     fn inspecting_inherited_named_layers_does_not_create_a_draft() {
         let tmp = TempDir::new("inherited-named");
         let base = tmp.write("base.toml", MULTIBAR);
         let mut doc = Document::open(&base, &tmp.0.join("config.toml")).unwrap();
-        assert_eq!(doc.layer_snapshot().len(), 5);
+        assert_eq!(doc.layer_snapshot().len(), 4);
         assert_eq!(doc.layer_roles().0, "home");
         assert!(!doc.is_dirty());
         doc.layers()[0].keys[0].stretch = Some(3);
-        assert_eq!(doc.layer_snapshot().len(), 5);
+        assert_eq!(doc.layer_snapshot().len(), 4);
         assert!(doc.is_dirty());
         assert!(doc.validate().is_empty(), "{:?}", doc.validate());
     }
@@ -1076,7 +1103,7 @@ mod tests {
         // re-parsing the candidate text yields an equal overlay.
         let round: ConfigProxy = toml::from_str(&doc.candidate_text()).unwrap();
         assert_eq!(round, before);
-        assert_eq!(doc.layers().len(), 5);
+        assert_eq!(doc.layers().len(), 4);
         assert_eq!(doc.user().default_layer.as_deref(), Some("home"));
     }
 

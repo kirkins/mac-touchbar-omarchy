@@ -25,12 +25,12 @@ use std::time::Duration;
 const APP_ID: &str = "org.dfrdeck.Configurator";
 
 fn main() -> anyhow::Result<()> {
-    let Some(options) = startup::parse(
+    let options = startup::parse(
         std::env::args().skip(1),
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
-    )?
-    else {
+    );
+    if matches!(options, Ok(None)) {
         println!("usage: dfr-configurator [--config PATH] [--base PATH]\n\
                   --config edits that file directly; by default Settings saves a user draft\n\
                   at $XDG_CONFIG_HOME/dfr-deck/config.toml (or $HOME/.config/dfr-deck/config.toml)\n\
@@ -38,29 +38,75 @@ fn main() -> anyhow::Result<()> {
                   Apply saved drafts with the administrator steps in /usr/share/doc/tiny-dfr/INSTALL.md");
         return Ok(());
     };
-    let doc = if options.draft {
-        model::Document::open_draft(
-            &options.base,
-            &options.user,
+    let document = match options {
+        Ok(Some(options)) => startup::open_document(
+            &options,
             Path::new("/etc/tiny-dfr/config.toml"),
             Path::new("/usr/share/tiny-dfr/multibar.toml"),
-        )?
-    } else {
-        model::Document::open(&options.base, &options.user)?
+        ),
+        _ => Err(startup::Problem::options()),
     };
-
-    adw::init().expect("libadwaita initializes");
+    let failed = document.is_err();
+    if let Err(problem) = &document {
+        eprintln!("{}: {}", problem.heading, problem.body);
+    }
+    adw::init().map_err(|_| anyhow::anyhow!("Cannot initialize Touch Bar Settings. Launch from the graphical desktop as its ordinary user; check the user-manager display/session environment and journalctl --user -b. See /usr/share/doc/tiny-dfr/INSTALL.md. No files changed."))?;
     let app = adw::Application::builder().application_id(APP_ID).build();
-    let document = std::cell::RefCell::new(Some(doc));
+    let document = std::cell::RefCell::new(Some(document));
     app.connect_activate(move |app| {
-        if let Some(doc) = document.borrow_mut().take() {
-            let workspace = build_window(app, doc);
-            workspace.window.present();
+        if let Some(window) = app.active_window() {
+            window.present();
+        } else if let Some(document) = document.borrow_mut().take() {
+            match document {
+                Ok(doc) => build_window(app, doc).window.present(),
+                Err(problem) => build_startup_error(app, &problem).present(),
+            }
         }
     });
     // The app owns GTK argument parsing; ours are already consumed.
     app.run_with_args::<String>(&[]);
+    if failed {
+        anyhow::bail!(
+            "Touch Bar Settings could not load; no files changed. See the startup guidance above."
+        );
+    }
     Ok(())
+}
+
+fn build_startup_error(
+    app: &adw::Application,
+    problem: &startup::Problem,
+) -> adw::ApplicationWindow {
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Touch Bar Settings — Cannot Open")
+        .default_width(560)
+        .default_height(460)
+        .build();
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    ui::margins(&content, 24);
+    let heading = gtk4::Label::new(Some(problem.heading));
+    heading.add_css_class("title-2");
+    heading.set_wrap(true);
+    let body = gtk4::Label::new(Some(problem.body));
+    body.set_wrap(true);
+    body.set_selectable(true);
+    body.set_xalign(0.0);
+    let close = gtk4::Button::with_label("Close");
+    close.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        move |_| window.close()
+    ));
+    content.append(&heading);
+    content.append(&body);
+    content.append(&close);
+    let scroll = gtk4::ScrolledWindow::builder().child(&content).build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroll));
+    window.set_content(Some(&toolbar));
+    window
 }
 
 struct Workspace {
@@ -129,7 +175,8 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
         .build();
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&switcher));
-    let save_button = gtk4::Button::with_label("Save");
+    let save_button = gtk4::Button::with_label("Save to File");
+    save_button.set_tooltip_text(Some("Save a draft, not Apply to the running Touch Bar"));
     save_button.add_css_class("suggested-action");
     save_button.set_action_name(Some("win.save"));
     header.pack_end(&save_button);
@@ -185,6 +232,23 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
     error_row.append(&retry);
     error_row.append(&dismiss);
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    let apply_banner = adw::Banner::new(
+        "Save a draft here. The running Touch Bar changes only after administrator Apply.",
+    );
+    apply_banner.set_revealed(true);
+    apply_banner.set_button_label(Some("Apply Instructions"));
+    apply_banner.connect_button_clicked(glib::clone!(
+        #[weak]
+        window,
+        move |_| {
+            ui::error_dialog(
+                &window,
+                "Save Draft / Administrator Apply",
+                model::Document::APPLY_GUIDANCE,
+            );
+        }
+    ));
+    body.append(&apply_banner);
     body.append(&summary);
     body.append(&error_row);
     body.append(&stack);
@@ -375,6 +439,8 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
         #[strong]
         editor,
         #[weak]
+        window,
+        #[weak]
         toast,
         move |action, _| {
             if !action.is_enabled() {
@@ -389,6 +455,11 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
             editor.run_pipeline();
             if result.is_ok() {
                 toast.add_toast(adw::Toast::new(editor.doc.borrow().save_message()));
+                ui::error_dialog(
+                    &window,
+                    "Saved to File — Apply Instructions",
+                    model::Document::APPLY_GUIDANCE,
+                );
             }
         }
     ));
@@ -403,9 +474,9 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
                 &window,
                 "Configuration File",
                 &format!(
-                    "Editing {}. Save writes this file.\n\n{}\n\nTo apply a user draft, validate it with tiny-dfr check, then have an administrator install it to /etc/tiny-dfr/config.toml. See /usr/share/doc/tiny-dfr/INSTALL.md. The GUI never elevates privileges.",
+                    "Editing {}.\n\n{}",
                     editor.doc.borrow().user_path().display(),
-                    editor.doc.borrow().save_message()
+                    model::Document::APPLY_GUIDANCE
                 ),
             );
         }
@@ -445,7 +516,7 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");
             if editor.doc.borrow().validate().is_empty() {
-                dialog.add_response("save", "Save and Close");
+                dialog.add_response("save", "Save Draft and Close");
             }
             dialog.choose(
                 Some(window),
@@ -469,7 +540,7 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
                             if result.is_err() {
                                 return;
                             }
-                            toast.add_toast(adw::Toast::new("Saved"));
+                            toast.add_toast(adw::Toast::new(editor.doc.borrow().save_message()));
                         }
                         if response == "discard" || response == "save" {
                             close_guard.borrow_mut().discard();
@@ -668,6 +739,11 @@ mod tests {
         pump(250);
         assert!(!workspace.editor.doc.borrow().is_dirty());
         assert!(!workspace.save.is_enabled());
+        assert!(widgets(&workspace.window).into_iter().any(|widget| widget
+            .downcast::<adw::Banner>()
+            .ok()
+            .is_some_and(|banner| banner.is_revealed()
+                && banner.button_label().as_deref() == Some("Apply Instructions"))));
         proof(&workspace, "layers-1100x760", 1100, 760);
         workspace.editor.select(0, Some(0));
         let mut icon_row = None;
@@ -740,6 +816,16 @@ mod tests {
         assert!(workspace.error.is_visible());
         std::fs::remove_dir(directory.join("config.toml.tmp")).unwrap();
         workspace.save.activate(None);
+        assert!(until(2000, || workspace.window.visible_dialog().is_some()));
+        assert!(widgets(&workspace.window.visible_dialog().unwrap())
+            .into_iter()
+            .any(|widget| widget
+                .downcast::<gtk4::Label>()
+                .ok()
+                .is_some_and(|label| label.text().contains("administrator")
+                    && label.text().contains("does not apply"))));
+        activate_dialog_button(&workspace.window, "Close");
+        assert!(until(2000, || workspace.window.visible_dialog().is_none()));
         assert!(!workspace.editor.doc.borrow().is_dirty());
         assert!(!workspace.error.is_visible());
         assert!(!workspace.save.is_enabled());
@@ -820,6 +906,27 @@ mod tests {
         pump(100);
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    #[ignore = "requires an isolated GTK display; never run on the live desktop"]
+    fn native_startup_error_is_bounded_readable_and_closable() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("org.dfrdeck.Configurator.StartupTests")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let window = build_startup_error(&app, &startup::Problem::options());
+        window.present();
+        assert!(until(2000, || window.is_mapped()));
+        assert!(widgets(&window).into_iter().any(|widget| widget
+            .downcast::<gtk4::Label>()
+            .ok()
+            .is_some_and(|label| label.is_selectable() && label.text().contains("--help"))));
+        button(&window, "Close").emit_clicked();
+        assert!(until(2000, || !window.is_visible()));
+        window.destroy();
+    }
+
     fn until(timeout: u64, mut condition: impl FnMut() -> bool) -> bool {
         let end = Instant::now() + Duration::from_millis(timeout);
         loop {

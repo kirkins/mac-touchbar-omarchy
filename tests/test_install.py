@@ -2,6 +2,7 @@
 import configparser
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -54,8 +55,13 @@ class InstallTests(unittest.TestCase):
         for name in ("LICENSE", "LICENSE.material"):
             self.assertEqual((self.stage / "usr/share/licenses/tiny-dfr" / name).read_bytes(),
                              (REPO / name).read_bytes())
-        for name in ("README.md", "INSTALL.md"):
-            self.assertTrue((self.stage / "usr/share/doc/tiny-dfr" / name).is_file())
+        docs = self.stage / "usr/share/doc/tiny-dfr"
+        for source in [REPO / "README.md", REPO / "INSTALL.md", *REPO.glob("integrations/*/README.md")]:
+            installed = docs / source.relative_to(REPO)
+            self.assertEqual(installed.read_bytes(), source.read_bytes())
+            for target in re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", installed.read_text()):
+                if "://" not in target:
+                    self.assertTrue((installed.parent / target).is_file(), f"{installed}: {target}")
         entry = self.stage / "usr/local/share/applications/org.dfrdeck.Configurator.desktop"
         if shutil.which("desktop-file-validate"):
             validation = subprocess.run(["desktop-file-validate", str(entry)], capture_output=True, text=True)
@@ -70,9 +76,69 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(Path(argv[0]).stat().st_mode & 0o777, 0o755)
         self.assertTrue((self.stage / "usr/bin/tiny-dfr").is_file())
         self.assertTrue((self.stage / "usr/local/bin/touchbar-capture-user").is_file())
-        self.assertTrue((self.stage / "etc/udev/rules.d/99-touchbar-tiny-dfr.rules").is_file())
+        for name in ("99-touchbar-tiny-dfr.rules", "99-touchbar-seat.rules"):
+            self.assertEqual((self.stage / "etc/udev/rules.d" / name).read_bytes(),
+                             (REPO / "etc/udev/rules.d" / name).read_bytes())
+        for source in (REPO / "etc/systemd/system").glob("systemd-backlight@*"):
+            self.assertFalse((self.stage / "etc/systemd/system" / source.name).exists(),
+                             "unqualified empty backlight masks must not be installed")
         self.assertFalse((self.stage / "var").exists())
         self.assertFalse((self.stage / "home").exists())
+
+    def user_install(self, home="/home/fixture"):
+        return subprocess.run(["make", "install-user-session", f"DESTDIR={self.stage}",
+                               f"USER_HOME={home}"], cwd=REPO, env=self.environment,
+                              capture_output=True, text=True)
+
+    @unittest.skipIf(os.getuid() == 0, "receiver setup must run as an ordinary user")
+    def test_user_session_staging_is_explicit_owned_copy_only_and_non_overwriting(self):
+        for bad in ("", "relative", "/", "/home/../fixture", "/home/./fixture"):
+            result = self.user_install(bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertFalse(self.stage.exists())
+        home = self.stage / "home/fixture"
+        draft = home / ".config/dfr-deck/config.toml"
+        draft.parent.mkdir(parents=True)
+        draft.write_text("private preexisting draft")
+        result = self.user_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for relative, source, mode in (
+                (".local/bin/touchbar-capture", "touchbar-capture", 0o755),
+                (".config/systemd/user/touchbar-capture.service", "touchbar-capture.service", 0o644)):
+            path = home / relative
+            self.assertEqual(path.read_bytes(), (REPO / "integrations/capture" / source).read_bytes())
+            self.assertEqual(path.stat().st_uid, os.getuid())
+            self.assertEqual(path.stat().st_mode & 0o777, mode)
+        self.assertEqual(draft.read_text(), "private preexisting draft")
+        self.assertFalse((home / ".config/systemd/user/graphical-session.target.wants").exists())
+        self.assertFalse((self.stage / "usr").exists())
+        result = self.user_install()
+        self.assertNotEqual(result.returncode, 0, "never overwrite an existing personal helper/unit")
+
+    @unittest.skipIf(os.getuid() == 0, "receiver setup must run as an ordinary user")
+    def test_existing_unit_or_dangling_symlink_refuses_before_any_copy(self):
+        unit = self.stage / "home/fixture/.config/systemd/user/touchbar-capture.service"
+        unit.parent.mkdir(parents=True)
+        unit.symlink_to("absent-personal-unit")
+        result = self.user_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(unit.is_symlink())
+        self.assertFalse((self.stage / "home/fixture/.local").exists())
+
+    def test_consumer_deck_is_voice_free_and_optional_profile_is_deliberate(self):
+        import tomllib
+        consumer = tomllib.loads((REPO / "share/tiny-dfr/multibar.toml").read_text())
+        home = next(layer for layer in consumer["Layers"] if layer["Name"] == "home")
+        self.assertEqual([key.get("Text") or key.get("Icon") or key.get("Battery") for key in home["Keys"]],
+                         ["volume_up", "brightness_high", "play_pause", "F1-F12", "Media", "More", "both", "Settings"])
+        self.assertEqual([home["Keys"][index]["Stretch"] for index in (0, 1, 6)], [2, 2, 2])
+        for layer in consumer["Layers"]:
+            self.assertNotEqual(layer["Name"], "recording")
+            for key in layer["Keys"]:
+                self.assertNotIn("voice", str(key.get("Action", "")))
+                self.assertFalse(key.get("Waveform"))
+        voice = tomllib.loads((REPO / "share/tiny-dfr/multibar-voice.toml").read_text())
+        self.assertIn("recording", [layer["Name"] for layer in voice["Layers"]])
 
     def test_missing_native_binary_refuses_before_installing_any_files(self):
         (self.binary / "dfr-configurator").unlink()

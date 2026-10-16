@@ -23,6 +23,13 @@ pub fn check_user_config(base: &Path, user: &Path, width: u16, search: &IconSear
             return diagnostics;
         }
     };
+    diagnostics.extend(check_resources(&loaded, search));
+    diagnostics
+}
+
+/// Shared resource gate for offline checks and the configurator's in-memory draft.
+pub fn check_resources(loaded: &model::LoadedModel, search: &IconSearch) -> Vec<String> {
+    let mut diagnostics = Vec::new();
     if let Err(err) = search.validate_layout(&loaded.layout) {
         diagnostics.push(format!("{err:#}"));
     }

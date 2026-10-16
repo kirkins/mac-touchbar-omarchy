@@ -68,10 +68,26 @@ credential setup or personal config overwrite. `DESTDIR` changes the staging
 root, not compiled runtime paths. Keep the stage for an installation manifest
 and uninstall reference. The installed files are `/usr/bin/tiny-dfr`,
 `/usr/local/bin/dfr-configurator`, the capture client, base/example TOML and all
-inherited SVGs under `/usr/share/tiny-dfr`, the udev rule and stock system unit,
-the desktop entry, both licenses and this guide/README. The base file is required;
+inherited SVGs under `/usr/share/tiny-dfr`, **both** seat and trigger udev rules,
+the stock system unit, desktop entry, both licenses and this guide/README plus
+relative integration/privacy guides and example configurations. Optional voice
+is an example only; no voice client, receiver or credentials are installed. The base file is required;
 an `/etc` overlay cannot replace it. A daemon-only `cargo build -p tiny-dfr`
 is possible but does not provide the complete Settings route described here.
+
+The ordinary-user Settings receiver has a **separate, explicit copy-only** target.
+Stage it as the ordinary user (not sudo), choosing an absolute, normalized home
+path; `DESTDIR` prefixes that path without changing the unit's `%h` runtime paths:
+
+```sh
+make install-user-session DESTDIR="$dfr_stage" USER_HOME="$HOME"
+```
+
+It copies only `.local/bin/touchbar-capture` (0755) and
+`.config/systemd/user/touchbar-capture.service` (0644), owned by the invoking
+ordinary user. It refuses existing helpers/units, including dangling symlinks,
+before copying either file. It neither creates a draft nor enables/starts any
+unit. Never run this target with sudo or infer another user's home from sudo.
 
 ## First installation
 
@@ -93,6 +109,19 @@ The stock unit prepares `/var/lib/tiny-dfr` owned by `nobody` (0755) and allows
 writes only there through `ReadWritePaths`; `ProtectSystem=strict`, `ProtectHome`,
 `PrivateTmp`, `NoNewPrivileges` and its other restrictions remain enabled.
 This directory persists on-glass theme choice. No writable `/etc` is required.
+
+**Complete the required graphical-user receiver setup below** for the full deck's
+Home → Settings button. System installation alone does not supply an active
+session receiver; the application-menu launcher remains the fallback.
+
+The seat rule assigns Touch Bar devices to `seat-touchbar` and removes DRM
+master-of-seat tagging so the daemon, not the desktop compositor, can own the
+Touch Bar. On upgrades, check for a distribution-owned rule/collision before
+replacement. The two tracked empty `systemd-backlight@backlight:*.service` files
+are historical mask placeholders with no verified need in this install; they
+are deliberately **not installed**. Backlight restore/mask behavior on a clean
+boot remains a target-device qualification gate, not a reason to install global
+masks or change device permissions blindly.
 
 New rules need a device add event. Reboot at a suitable time after installation
 so the already connected devices are discovered with the new rules. The udev
@@ -116,8 +145,8 @@ Opening does not write; Save/Ctrl+S creates the user-owned directory/file and
 later saves atomically with a first-save backup. Invalid drafts cannot be saved.
 
 **Save writes the draft. Apply installs that draft for the daemon.** Save alone
-does not change the running Touch Bar. The Configuration File menu and saved
-toast explain this contract. Explicit `--config PATH` edits that file directly;
+does not change the running Touch Bar. The persistent Save/Apply banner, Apply Instructions button, Configuration File
+menu and post-save dialog explain this contract and link to the terminal steps. Explicit `--config PATH` edits that file directly;
 use it only with a writable file. `/etc` remains administrator-owned.
 
 After saving, run this separate handoff in a terminal as the desktop user:
@@ -141,24 +170,59 @@ overlay with `sudo install -m644 /etc/tiny-dfr/config.toml.before-settings
 skip the backup copy and use `sudo install -Dm644` after validation. There is
 no privileged apply helper, sudo policy or home/runtime permission change.
 
-## Optional desktop receivers
+## Required full-deck Settings receiver (ordinary graphical UID 1000)
 
-For the full deck's **Settings button**, install this receiver as desktop UID
-1000; the machine capture client is already supplied by `make install`:
+This step is **part of the full-deck installation**, not optional for its Settings
+button. Python 3.11+, `systemd-run`, a systemd user manager in the graphical
+UID1000 session, and the installed native app/runtime libraries are required.
+`notify-send` is recommended for session-side failure notifications (journal
+feedback remains if it is absent). From the same reviewed checkout, in that
+user's graphical terminal, without sudo:
 
 ```sh
-install -Dm755 integrations/capture/touchbar-capture "$HOME/.local/bin/touchbar-capture"
-install -Dm644 integrations/capture/touchbar-capture.service "$HOME/.config/systemd/user/touchbar-capture.service"
+id -u # must be 1000 for the supplied daemon/client route
+make install-user-session USER_HOME="$HOME"
 systemctl --user daemon-reload
 systemctl --user enable --now touchbar-capture.service
 ```
 
 The receiver launches the same native app/default draft as the desktop entry.
-Its user-manager environment must contain `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`,
-`DBUS_SESSION_BUS_ADDRESS` and, for Omarchy screenshot, the compositor's session
-environment. Use the desktop's normal session-environment import/re-login
-mechanism. Screenshot additionally needs Omarchy's `grim`, `slurp`, `hyprpicker`,
+Its user-manager environment must contain `WAYLAND_DISPLAY` (or `DISPLAY`),
+`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and, for Omarchy screenshot, the
+compositor's session environment. Use the desktop's normal session-environment
+import/re-login mechanism; do not grant the daemon access to the user's home,
+runtime directory or bus. Inspect `systemctl --user status touchbar-capture.service`
+and `journalctl --user -u touchbar-capture.service -b`. After a deliberate setup,
+`/usr/local/bin/touchbar-capture-user settings` submits the same fixed app launch
+as the Home button. **Submission/exec success is not proof a window mapped.**
+Confirm the window yourself; GTK/display/runtime failures appear in
+`journalctl --user -b`. Repeated launches present the existing native window. Screenshot additionally needs Omarchy's `grim`, `slurp`, `hyprpicker`,
 `wl-copy`, `hyprctl` flow. Settings needs neither a screenshot nor Omarchy itself.
+
+### If Settings does not open
+
+- Missing receiver: the sandboxed daemon cannot display a desktop notification.
+  Check `journalctl -u tiny-dfr.service -b` for handoff/setup guidance, complete
+  the user setup above, or open **Touch Bar Settings** from the application menu.
+  A button press does not claim on-glass launch success.
+- Missing app/launcher or missing session environment: the receiver returns an
+  error and attempts a bounded desktop notification. Check its journal and the
+  installed `/usr/local/bin/dfr-configurator`, runtime libraries and graphical
+  user-manager environment; re-login/restart only that user receiver as needed.
+- Invalid/unreadable base or draft: Settings shows a bounded native error window
+  when GTK can initialize; otherwise it writes safe launch guidance to stderr /
+  the session journal. It does not dump configuration contents or change files.
+  Use `tiny-dfr check --base BASE DRAFT` in a **private terminal** for detailed
+  parser diagnostics (these may quote the file); back up/repair the draft rather
+  than deleting it. Verify installed base/example files using the retained stage.
+
+The user install target refuses replacements. For an upgrade, back up both user
+files, stop only this receiver, deliberately move the prior files aside, copy
+the reviewed replacements as that same user, reload the user manager and start
+it again; preserve the backups for rollback. Do not overwrite a personal unit
+or a distribution file without reviewing it.
+
+## Other optional desktop receivers
 
 Each other integration is separately optional:
 
@@ -186,7 +250,13 @@ an XDG override for the Settings draft does not relocate these helper binaries.
 Read each integration README for its protocol/rollback. No receiver is started
 by `make install`. Without receivers, deck navigation still works, slider/quick
 key requests fail visibly/in the journal, now-playing is idle and an enabled
-visualizer reports `No feed`. Voice is unnecessary for Settings or the deck.
+visualizer reports `No feed`. Voice is unnecessary for Settings or the deck. The consumer `multibar.toml`
+contains no voice commands or recording layer. Only after reading the installed
+[voice privacy/setup guide](integrations/voice/README.md), deliberately configuring
+its separate receiver and backing up the existing overlay, select
+`/usr/share/tiny-dfr/multibar-voice.toml` instead if desired. Validate it before
+administrator Apply. This optional profile restores Mic/recording controls and
+keeps Settings in More. Never enable it just to test or open Settings.
 
 ## Safe checks and optional device smoke
 

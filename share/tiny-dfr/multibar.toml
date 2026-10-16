@@ -1,4 +1,5 @@
-# Optional named-bar configuration. After review, install as /etc/tiny-dfr/config.toml.
+# Consumer full deck: explicitly select over the legacy base (see INSTALL.md).
+# No voice/recording actions. Optional voice is in multibar-voice.toml.
 # Global appearance/brightness options continue to inherit from config.toml.
 DefaultLayer = "home"
 # Optional: holding Fn temporarily shows this bar; releasing Fn returns to the
@@ -30,7 +31,7 @@ Keys = [
     { Text = "Media", Action = { Layer = "media" } },
     { Text = "More", Action = { Layer = "more" } },
     { Battery = "both", Stretch = 2 },
-    { Text = "Mic", Accent = "cyan", Action = { Command = "voice-dictate-user start", Layer = "recording" } },
+    { Text = "Settings", Action = { Command = "touchbar-capture-user settings" } },
 ]
 
 [[Layers]]
@@ -99,33 +100,6 @@ Keys = [
 # calmer motion with VisualizerSmoothing (ms decay, attack a third of it) and
 # VisualizerLag (ms of visual delay, capped at 500).
 
-# Voice dictation: the home-bar mic button runs `voice-dictate-user start` and
-# opens this recording layer in one press; the layer itself is the visual
-# state. The middle Waveform button shows the sound actually coming in: a
-# drawn line that rests flat while silent and ripples while speaking, a
-# recording dot that pulses with live level, and a duration timer counting
-# from entering the layer, all driven by the optional desktop-session level
-# feed (see README; a dead or missing feed shows an unmissable red slashed
-# dot and a `No feed` label, never the calm idle baseline of a quiet feed,
-# while the timer keeps counting). The line follows the level directly,
-# unsmoothed. Set
-# WaveformStyle = "bars" on the button to keep the previous scrolling bar
-# graph instead of the line, or opt into a calmer motion with
-# WaveformSmoothing (ms decay, attack a third of it) and WaveformLag (ms of
-# visual delay, capped at 500).
-# Stop keeps the recording and types the transcript into the focused
-# window, Cancel discards a mis-start; both run their command and return
-# home. Install the optional integrations/voice client and desktop-session
-# service separately (see README); without the receiver these presses still
-# switch layers and log the failed command.
-[[Layers]]
-Name = "recording"
-Keys = [
-    { Text = "Cancel", Accent = "neutral", Action = { Command = "voice-dictate-user cancel", Layer = "home" } },
-    { Waveform = true, Accent = "blue", Stretch = 3 },
-    { Text = "Stop", Accent = "red", Action = { Command = "voice-dictate-user stop", Layer = "home" } },
-]
-
 # Custom quick keys: the home bar's More button opens this bar, a parking
 # lot for one-press commands with room for as many entries as you like.
 # Each quick key is one entry: a Text label or an Icon glyph, and an Action
@@ -135,7 +109,7 @@ Keys = [
 # leaves without running anything. Labels, glyphs, accents, and Stretch
 # work as on any bar, and commands run through /bin/sh like any command
 # button (see the notes above and the README). Commands that need the
-# desktop session - like the shipped Screenshot and Settings keys - must go
+# desktop session - like Screenshot here and Settings on Home - must go
 # through a session receiver client such as touchbar-capture-user, because
 # the daemon's unprivileged sandbox cannot reach the compositor or user manager.
 [[Layers]]
@@ -143,7 +117,6 @@ Name = "more"
 Keys = [
     { Text = "Home", Action = { Layer = "home" } },
     { Text = "Screenshot", Action = { Command = "touchbar-capture-user screenshot", Layer = "home" } },
-    { Text = "Settings", Action = { Command = "touchbar-capture-user settings", Layer = "home" } },
     # Lock: emits the compositor's lock bind - Omarchy's default
     # SUPER+CTRL+L (omarchy-system-lock) - as a pure key chord, so it
     # works inside the daemon's unprivileged sandbox with no shell and
@@ -158,7 +131,7 @@ Keys = [
 # A Home button is inserted automatically on sub-bars that lack a visible
 # button targeting DefaultLayer; a button can also run a shell command on
 # touch-down with Action = { Command = "..." }, optionally combined with a
-# Layer switch as in the mic button above. Commands run through /bin/sh as
+# Layer switch as in the Screenshot button above. Commands run through /bin/sh as
 # the daemon user; failures are logged to the journal. With PetEnabled (see
 # config.toml) the "more" bar gains a Pet button opening the daemon's own
 # pet layer (or the home bar if no "more" bar exists), unless a layer named

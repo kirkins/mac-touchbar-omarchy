@@ -1,5 +1,5 @@
 [Unit]
-Description=Touch Bar desktop-session screenshot receiver
+Description=Touch Bar Settings and screenshot session receiver
 PartOf=graphical-session.target
 After=graphical-session.target
 

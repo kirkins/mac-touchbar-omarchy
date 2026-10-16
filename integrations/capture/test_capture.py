@@ -63,6 +63,8 @@ class Fixture:
             "FAKE_SYSTEMD_RUN_EXIT": "",
         })
         self.environment.start()
+        self.preflight = patch.object(capture, "settings_preflight")
+        self.preflight.start()
         self.engine = capture.Capture()
         self.notifications = patch.object(capture, "notify")
         self.notifications.start()
@@ -70,6 +72,7 @@ class Fixture:
     def stop_fixture(self):
         self.stop_capture()
         self.notifications.stop()
+        self.preflight.stop()
         self.environment.stop()
         self.temporary.cleanup()
 
@@ -132,10 +135,24 @@ class CaptureTests(Fixture, unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError, "Cannot launch"):
             engine.dispatch("screenshot")
 
-    def test_settings_runs_only_the_fixed_session_launcher(self):
-        self.engine.dispatch("settings")
+    def test_settings_runs_only_the_fixed_session_launcher_and_can_repeat(self):
+        for _ in range(2):
+            self.engine.dispatch("settings")
         self.assertEqual(self.calls("systemd-run"), [[
-            "--user", "--collect", "--quiet", "/usr/local/bin/dfr-configurator"]])
+            "--user", "--collect", "--quiet", "--property=Type=exec",
+            "/usr/local/bin/dfr-configurator"]] * 2)
+
+    def test_settings_launch_os_error_timeout_and_preflight_are_bounded(self):
+        for error in (FileNotFoundError("PRIVATE_SENTINEL"),
+                      subprocess.TimeoutExpired("PRIVATE_SENTINEL", 15)):
+            with patch.object(capture.subprocess, "run", side_effect=error):
+                with self.assertRaisesRegex(capture.CaptureError, "application menu") as raised:
+                    self.engine.dispatch("settings")
+                self.assertNotIn("PRIVATE_SENTINEL", str(raised.exception))
+        self.engine.settings_check = lambda: (_ for _ in ()).throw(capture.CaptureError("Missing app"))
+        with self.assertRaisesRegex(capture.CaptureError, "Missing app"):
+            self.engine.dispatch("settings")
+        self.assertEqual(self.calls("systemd-run"), [])
 
     def test_settings_launcher_failure_is_reported(self):
         os.environ["FAKE_SYSTEMD_RUN_EXIT"] = "1"
@@ -198,7 +215,8 @@ class ReceiverTests(Fixture, unittest.TestCase):
     def test_real_socket_routes_settings_and_rejects_unknown_actions(self):
         self.exchange("settings")
         self.assertEqual(self.calls("systemd-run"), [[
-            "--user", "--collect", "--quiet", "/usr/local/bin/dfr-configurator"]])
+            "--user", "--collect", "--quiet", "--property=Type=exec",
+            "/usr/local/bin/dfr-configurator"]])
         result = self.raw_exchange(b"arbitrary")
         self.assertFalse(result["ok"])
         self.assertIn("Invalid action", result["error"])
@@ -264,10 +282,37 @@ client.request('screenshot', os.getuid(), '\\0' + sys.argv[2])
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid choice", result.stderr)
 
+    def test_missing_receiver_gives_honest_setup_and_menu_fallback(self):
+        missing = self.address + "-absent"
+        with self.assertRaisesRegex(OSError, "receiver unavailable") as raised:
+            client.request("settings", os.getuid(), missing)
+        self.assertIn("application menu", str(raised.exception))
+        self.assertIn("user-session setup", str(raised.exception))
+
+    def test_settings_submission_failure_notifies_and_reaches_client(self):
+        os.environ["FAKE_SYSTEMD_RUN_EXIT"] = "5"
+        with self.assertRaisesRegex(ValueError, "exit status: 5"):
+            self.exchange("settings")
+        capture.notify.assert_called_once()
+        self.assertIn("journalctl --user", capture.notify.call_args.args[0])
+
     def test_client_action_validation_accepts_settings_and_rejects_unknown(self):
         with self.assertRaisesRegex(ValueError, "Invalid action"):
             client.request("arbitrary", os.getuid(), "\0missing")
         self.exchange("settings")
+
+
+class SettingsPreflightTests(unittest.TestCase):
+    def test_missing_app_or_graphical_environment_is_actionable_without_launch(self):
+        with patch.object(capture.os, "access", return_value=False):
+            with self.assertRaisesRegex(capture.CaptureError, "app is missing"):
+                capture.settings_preflight()
+        with patch.object(capture.os, "access", return_value=True), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(capture.CaptureError, "graphical user-manager environment"):
+                capture.settings_preflight()
+            os.environ.update(WAYLAND_DISPLAY="fixture", XDG_RUNTIME_DIR="/fixture",
+                              DBUS_SESSION_BUS_ADDRESS="fixture")
+            capture.settings_preflight()
 
 
 if __name__ == "__main__":

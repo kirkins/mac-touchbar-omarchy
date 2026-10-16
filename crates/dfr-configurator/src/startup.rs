@@ -49,9 +49,71 @@ pub fn parse(
     }))
 }
 
+/// Do not put parser diagnostics in notifications, startup UI or the journal:
+/// TOML errors may quote configuration contents (including command secrets).
+#[derive(Debug)]
+pub struct Problem {
+    pub heading: &'static str,
+    pub body: &'static str,
+}
+
+impl Problem {
+    pub fn options() -> Self {
+        Self {
+            heading: "Cannot start Touch Bar Settings",
+            body: "Invalid launch options or no absolute HOME. Run dfr-configurator --help in a terminal. Launch Settings as the ordinary graphical desktop user, never with sudo. See /usr/share/doc/tiny-dfr/INSTALL.md.",
+        }
+    }
+}
+
+pub fn open_document(
+    options: &Options,
+    installed: &std::path::Path,
+    example: &std::path::Path,
+) -> Result<crate::model::Document, Problem> {
+    let result = if options.draft {
+        crate::model::Document::open_draft(&options.base, &options.user, installed, example)
+    } else {
+        crate::model::Document::open(&options.base, &options.user)
+    };
+    result.map_err(|_| Problem {
+        heading: "Cannot open Touch Bar Settings",
+        body: "The base configuration or selected draft could not be read or parsed, or the full-deck example is missing. No files were changed. Check the base (--base; default /usr/share/tiny-dfr/config.toml) and draft (--config; default $XDG_CONFIG_HOME/dfr-deck/config.toml or $HOME/.config/dfr-deck/config.toml). If there is no draft, check /etc/tiny-dfr/config.toml and /usr/share/tiny-dfr/multibar.toml. Back up an invalid draft before repairing it; do not delete it blindly. Use tiny-dfr check --base BASE DRAFT in a private terminal for detailed diagnostics. For installation and administrator repair steps see /usr/share/doc/tiny-dfr/INSTALL.md; journalctl --user -b contains session launch failures.",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_or_invalid_startup_files_have_bounded_private_feedback() {
+        let root = std::env::temp_dir().join(format!("dfr-startup-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let base = root.join("base.toml");
+        let user = root.join("draft.toml");
+        let seed = root.join("example.toml");
+        let options = Options {
+            base: base.clone(),
+            user: user.clone(),
+            draft: true,
+        };
+        let problem = open_document(&options, &seed, &seed).err().unwrap();
+        assert!(problem.body.contains("No files were changed"));
+        std::fs::write(&base, include_str!("../../../share/tiny-dfr/config.toml")).unwrap();
+        std::fs::write(&seed, include_str!("../../../share/tiny-dfr/multibar.toml")).unwrap();
+        assert!(open_document(&options, &seed, &seed).is_ok());
+        assert!(!user.exists(), "opening must not create a draft");
+        for path in [&base, &user] {
+            std::fs::write(path, "PRIVATE_SENTINEL = [broken").unwrap();
+            let problem = open_document(&options, &seed, &seed).err().unwrap();
+            assert!(!problem.body.contains("PRIVATE_SENTINEL"));
+            assert!(problem.body.len() < 1200);
+            assert!(problem.body.contains("tiny-dfr check"));
+            std::fs::write(path, include_str!("../../../share/tiny-dfr/config.toml")).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn desktop_and_receiver_defaults_select_an_ordinary_user_draft() {
