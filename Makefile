@@ -6,7 +6,7 @@ CARGO_JOBS ?= 1
 # Explicit destination for the ordinary-user receiver; never infer from sudo.
 USER_HOME ?=
 
-.PHONY: build install check-install-inputs install-user-session check-user-session-inputs
+.PHONY: build install install-docs check-install-inputs install-user-session check-user-session-inputs
 build:
 	cargo build --locked --workspace --release -j$(CARGO_JOBS)
 
@@ -14,8 +14,20 @@ check-install-inputs:
 	test -x "$(BINARY_DIR)/tiny-dfr"
 	test -x "$(BINARY_DIR)/dfr-configurator"
 
+# Refresh only the installed documentation tree; DESTDIR stages it like install.
+install-docs:
+	install -d "$(DESTDIR)/usr/share/doc/tiny-dfr"
+	install -m644 README.md INSTALL.md LICENSE LICENSE.material "$(DESTDIR)/usr/share/doc/tiny-dfr/"
+	install -d "$(DESTDIR)/usr/share/doc/tiny-dfr/assets"
+	install -m644 assets/*.png assets/README.md "$(DESTDIR)/usr/share/doc/tiny-dfr/assets/"
+	set -e; for name in audio brightness capture now-playing viz voice; do \
+		install -Dm644 "integrations/$$name/README.md" "$(DESTDIR)/usr/share/doc/tiny-dfr/integrations/$$name/README.md"; \
+	done
+	install -d "$(DESTDIR)/usr/share/doc/tiny-dfr/share/tiny-dfr"
+	install -m644 share/tiny-dfr/*.toml "$(DESTDIR)/usr/share/doc/tiny-dfr/share/tiny-dfr/"
+
 # No build, service operation, credential setup or user config overwrite here.
-install: check-install-inputs
+install: check-install-inputs install-docs
 	install -Dm755 "$(BINARY_DIR)/tiny-dfr" "$(DESTDIR)/usr/bin/tiny-dfr"
 	install -Dm755 "$(BINARY_DIR)/dfr-configurator" "$(DESTDIR)/usr/local/bin/dfr-configurator"
 	install -Dm755 integrations/capture/touchbar-capture-user "$(DESTDIR)/usr/local/bin/touchbar-capture-user"
@@ -25,16 +37,8 @@ install: check-install-inputs
 	install -Dm644 etc/udev/rules.d/99-touchbar-seat.rules "$(DESTDIR)/etc/udev/rules.d/99-touchbar-seat.rules"
 	install -Dm644 etc/systemd/system/tiny-dfr.service "$(DESTDIR)/etc/systemd/system/tiny-dfr.service"
 	install -Dm644 share/applications/org.dfrdeck.Configurator.desktop "$(DESTDIR)/usr/local/share/applications/org.dfrdeck.Configurator.desktop"
-	install -d "$(DESTDIR)/usr/share/licenses/tiny-dfr" "$(DESTDIR)/usr/share/doc/tiny-dfr"
+	install -d "$(DESTDIR)/usr/share/licenses/tiny-dfr"
 	install -m644 LICENSE LICENSE.material "$(DESTDIR)/usr/share/licenses/tiny-dfr/"
-	install -m644 README.md INSTALL.md LICENSE LICENSE.material "$(DESTDIR)/usr/share/doc/tiny-dfr/"
-	install -d "$(DESTDIR)/usr/share/doc/tiny-dfr/assets"
-	install -m644 assets/*.png assets/README.md "$(DESTDIR)/usr/share/doc/tiny-dfr/assets/"
-	set -e; for name in audio brightness capture now-playing viz voice; do \
-		install -Dm644 "integrations/$$name/README.md" "$(DESTDIR)/usr/share/doc/tiny-dfr/integrations/$$name/README.md"; \
-	done
-	install -d "$(DESTDIR)/usr/share/doc/tiny-dfr/share/tiny-dfr"
-	install -m644 share/tiny-dfr/*.toml "$(DESTDIR)/usr/share/doc/tiny-dfr/share/tiny-dfr/"
 
 # A separate copy-only step, run as the desktop user, with no enable/start.
 # Refuse existing helpers/units (including dangling symlinks) before any copy.

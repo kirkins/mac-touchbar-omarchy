@@ -84,6 +84,11 @@ is an example only; no voice client, receiver or credentials are installed. The 
 an `/etc` overlay cannot replace it. A daemon-only `cargo build -p tiny-dfr`
 is possible but does not provide the complete Settings route described here.
 
+To refresh only the installed documentation after a docs change, without
+reinstalling binaries or touching `/etc`, run `sudo make install-docs`. It copies
+the same guide, README, licenses, assets, integration guides and example
+configurations below `/usr/share/doc/tiny-dfr`; `DESTDIR` stages it like `install`.
+
 The ordinary-user Settings receiver has a **separate, explicit copy-only** target.
 Stage it as the ordinary user (not sudo), choosing an absolute, normalized home
 path; `DESTDIR` prefixes that path without changing the unit's `%h` runtime paths:
