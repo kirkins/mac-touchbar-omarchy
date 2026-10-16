@@ -1,4 +1,4 @@
-# Install Super Touch Bar (tiny-dfr)
+# Install mac-touchbar-omarchy (tiny-dfr)
 
 This is the supported source installation procedure. It installs the native
 GTK4/libadwaita Settings app as well as the daemon. It does not install drivers,
@@ -7,22 +7,31 @@ for the operator of the target machine; development tests use staging and mocks.
 
 ## Scope and prerequisites
 
+**Supported:** Touch Bar MacBook Pro 13-inch on Apple Silicon - `MacBookPro17,1`
+(M1) and `Mac14,7` (M2) - in an Omarchy Wayland session with a systemd user
+manager and PipeWire, **desktop UID 1000** and daemon user `nobody` (65534).
+Everything else is unsupported: Intel/T2 Macs, other Apple Silicon models,
+other distributions and desktops, other user IDs, and the experimental Nix
+flake. Only `MacBookPro17,1` has been exercised on hardware; `Mac14,7` is named
+by the shipped rules but is not yet device-qualified.
+
 The daemon needs Linux Touch Bar DRM, touch-input, backlight and uinput support
 already provided by the distribution. The inherited udev rules name
-`MacBookPro17,1` and `Mac14,7`, DRM drivers `adp`/`appletbdrm`, and the
-`panel-summit`/`hid-appletb-bl` Touch Bar backlights. They also retain Intel/T2
-identifiers; their presence is not a qualification of Intel/T2 hardware.
+`MacBookPro17,1` and `Mac14,7`, the `adp`/`appletbdrm` DRM drivers, the
+`228600000.dsi.0`/`appletb_backlight` Touch Bar backlight and the
+`apple-panel-bl` display backlight. They also retain Intel/T2 identifiers
+(`228200000.display-pipe.0`, `gmux_backlight`, `intel_backlight`,
+`acpi_video0`); their presence is not a qualification of Intel/T2 hardware.
 There is no fresh device or all-distribution Asahi acceptance claim here.
 
-The supplied desktop integrations target **desktop UID 1000** and the daemon's
+The supplied desktop integrations pin **desktop UID 1000** and the daemon's
 `nobody` UID 65534. Receivers derive their own socket UID but the daemon and
 clients pin 1000. A different user UID requires coordinated source changes and
-qualification; editing only a service is insufficient. The complete example
-targets an Omarchy Wayland session with a systemd user manager and PipeWire.
-Screenshot needs Omarchy; the lock key emits its `SUPER+CTRL+L` binding. The
-Settings application itself is a generic native app; its Touch Bar launch needs
-the capture receiver and the graphical user manager. Other desktops and hardware
-are adaptation work, outside the supplied full-deck qualification.
+qualification; editing only a service is insufficient. Screenshot needs Omarchy;
+the lock key emits its `SUPER+CTRL+L` binding. The Settings application itself
+is a generic native app; its Touch Bar launch needs the capture receiver and the
+graphical user manager. Other desktops and hardware are adaptation work, outside
+the supplied full-deck qualification.
 
 The system daemon opens DRM, Touch Bar input/backlight and `/dev/uinput`, then
 drops to `nobody` with supplementary **input** and **video** groups. Those groups

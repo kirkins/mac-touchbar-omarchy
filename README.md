@@ -1,12 +1,28 @@
-# tiny-dfr
-The most basic dynamic function row daemon possible
+# mac-touchbar-omarchy
 
-Super Touch Bar builds on Asahi Linux's tiny-dfr. The supplied source targets
-Linux Touch Bar DRM/input/backlight drivers and an Omarchy Wayland desktop with
-UID 1000 for the optional session integrations. It is developed on Omarchy;
-this is not an all-distribution Asahi or Intel/T2 hardware qualification.
-Screenshot/Lock, audio and display helpers have specific desktop/device
-requirements; Settings is a native GTK4/libadwaita app. See the complete
+Touch Bar daemon and deck for the Apple Silicon MacBook Pro 13-inch.
+
+`mac-touchbar-omarchy` is this source tree's public name. It is a build of
+Asahi Linux's [`tiny-dfr`](https://github.com/AsahiLinux/tiny-dfr) - "the most
+basic dynamic function row daemon possible" - plus a native deck and Settings
+app. The package, installed binary and workspace crates keep their inherited
+`tiny-dfr` / `dfr-*` names; "Super Touch Bar" was an earlier working name.
+
+## Support
+
+| | |
+| --- | --- |
+| **Supported devices** | MacBook Pro 13-inch on Apple Silicon with a Touch Bar: `MacBookPro17,1` (M1) and `Mac14,7` (M2). |
+| **Supported platform** | An Omarchy Wayland session with a systemd user manager and PipeWire, desktop UID 1000 and daemon user `nobody` (65534). |
+| **Unsupported** | Everything else: Intel/T2 Macs, other Apple Silicon models, other distributions and desktops, other user IDs, and the experimental Nix flake. |
+
+Only `MacBookPro17,1` has been exercised on hardware; `Mac14,7` is named by the
+shipped udev rules but is not yet device-qualified. The daemon itself needs the
+Linux Touch Bar DRM, input and backlight devices; other platforms are porting
+work, not a supported configuration. Screenshot, lock, audio, visualizer and
+brightness keys call Omarchy helpers, and Settings is a generic GTK4/libadwaita
+app whose Touch Bar launch still needs the capture receiver and a graphical user
+manager. See the complete
 [installation guide and support boundary](INSTALL.md) before installing.
 
 
