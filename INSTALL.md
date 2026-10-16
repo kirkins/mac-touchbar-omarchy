@@ -18,11 +18,11 @@ by the shipped rules but is not yet device-qualified.
 The daemon needs Linux Touch Bar DRM, touch-input, backlight and uinput support
 already provided by the distribution. The inherited udev rules name
 `MacBookPro17,1` and `Mac14,7`, the `adp`/`appletbdrm` DRM drivers, the
-`228600000.dsi.0`/`appletb_backlight` Touch Bar backlight and the
-`apple-panel-bl` display backlight. They also retain Intel/T2 identifiers
-(`228200000.display-pipe.0`, `gmux_backlight`, `intel_backlight`,
-`acpi_video0`); their presence is not a qualification of Intel/T2 hardware.
-There is no fresh device or all-distribution Asahi acceptance claim here.
+`228200000.display-pipe.0`/`228600000.dsi.0`/`appletb_backlight` Touch Bar
+backlight and the `apple-panel-bl` display backlight. They also retain Intel/T2
+identifiers (`gmux_backlight`, `intel_backlight`, `acpi_video0`); their presence
+is not a qualification of Intel/T2 hardware. There is no fresh device or
+all-distribution Asahi acceptance claim here.
 
 The supplied desktop integrations pin **desktop UID 1000** and the daemon's
 `nobody` UID 65534. Receivers derive their own socket UID but the daemon and
