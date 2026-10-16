@@ -46,6 +46,12 @@ fn find_backlight() -> Result<PathBuf> {
 fn find_display_backlight() -> Result<PathBuf> {
     for entry in fs::read_dir("/sys/class/backlight/")? {
         let entry = entry?;
+        // apple-panel-bl is the Apple Silicon display backlight. The Intel
+        // names (gmux_backlight, intel_backlight, acpi_video0) are retained
+        // from upstream tiny-dfr as a porting starting point and to stay close
+        // to upstream; Intel/T2 is not supported or tested here. This lookup is
+        // optional - a failure only logs - unlike find_backlight above, which
+        // is mandatory and matches Apple Silicon Touch Bar devices only.
         if [
             "apple-panel-bl",
             "gmux_backlight",
