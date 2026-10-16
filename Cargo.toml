@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "tiny-dfr"
-version = "0.3.7"
+version = "0.1.0"
 edition = "2021"
 license = "MIT AND Apache-2.0"
 description = "Touch Bar daemon and deck for the Apple Silicon MacBook Pro 13-inch on Omarchy Linux, built on Asahi Linux's tiny-dfr"
