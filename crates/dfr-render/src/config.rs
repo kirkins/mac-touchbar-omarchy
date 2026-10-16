@@ -1418,7 +1418,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 5);
+        assert_eq!(more.keys.len(), 4);
         assert!(!more
             .keys
             .iter()
@@ -1429,13 +1429,18 @@ Keys = [\n\
             more.keys[0].action,
             ButtonAction::SwitchLayer("home".into())
         );
-        assert_eq!(more.keys[2].text.as_deref(), Some("Settings"));
+        assert!(!more
+            .keys
+            .iter()
+            .any(|key| key.text.as_deref() == Some("Settings")));
+        let settings = layout.layers[layout.home]
+            .keys
+            .iter()
+            .find(|key| key.text.as_deref() == Some("Settings"))
+            .unwrap();
         assert_eq!(
-            more.keys[2].action,
-            ButtonAction::CommandLayer {
-                command: "touchbar-capture-user settings".into(),
-                layer: "home".into()
-            }
+            settings.action,
+            ButtonAction::Command("touchbar-capture-user settings".into())
         );
         let screenshot = &more.keys[1];
         assert_eq!(screenshot.text.as_deref(), Some("Screenshot"));
@@ -1467,7 +1472,7 @@ Keys = [\n\
             .iter()
             .find(|layer| layer.name == "more")
             .unwrap();
-        assert_eq!(more.keys.len(), 7);
+        assert_eq!(more.keys.len(), 6);
         assert_eq!(more.keys[2].icon.as_deref(), Some("search"));
         assert!(more.keys[2].text.is_none());
         assert_eq!(
