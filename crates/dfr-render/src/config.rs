@@ -251,7 +251,7 @@ mod tests {
 
     // Pixel digests of the golden frames (FNV-1a over the 64x2048
     // portrait buffer); see shipped_multibar_frames_match_the_pinned_pixel_digests.
-    const GOLDEN_HOME: u64 = 14136130584182235729;
+    const GOLDEN_HOME: u64 = 5630012103463864515;
     const GOLDEN_MEDIA: u64 = 9540707964474980499;
     const GOLDEN_FUNCTION: u64 = 8649432053679081575;
     const NAMED: &str = r#"

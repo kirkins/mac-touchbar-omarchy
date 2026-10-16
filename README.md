@@ -161,8 +161,9 @@ A native GTK4/libadwaita configurator lives in `crates/dfr-configurator`
 it at `/usr/local/bin/dfr-configurator` and adds **Touch Bar Settings** to the
 application menu. Run it as the ordinary desktop user. Save writes a user-owned
 draft; the separate administrator Apply steps in [INSTALL.md](INSTALL.md) validate
-and install that draft for the daemon. The persistent Save/Apply banner and
-post-save instructions make that boundary explicit; the GUI never elevates
+and install that draft for the daemon. The persistent Save/Apply banner,
+explicit instructions action and saved-draft toast make that boundary clear
+without a dialog interrupting each save; the GUI never elevates
 privileges. Home → Settings requires the **ordinary graphical UID1000 receiver
 setup in INSTALL.md**, in addition to system installation. The app-menu entry
 is the fallback. A submitted session launch is not proof a window mapped.

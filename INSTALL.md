@@ -145,8 +145,10 @@ Opening does not write; Save/Ctrl+S creates the user-owned directory/file and
 later saves atomically with a first-save backup. Invalid drafts cannot be saved.
 
 **Save writes the draft. Apply installs that draft for the daemon.** Save alone
-does not change the running Touch Bar. The persistent Save/Apply banner, Apply Instructions button, Configuration File
-menu and post-save dialog explain this contract and link to the terminal steps. Explicit `--config PATH` edits that file directly;
+does not change the running Touch Bar. The persistent Save/Apply banner,
+explicit Apply Instructions action, Configuration File menu and saved-draft toast
+explain this contract without interrupting each save with a dialog. The action
+points to the terminal steps. Explicit `--config PATH` edits that file directly;
 use it only with a writable file. `/etc` remains administrator-owned.
 
 After saving, run this separate handoff in a terminal as the desktop user:
