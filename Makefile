@@ -28,6 +28,8 @@ install: check-install-inputs
 	install -d "$(DESTDIR)/usr/share/licenses/tiny-dfr" "$(DESTDIR)/usr/share/doc/tiny-dfr"
 	install -m644 LICENSE LICENSE.material "$(DESTDIR)/usr/share/licenses/tiny-dfr/"
 	install -m644 README.md INSTALL.md LICENSE LICENSE.material "$(DESTDIR)/usr/share/doc/tiny-dfr/"
+	install -d "$(DESTDIR)/usr/share/doc/tiny-dfr/assets"
+	install -m644 assets/*.png assets/README.md "$(DESTDIR)/usr/share/doc/tiny-dfr/assets/"
 	set -e; for name in audio brightness capture now-playing viz voice; do \
 		install -Dm644 "integrations/$$name/README.md" "$(DESTDIR)/usr/share/doc/tiny-dfr/integrations/$$name/README.md"; \
 	done

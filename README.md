@@ -8,6 +8,35 @@ basic dynamic function row daemon possible" - plus a native deck and Settings
 app. The package, installed binary and workspace crates keep their inherited
 `tiny-dfr` / `dfr-*` names; "Super Touch Bar" was an earlier working name.
 
+<!-- Optional hero slot: a real desktop capture of the Touch Bar in situ (see
+assets/README.md) can replace the render below without other edits. -->
+![The shipped Home bar: volume, brightness, play/pause, F1-F12, Media, More, battery and Settings buttons](assets/deck-home.png)
+
+*The shipped Home bar, rendered headless from the pinned test frames - the real
+2008x60 output, not a mock-up.*
+
+## What it does
+
+- Volume and brightness sliders with confirmed readback, plus a battery widget
+  that cycles the system and device batteries on a tap.
+- Media transport, and a now-playing title and artist row when the desktop
+  receiver feeds it.
+- The full F1-F12 function row on demand, plus screenshot and lock keys.
+- A native GTK4/libadwaita **Touch Bar Settings** app. Save writes an
+  ordinary-user draft; a separate administrator Apply installs it.
+- An opt-in music visualizer fed by the desktop session.
+- A small touch-bar pet and a time-of-day background tint.
+- A color-theme system; theme and picker buttons are added to a bar explicitly.
+- An optional dictation profile, kept out of the default deck.
+
+The other two shipped layers:
+
+![The shipped Media bar: Home, previous, play/pause, next, now-playing, volume and Viz buttons](assets/deck-media.png)
+
+![The shipped Function bar: Home and F1-F12](assets/deck-function.png)
+
+Every item above exists in this tree; the support boundary below still applies.
+
 ## Support
 
 | | |
@@ -25,6 +54,35 @@ app whose Touch Bar launch still needs the capture receiver and a graphical user
 manager. See the complete
 [installation guide and support boundary](INSTALL.md) before installing.
 
+## Install
+
+Supported installs need an Omarchy Wayland session with a systemd user manager
+and PipeWire, the Touch Bar Mac listed above, and GTK 4.10+ / libadwaita 1.5+
+to build the Settings app (the daemon builds without them). Follow the complete
+[installation guide](INSTALL.md): it covers the build, first installation, the
+ordinary-user Settings receiver, and upgrade/rollback. Nothing here changes the
+machine until you run those commands.
+
+## Integrations
+
+The daemon and deck work on their own; these optional desktop-session receivers
+add features. Each README covers its own install and privacy boundary:
+
+- [audio](integrations/audio/README.md) - the output-volume slider.
+- [brightness](integrations/brightness/README.md) - the display-brightness slider.
+- [capture](integrations/capture/README.md) - screenshot, and the Home -> Settings
+  launch the consumer deck needs.
+- [now-playing](integrations/now-playing/README.md) - the now-playing title and
+  artist row.
+- [viz](integrations/viz/README.md) - the music-visualizer feed.
+- [voice](integrations/voice/README.md) - the optional cloud dictation profile.
+
+## Reference
+
+The rest of this file is the configuration and build reference: how to build and
+validate the daemon, the generated knob tables, the named-bar examples, the
+migration notes and the reversible installation recipe. The
+[Support](#support) boundary above still applies to all of it.
 
 ## Dependencies
 cairo, libinput, freetype, fontconfig, librsvg 2.59 or later, uinput enabled in kernel config.
