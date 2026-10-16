@@ -215,6 +215,49 @@ impl CloseGuard {
     }
 }
 
+/// Truthful Save/Apply copy shared by every UI entry point. Classification is
+/// lexical and performs no filesystem access: only the supported explicit
+/// deployed path is treated as direct editing, not arbitrary files or symlinks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveGuidance {
+    pub save_label: &'static str,
+    pub save_tooltip: &'static str,
+    pub banner: &'static str,
+    pub instructions_label: &'static str,
+    pub instructions_title: &'static str,
+    pub instructions: &'static str,
+    pub saved_message: &'static str,
+    pub close_save_label: &'static str,
+}
+
+impl SaveGuidance {
+    fn for_path(path: &Path) -> Self {
+        if path == Path::new("/etc/tiny-dfr/config.toml") {
+            Self {
+                save_label: "Save Configuration",
+                save_tooltip: "Save directly to /etc/tiny-dfr/config.toml; check daemon reload results",
+                banner: "Editing the deployed configuration directly. After saving, check daemon reload results.",
+                instructions_label: "Reload Help",
+                instructions_title: "Direct Configuration Save / Reload",
+                instructions: "Save writes directly to /etc/tiny-dfr/config.toml if your current account has permission. The daemon watches this file; no separate draft Apply is needed. Saving is not proof that the running Touch Bar reloaded successfully. Check journalctl -u tiny-dfr -b for reload results. See Native Settings, Save and Apply in /usr/share/doc/tiny-dfr/INSTALL.md for backup and rollback steps. Never run Settings with sudo. This app does not elevate privileges.",
+                saved_message: "Saved configuration — check the daemon journal for reload results",
+                close_save_label: "Save Configuration and Close",
+            }
+        } else {
+            Self {
+                save_label: "Save Draft",
+                save_tooltip: "Save a draft, not Apply to the running Touch Bar",
+                banner: "Save a draft here. The running Touch Bar changes only after administrator Apply.",
+                instructions_label: "Apply Instructions",
+                instructions_title: "Save Draft / Administrator Apply",
+                instructions: "Save writes only the file shown in Configuration File; it does not apply a user draft to the running Touch Bar. After saving, validate the draft with tiny-dfr check, then ask an administrator to back up and install it to /etc/tiny-dfr/config.toml. See Native Settings, Save and Apply in /usr/share/doc/tiny-dfr/INSTALL.md for terminal steps and rollback. Never run Settings with sudo. This app does not elevate privileges.",
+                saved_message: "Saved draft only — the running Touch Bar is unchanged; an administrator must apply it",
+                close_save_label: "Save Draft and Close",
+            }
+        }
+    }
+}
+
 /// The editing document: the base file it overlays, the user file it
 /// will install, and the overlay being edited.
 #[derive(Clone)]
@@ -264,15 +307,13 @@ impl Document {
         Ok(doc)
     }
 
-    pub fn save_message(&self) -> &'static str {
-        if self.user_path == Path::new("/etc/tiny-dfr/config.toml") {
-            "Saved configuration — check the daemon journal for reload results"
-        } else {
-            "Saved draft only — the running Touch Bar is unchanged; an administrator must apply it"
-        }
+    pub fn save_guidance(&self) -> SaveGuidance {
+        SaveGuidance::for_path(&self.user_path)
     }
 
-    pub const APPLY_GUIDANCE: &'static str = "Save writes only the file shown in Configuration File; it does not apply a user draft to the running Touch Bar. After saving, validate the draft with tiny-dfr check, then ask an administrator to back up and install it to /etc/tiny-dfr/config.toml. See Native Settings, Save and Apply in /usr/share/doc/tiny-dfr/INSTALL.md for terminal steps and rollback. Never run Settings with sudo. This app does not elevate privileges.";
+    pub fn save_message(&self) -> &'static str {
+        self.save_guidance().saved_message
+    }
 
     /// Open the document: the base file must parse; a missing or empty
     /// user file starts from an empty overlay (everything inherits the
@@ -756,6 +797,74 @@ mod tests {
         };
         let doc = Document::open(&base, &user_path).unwrap();
         (tmp, doc)
+    }
+
+    #[test]
+    fn save_guidance_distinguishes_deployed_file_from_drafts_without_io() {
+        // Pure path/copy contract: never open, save, apply, or inspect /etc.
+        let deployed = SaveGuidance::for_path(Path::new("/etc/tiny-dfr/config.toml"));
+        assert_eq!(deployed.save_label, "Save Configuration");
+        assert_eq!(deployed.close_save_label, "Save Configuration and Close");
+        assert_eq!(deployed.instructions_label, "Reload Help");
+        assert_eq!(
+            deployed.instructions_title,
+            "Direct Configuration Save / Reload"
+        );
+        for text in [
+            deployed.banner,
+            deployed.save_tooltip,
+            deployed.saved_message,
+        ] {
+            assert!(text.contains("reload results"), "{text}");
+            assert!(!text.contains("draft"), "{text}");
+            assert!(!text.contains("administrator Apply"), "{text}");
+        }
+        assert!(deployed
+            .instructions
+            .contains("no separate draft Apply is needed"));
+        assert!(deployed.instructions.contains("Saving is not proof"));
+        assert!(deployed.instructions.contains("journalctl -u tiny-dfr -b"));
+
+        let draft = SaveGuidance::for_path(Path::new("/home/example/.config/dfr-deck/config.toml"));
+        assert_eq!(draft.save_label, "Save Draft");
+        assert_eq!(draft.close_save_label, "Save Draft and Close");
+        assert_eq!(draft.instructions_label, "Apply Instructions");
+        assert_eq!(draft.instructions_title, "Save Draft / Administrator Apply");
+        assert!(draft.banner.contains("only after administrator Apply"));
+        assert!(draft.save_tooltip.contains("not Apply"));
+        assert!(draft
+            .saved_message
+            .contains("running Touch Bar is unchanged"));
+        assert!(draft.instructions.contains("tiny-dfr check"));
+        assert!(draft.instructions.contains("ask an administrator"));
+        for path in [
+            "config.toml",
+            "/tmp/config.toml",
+            "/etc/tiny-dfr/other.toml",
+        ] {
+            assert_eq!(SaveGuidance::for_path(Path::new(path)), draft);
+        }
+        for guidance in [draft, deployed] {
+            assert!(guidance
+                .instructions
+                .contains("/usr/share/doc/tiny-dfr/INSTALL.md"));
+            assert!(guidance
+                .instructions
+                .contains("Never run Settings with sudo"));
+            assert!(guidance
+                .instructions
+                .contains("does not elevate privileges"));
+        }
+    }
+
+    #[test]
+    fn document_save_guidance_follows_its_selected_path_without_saving() {
+        let (_tmp, mut doc) = document("guidance", None);
+        assert_eq!(doc.save_guidance().save_label, "Save Draft");
+        // Assign a path in memory only, not through Document::open or save.
+        doc.user_path = PathBuf::from("/etc/tiny-dfr/config.toml");
+        assert_eq!(doc.save_guidance().save_label, "Save Configuration");
+        assert_eq!(doc.save_message(), doc.save_guidance().saved_message);
     }
 
     #[test]

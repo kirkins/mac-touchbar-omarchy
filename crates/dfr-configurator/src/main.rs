@@ -132,6 +132,7 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
         .build();
     window.set_size_request(360, 420);
     let layer = doc.layer_roles().0;
+    let guidance = doc.save_guidance();
     let editor = Editor::new(doc, preview::Preview::new(&layer));
     editor.selection.borrow_mut().layer = editor
         .doc
@@ -175,8 +176,8 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
         .build();
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&switcher));
-    let save_button = gtk4::Button::with_label("Save to File");
-    save_button.set_tooltip_text(Some("Save a draft, not Apply to the running Touch Bar"));
+    let save_button = gtk4::Button::with_label(guidance.save_label);
+    save_button.set_tooltip_text(Some(guidance.save_tooltip));
     save_button.add_css_class("suggested-action");
     save_button.set_action_name(Some("win.save"));
     header.pack_end(&save_button);
@@ -232,20 +233,14 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
     error_row.append(&retry);
     error_row.append(&dismiss);
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    let apply_banner = adw::Banner::new(
-        "Save a draft here. The running Touch Bar changes only after administrator Apply.",
-    );
+    let apply_banner = adw::Banner::new(guidance.banner);
     apply_banner.set_revealed(true);
-    apply_banner.set_button_label(Some("Apply Instructions"));
+    apply_banner.set_button_label(Some(guidance.instructions_label));
     apply_banner.connect_button_clicked(glib::clone!(
         #[weak]
         window,
         move |_| {
-            ui::error_dialog(
-                &window,
-                "Save Draft / Administrator Apply",
-                model::Document::APPLY_GUIDANCE,
-            );
+            ui::error_dialog(&window, guidance.instructions_title, guidance.instructions);
         }
     ));
     body.append(&apply_banner);
@@ -439,8 +434,6 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
         #[strong]
         editor,
         #[weak]
-        window,
-        #[weak]
         toast,
         move |action, _| {
             if !action.is_enabled() {
@@ -454,12 +447,9 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
             editor.save_feedback.borrow_mut().record(result.clone());
             editor.run_pipeline();
             if result.is_ok() {
+                // The persistent banner offers instructions without interrupting
+                // every successful save with a modal dialog.
                 toast.add_toast(adw::Toast::new(editor.doc.borrow().save_message()));
-                ui::error_dialog(
-                    &window,
-                    "Saved to File — Apply Instructions",
-                    model::Document::APPLY_GUIDANCE,
-                );
             }
         }
     ));
@@ -476,14 +466,14 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
                 &format!(
                     "Editing {}.\n\n{}",
                     editor.doc.borrow().user_path().display(),
-                    model::Document::APPLY_GUIDANCE
+                    editor.doc.borrow().save_guidance().instructions
                 ),
             );
         }
     ));
     window.add_action(&file_info);
     let shortcuts = gio::SimpleAction::new("shortcut-info", None);
-    shortcuts.connect_activate(glib::clone!(#[weak] window, move |_, _| ui::error_dialog(&window,"Keyboard Shortcuts","Ctrl+S saves the valid draft. Use the arrow keys to select rows and Enter to open button properties. Alt+Left returns to the button list.")));
+    shortcuts.connect_activate(glib::clone!(#[weak] window, move |_, _| ui::error_dialog(&window,"Keyboard Shortcuts","Ctrl+S saves valid changes to the selected configuration file. Use the arrow keys to select rows and Enter to open button properties. Alt+Left returns to the button list.")));
     window.add_action(&shortcuts);
     let close_guard = Rc::new(std::cell::RefCell::new(model::CloseGuard::default()));
     window.connect_close_request(glib::clone!(
@@ -508,7 +498,7 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
             close_guard.borrow_mut().dialog_open = true;
             let dialog = adw::AlertDialog::builder()
                 .heading("Unsaved Changes")
-                .body("Save the draft, discard it, or keep editing.")
+                .body("Save changes to the selected file, discard them, or keep editing.")
                 .build();
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("discard", "Discard");
@@ -516,7 +506,7 @@ fn build_window(app: &adw::Application, doc: model::Document) -> Workspace {
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");
             if editor.doc.borrow().validate().is_empty() {
-                dialog.add_response("save", "Save Draft and Close");
+                dialog.add_response("save", guidance.close_save_label);
             }
             dialog.choose(
                 Some(window),
@@ -816,6 +806,12 @@ mod tests {
         assert!(workspace.error.is_visible());
         std::fs::remove_dir(directory.join("config.toml.tmp")).unwrap();
         workspace.save.activate(None);
+        pump(250);
+        assert!(
+            workspace.window.visible_dialog().is_none(),
+            "Save must not interrupt editing"
+        );
+        button(&workspace.window, "Apply Instructions").emit_clicked();
         assert!(until(2000, || workspace.window.visible_dialog().is_some()));
         assert!(widgets(&workspace.window.visible_dialog().unwrap())
             .into_iter()

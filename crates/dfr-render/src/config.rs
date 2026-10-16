@@ -2263,6 +2263,25 @@ Keys = [{{ Text = \"P1\" }}]\n"
                 volume,
                 background,
             );
+            // Optional review artifact from the exact pinned frame, not a
+            // second renderer or a guessed replacement digest. No output by
+            // default; the supervised gate supplies an isolated directory.
+            if let Some(dir) = std::env::var_os("DFR_DECK_REVIEW_OUTPUT") {
+                fs::create_dir_all(&dir).unwrap();
+                let horizontal =
+                    cairo::ImageSurface::create(cairo::Format::ARgb32, 2008, 60).unwrap();
+                let context = cairo::Context::new(&horizontal).unwrap();
+                context.translate(0.0, 60.0);
+                context.rotate((-90.0_f64).to_radians());
+                context.set_source_surface(&portrait, 0.0, 0.0).unwrap();
+                context.paint().unwrap();
+                horizontal
+                    .write_to_png(
+                        &mut fs::File::create(Path::new(&dir).join(format!("golden-{name}.png")))
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
             frame_hash(&mut portrait)
         };
         for (name, golden) in [
