@@ -1,0 +1,96 @@
+name: CI
+
+# Build and test every push and pull request. Pushes to any branch are
+# covered so a topic branch gets the same signal as master before a pull
+# request exists.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test (Arch Linux)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel rust pkgconf git \
+            cairo libinput freetype2 fontconfig librsvg \
+            glib2 pango gdk-pixbuf2 libdrm systemd-libs \
+            gtk4 libadwaita \
+            ttf-liberation desktop-file-utils python
+
+      - name: Report dependency versions
+        run: |
+          rustc --version
+          cargo --version
+          python3 --version
+          pkg-config --modversion gtk4 libadwaita-1 librsvg-2.0
+
+      # The daemon's shipped FontTemplate is ":bold" and the dfr-render
+      # frame digests are pinned against the face the Omarchy development
+      # machine resolves for it (Liberation Sans Bold, because the desktop
+      # fontconfig maps the generic sans-serif family to Liberation Sans).
+      # A bare archlinux container has no such mapping, so ":bold" would
+      # resolve to a different face and the pinned frames would drift.
+      # Reproduce just that mapping here so the pinned digests are checked
+      # against the same face - the test itself is unchanged.
+      - name: Pin the default sans face used by the pinned frame digests
+        run: |
+          cat > /etc/fonts/local.conf <<'EOF'
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+          <fontconfig>
+            <match target="pattern">
+              <test name="family" qual="any">
+                <string>sans-serif</string>
+              </test>
+              <edit name="family" mode="assign" binding="strong">
+                <string>Liberation Sans</string>
+              </edit>
+            </match>
+          </fontconfig>
+          EOF
+          fc-match ':bold'
+
+      # The configurator resolves icons from the fixed installed paths
+      # (dfr-render's ICON_DIRS: /etc/tiny-dfr and /usr/share/tiny-dfr),
+      # so stage the shipped assets the install route would place there.
+      - name: Stage installed assets for the fixed icon search path
+        run: |
+          install -d /usr/share/tiny-dfr
+          install -m644 share/tiny-dfr/*.toml share/tiny-dfr/*.svg /usr/share/tiny-dfr/
+
+      # Some tests assert ordinary-user permission behaviour (a read-only
+      # seed file must survive a save), so run the Rust suite as a non-root
+      # user rather than the container's default root account.
+      - name: Create the ordinary build user
+        run: |
+          useradd --create-home --shell /bin/bash builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Check formatting
+        run: su builder -c "export HOME=/home/builder CARGO_HOME=/home/builder/.cargo PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE' && cargo fmt --all -- --check"
+
+      - name: Build the workspace
+        run: su builder -c "export HOME=/home/builder CARGO_HOME=/home/builder/.cargo PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE' && cargo build --locked --workspace"
+
+      - name: Test the workspace
+        run: su builder -c "export HOME=/home/builder CARGO_HOME=/home/builder/.cargo PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE' && cargo test --locked --workspace -- --test-threads=1"
+
+      - name: Lint with clippy
+        run: su builder -c "export HOME=/home/builder CARGO_HOME=/home/builder/.cargo PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE' && cargo clippy --locked --workspace --all-targets"
+
+      # The staging tests refuse to run as root, so exercise all six as the
+      # same ordinary user against the same checked-out tree.
+      - name: Install staging tests
+        run: su builder -c "export HOME=/home/builder CARGO_HOME=/home/builder/.cargo PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE' && python3 -m unittest discover -s tests -p test_install.py"
