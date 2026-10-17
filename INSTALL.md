@@ -287,6 +287,14 @@ python3 -B -m unittest discover -s integrations/capture -v
 cargo test --locked --workspace -j1 -- --test-threads=1
 ```
 
+The `dfr-render` pinned-frame check inside `cargo test` compares exact pixels of
+the shipped deck, so it depends on font resolution: Omarchy maps the generic
+`sans-serif` family to Liberation Sans, and without that mapping (a bare
+container, or a non-Omarchy distribution) `:bold` resolves to a different face
+and the pinned digests fail even though nothing regressed. Provide that mapping,
+or Liberation Sans, before treating such a failure as real; never weaken or
+re-pin the digests. Our CI supplies the mapping.
+
 These checks do not qualify live hardware, microphone/cloud behavior or desktop
 text insertion. A device owner can separately check Home → Functions → Home,
 Home → Media → Home, Fn press/release and key release across layer/config changes.
