@@ -31,7 +31,7 @@ real 2008x60 resolution by the same code that draws the Touch Bar
 - **Battery widget** that cycles through connected device batteries and changes
   color as charge runs low.
 - **Quick keys:** Screenshot, Lock and Settings, plus any shell command you add.
-- **Color themes:** thirteen built in, custom themes, and a background that
+- **Color themes:** fourteen built in, custom themes, and a background that
   follows the time of day.
 - **A pet** - a cat or a fox - that wanders, naps and begs for food on its own
   layer.
