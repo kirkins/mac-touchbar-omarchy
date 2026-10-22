@@ -1,8 +1,8 @@
 //! The knob registry: one table describing every knob a configuration
 //! author can write - its name, type, default, constraints, and a
 //! one-line purpose. It is the single source of truth the generated
-//! README reference section renders from and the future configurator's
-//! property model. Tests pin it against the wire types in both
+//! configuration reference (docs/configuration.md) renders from and the
+//! future configurator's property model. Tests pin it against the wire types in both
 //! directions: every registered name must parse, and every field the
 //! types serialize must be registered.
 
@@ -217,14 +217,14 @@ pub fn button_knob_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// Render the README reference section: the stable, generated block the
-/// README carries between the marker comments. A test pins the README
-/// copy to this output, so the two cannot drift.
+/// Render the configuration reference: the stable, generated block
+/// docs/configuration.md carries between the marker comments. A test pins
+/// that copy to this output, so the two cannot drift.
 pub fn reference_markdown() -> String {
     let mut out = String::new();
     out.push_str("The knob registry in `crates/dfr-config/src/registry.rs` is the single\n");
     out.push_str("source of truth for this table; a test regenerates it and fails when the\n");
-    out.push_str("README copy drifts. Every knob rejects unknown siblings: a typo in a\n");
+    out.push_str("documented copy drifts. Every knob rejects unknown siblings: a typo in a\n");
     out.push_str("name rejects the candidate configuration naming the line, not a silent\n");
     out.push_str("ignore. Defaults are code-level: a stripped base file still loads.\n");
     out.push('\n');
@@ -386,17 +386,17 @@ mod tests {
 
     #[test]
     fn the_readme_reference_section_stays_in_sync() {
-        let readme = include_str!("../../../README.md");
+        let readme = include_str!("../../../docs/configuration.md");
         let begin = readme
             .find(REFERENCE_BEGIN)
-            .expect("the README carries the generated reference block");
+            .expect("docs/configuration.md carries the generated reference block");
         let end = readme.find(REFERENCE_END).expect("the block is closed");
         let body = &readme[begin + REFERENCE_BEGIN.len()..end];
         let expected = reference_markdown();
         assert_eq!(
             body.trim(),
             expected.trim(),
-            "the README reference drifted from the knob registry; regenerate it"
+            "the docs/configuration.md reference drifted from the knob registry; regenerate it"
         );
         // The reference itself renders for every knob.
         assert!(expected.contains("| `ShowButtonOutlines` |"));
