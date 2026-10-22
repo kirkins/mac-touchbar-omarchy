@@ -2427,7 +2427,10 @@ mod tests {
         // repaint, but a real regression slows them all.
         spent.sort();
         let median = spent[spent.len() / 2];
-        assert!(median < budget, "median repaint took {median:?}, budget {budget:?}");
+        assert!(
+            median < budget,
+            "median repaint took {median:?}, budget {budget:?}"
+        );
     }
 
     #[test]
