@@ -682,6 +682,8 @@ mod tests {
 
     #[test]
     fn fetch_speaks_the_wire_and_fails_closed() {
+        // The fixture receiver runs as this test process's user.
+        let uid = unsafe { libc::getuid() };
         let address = test_address("fetch");
         let (handle, ready) = script_server(
             address.clone(),
@@ -693,14 +695,14 @@ mod tests {
         );
         ready.recv().unwrap();
         assert_eq!(
-            fetch_feed(&address, 1000).unwrap(),
+            fetch_feed(&address, uid).unwrap(),
             Feed::Playing(Track {
                 title: "Wire Song".into(),
                 artist: Some("Wire Artist".into()),
             })
         );
-        assert_eq!(fetch_feed(&address, 1000).unwrap(), Feed::Idle);
-        assert_eq!(fetch_feed(&address, 1000).unwrap(), Feed::Idle);
+        assert_eq!(fetch_feed(&address, uid).unwrap(), Feed::Idle);
+        assert_eq!(fetch_feed(&address, uid).unwrap(), Feed::Idle);
         handle.join().unwrap();
     }
 

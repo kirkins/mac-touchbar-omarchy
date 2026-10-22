@@ -126,6 +126,30 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      # Match the font rendering the render tests assume (see the Arch job):
+      # Liberation Sans for sans-serif and grayscale antialiasing, since
+      # Ubuntu's subpixel default leaves colored fringes on glyph edges.
+      - name: Pin the font face and antialiasing used by the render tests
+        run: |
+          sudo tee /etc/fonts/local.conf >/dev/null <<'EOF'
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+          <fontconfig>
+            <match target="pattern">
+              <test name="family" qual="any">
+                <string>sans-serif</string>
+              </test>
+              <edit name="family" mode="assign" binding="strong">
+                <string>Liberation Sans</string>
+              </edit>
+            </match>
+            <match target="font">
+              <edit name="rgba" mode="assign"><const>none</const></edit>
+            </match>
+          </fontconfig>
+          EOF
+          fc-match ':bold'
+
       - name: Stage installed assets for the fixed icon search path
         run: |
           sudo install -d /usr/share/tiny-dfr
