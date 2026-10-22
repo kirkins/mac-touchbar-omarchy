@@ -31,15 +31,18 @@ pub struct ConfigManager {
 
 fn arm_dir_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescriptor> {
     // Watch the parent to handle both direct writes and editors' atomic renames.
+    // IN_ATTRIB catches the chmod that tools like `install` apply after
+    // writing: until then the new file can be unreadable to the daemon.
     let flags = AddWatchFlags::IN_MOVED_TO
         | AddWatchFlags::IN_MOVED_FROM
         | AddWatchFlags::IN_CLOSE_WRITE
+        | AddWatchFlags::IN_ATTRIB
         | AddWatchFlags::IN_DELETE
         | AddWatchFlags::IN_DELETE_SELF
         | AddWatchFlags::IN_MOVE_SELF;
     match inotify_fd.add_watch(user_path.parent().unwrap(), flags) {
         Ok(wd) => Some(wd),
-        Err(Errno::ENOENT) => None,
+        Err(Errno::ENOENT | Errno::EACCES) => None,
         e => Some(e.unwrap()),
     }
 }
@@ -49,7 +52,10 @@ fn arm_file_watch(inotify_fd: &Inotify, user_path: &Path) -> Option<WatchDescrip
         AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVE_SELF | AddWatchFlags::IN_DELETE_SELF;
     match inotify_fd.add_watch(user_path, flags) {
         Ok(wd) => Some(wd),
-        Err(Errno::ENOENT) => None,
+        // Missing, or briefly unreadable mid-replacement (`install` creates
+        // the file 0600 before its chmod): retry on the next pass instead of
+        // panicking; the parent watch's IN_ATTRIB brings that pass promptly.
+        Err(Errno::ENOENT | Errno::EACCES) => None,
         e => Some(e.unwrap()),
     }
 }
@@ -250,6 +256,43 @@ MediaLayerKeys = [{ Text = "Volume", Action = "VolumeUp" }]
         fs::remove_file(path).unwrap();
         assert!(manager.pending_reload());
         assert!(!manager.pending_reload());
+    }
+
+    #[test]
+    fn replacement_that_is_briefly_unreadable_reloads_once_readable() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // `install -m644 new /etc/tiny-dfr/config.toml` replaces the file,
+        // writes it 0600 and chmods it last. The daemon (not root) used to
+        // panic re-arming its watch in that window; it must wait instead.
+        let tmp = TempDir::new();
+        let base = tmp.0.join("base.toml");
+        fs::write(&base, text_only_base()).unwrap();
+        let path = tmp.0.join("config.toml");
+        fs::write(&path, NAMED).unwrap();
+        let mut manager = ConfigManager::with_paths(base, path.clone(), tmp.0.join("active-theme"));
+        let (_, mut deck) = manager.load_config(2008);
+
+        fs::remove_file(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o000)
+            .open(&path)
+            .unwrap();
+        fs::write(&path, NAMED.replace("F1", "F7")).unwrap_or(());
+        // Root reads anything, so only an ordinary user sees the window.
+        let _ = manager.update_config(2008);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&path, NAMED.replace("F1", "F7")).unwrap();
+        let (_, replacement) = manager.update_config(2008).expect("reloads once readable");
+
+        let mut events = Vec::new();
+        let mut emit = |keys: &[Key], active| events.push((keys.to_vec(), active));
+        deck.replace(replacement, &mut emit);
+        deck.switch_named("function", &mut emit);
+        deck.touch_down(0, 1, 1500.0, 30.0, &mut emit, &mut |_| {}, &mut |_| None);
+        drop(emit);
+        assert_eq!(events.last(), Some(&(vec![Key::F7], true)));
     }
 
     #[test]
