@@ -2,11 +2,10 @@
 
 `dfr-brightness` is a narrow desktop-user receiver for the built-in display.
 It accepts only `get` and `set 1..100` over its own abstract AF_UNIX socket
-`dfr-brightness-1000`. Requests cannot supply device names, paths or commands.
-The daemon verifies peer UID 1000; the receiver permits that user and `nobody`
-(65534), matching the installed audio boundary. This personal configuration
-expects desktop UID 1000 and the observed `apple-panel-bl`; adapt both client
-and receiver explicitly before using different hardware or a different UID.
+`dfr-brightness-<uid>`. Requests cannot supply device names, paths or commands.
+The daemon verifies the receiver runs as the seat's desktop user; the receiver
+permits that user and the daemon's `tiny-dfr` account (`nobody` on installs without it), matching the audio boundary. It expects the
+built-in `apple-panel-bl` display; adapt it before using different hardware.
 
 The existing keyboard path uses `omarchy-hw-display` to select `apple-panel-bl`
 and `brightnessctl` with linear percentages. Its usable minimum is 1% and its

@@ -27,7 +27,7 @@ jobs:
             cairo libinput freetype2 fontconfig librsvg \
             glib2 pango gdk-pixbuf2 libdrm systemd-libs \
             gtk4 libadwaita \
-            ttf-liberation desktop-file-utils python
+            ttf-liberation desktop-file-utils python python-dbus
 
       - name: Report dependency versions
         run: |
@@ -94,3 +94,45 @@ jobs:
       # same ordinary user against the same checked-out tree.
       - name: Install staging tests
         run: su builder -c "export HOME=/home/builder CARGO_HOME=/home/builder/.cargo PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE' && python3 -m unittest discover -s tests -p test_install.py"
+
+      # The desktop-session helpers ship their own unit tests; run each
+      # integration's suite from its own directory, as the helpers expect.
+      - name: Desktop helper tests
+        run: |
+          for helper in audio brightness capture now-playing viz voice; do
+            echo "::group::$helper"
+            su builder -c "export HOME=/home/builder PATH=/usr/bin:/bin; cd '$GITHUB_WORKSPACE/integrations/$helper' && python3 -m unittest discover -p 'test_*.py'"
+            echo "::endgroup::"
+          done
+
+  # aarch64 is the only supported architecture, so build and test natively
+  # on an Arm runner too. Ubuntu's font stack differs from the Arch image the
+  # pinned frame digests are checked against, so that one test runs above.
+  build-and-test-aarch64:
+    name: Build and test (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcairo2-dev libinput-dev libfreetype-dev \
+            libfontconfig-dev librsvg2-dev libglib2.0-dev libpango1.0-dev \
+            libgdk-pixbuf-2.0-dev libdrm-dev libudev-dev libsystemd-dev \
+            libgtk-4-dev libadwaita-1-dev fonts-liberation
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Stage installed assets for the fixed icon search path
+        run: |
+          sudo install -d /usr/share/tiny-dfr
+          sudo install -m644 share/tiny-dfr/*.toml share/tiny-dfr/*.svg /usr/share/tiny-dfr/
+
+      - name: Build the workspace
+        run: cargo build --locked --workspace
+
+      - name: Test the workspace
+        run: cargo test --locked --workspace -- --test-threads=1 --skip shipped_multibar_frames_match_the_pinned_pixel_digests

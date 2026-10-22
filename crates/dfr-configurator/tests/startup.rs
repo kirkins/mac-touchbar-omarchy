@@ -48,7 +48,7 @@ fn help_and_startup_failures_are_safe_without_a_graphical_session() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("No files were changed"), "{stderr}");
         assert!(stderr.contains("journalctl --user"), "{stderr}");
-        assert!(stderr.contains("tiny-dfr check"), "{stderr}");
+        assert!(stderr.contains("tiny-dfr-deck check"), "{stderr}");
         assert!(!stderr.contains("PRIVATE_SENTINEL"), "{stderr}");
         assert!(stderr.len() < 8192, "startup feedback must be bounded");
         assert!(!draft.exists());

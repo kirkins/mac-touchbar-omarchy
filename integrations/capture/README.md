@@ -8,8 +8,8 @@ only the operator subsequently enables the user unit.
 
 ## Requirements and setup
 
-The supplied route supports graphical desktop **UID 1000**, daemon `nobody`
-UID 65534, Python 3.11+, a systemd user manager / `systemd-run`, and the installed
+The supplied route needs the seat's graphical desktop user, the daemon's
+`tiny-dfr` account, Python 3.11+, a systemd user manager / `systemd-run`, and the installed
 native GTK4/libadwaita app and runtime libraries. `notify-send` is recommended
 for bounded failure notifications. Settings does not require Omarchy or audio.
 Screenshot separately requires `omarchy capture screenshot` and its `grim`,
@@ -19,7 +19,6 @@ After reviewing/staging/building and system installation per INSTALL.md, run
 from the reviewed checkout **as the ordinary desktop user, never sudo**:
 
 ```sh
-id -u # supplied client/daemon require desktop UID 1000
 make install-user-session USER_HOME="$HOME"
 systemctl --user daemon-reload
 systemctl --user enable --now touchbar-capture.service
@@ -60,14 +59,14 @@ user-manager access. Do not loosen them. A Linux abstract AF_UNIX socket named
 `dfr-capture-<desktop UID>` crosses that boundary without making the desktop's
 0700 runtime directory public.
 
-The receiver authenticates `SO_PEERCRED` against its own UID and UID 65534, and
+The receiver authenticates `SO_PEERCRED` against its own UID and the daemon's `tiny-dfr` account (`nobody` on installs without it), and
 the client verifies the receiver UID. Other processes with either allowed UID
 can invoke these two fixed actions; this is the explicit local trust boundary.
 Only `screenshot` and `settings` are accepted; wire bytes are never executed as
 commands or arguments. Settings selects exactly:
 
 ```text
-systemd-run --user --collect --quiet --property=Type=exec /usr/local/bin/dfr-configurator
+systemd-run --user --collect --quiet --property=Type=exec <dfr-configurator on PATH>
 ```
 
 `Type=exec` catches executable-launch failures, **not GTK readiness or a mapped
@@ -89,11 +88,11 @@ reported. Neither its submission nor an exit code is proof of a completed image.
   `journalctl --user -u touchbar-capture.service -b` and `journalctl --user -b`
   for transient app/runtime/display failures. If no window appears, open **Touch
   Bar Settings** from the application menu or run
-  `/usr/local/bin/dfr-configurator` in the ordinary user's graphical terminal.
+  `dfr-configurator` in the ordinary user's graphical terminal.
 - Unreadable/invalid base or draft: the native app shows a safe, bounded error
   window when GTK can initialize, otherwise session-journal guidance. It changes
   no files and does not quote configuration contents. Back up/repair the file;
-  run `tiny-dfr check --base BASE DRAFT` in a private terminal for detailed
+  run `tiny-dfr-deck check --base BASE DRAFT` in a private terminal for detailed
   diagnostics. Never run the GUI with sudo.
 
 There is no success notification pretending a submitted launch mapped. The

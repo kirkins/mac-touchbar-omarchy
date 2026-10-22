@@ -55,7 +55,7 @@ arguments and travels to curl through a temporary mode-0600 header file.
 
 First use the [complete daemon/Settings installation guide](../../INSTALL.md).
 Preserve previous helper/unit/client/drop-in files before an upgrade. From the
-repository root, as desktop UID **1000**:
+repository root, as the desktop user:
 
 ```sh
 install -Dm755 integrations/voice/voice-dictate "$HOME/.local/bin/voice-dictate"
@@ -69,7 +69,7 @@ sudo systemctl daemon-reload
 
 The consumer `multibar.toml` has **no Mic/Stop/Cancel or recording layer**.
 After this deliberate optional setup and privacy review, back up the installed
-overlay, validate `/usr/share/tiny-dfr/multibar-voice.toml` with `tiny-dfr check`,
+overlay, validate `share/tiny-dfr-deck/multibar-voice.toml` (under the install prefix) with `tiny-dfr-deck check`,
 and have an administrator select that profile using the Apply procedure in
 [INSTALL.md](../../INSTALL.md), preserving custom settings. Its Mic/Stop/Cancel
 actions select this client; Settings remains in More. Merely installing the
@@ -78,16 +78,16 @@ profile asset does not select it or start recording. Restart only
 for the deck, Settings, Pet or themes. The user manager must already contain the
 current `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`.
 
-The client and daemon level reader pin desktop UID 1000; receivers derive their
-own UID. A different desktop UID requires coordinated source adaptation and
-qualification, not merely a service edit. The daemon remains nobody/65534 and
-cannot access the user's home or runtime sockets. This integration keeps the
+The client and daemon level reader follow the seat's active desktop user
+(override with `TINY_DFR_DESKTOP_UID`, see INSTALL.md); receivers derive their
+own UID. The daemon runs as its `tiny-dfr` account and cannot access the
+user's home or runtime sockets. This integration keeps the
 existing `ProtectHome`, `PrivateTmp`, `NoNewPrivileges` and AF_UNIX/AF_NETLINK
-restrictions. It uses no privileged launcher or environment import into nobody.
+restrictions. It uses no privileged launcher or environment import into the daemon.
 
 The receiver's Linux abstract AF_UNIX socket `dfr-voice-<desktop UID>` accepts
 only `start`, `stop`, `cancel` and authenticates `SO_PEERCRED` against its own
-UID and 65534. The client verifies the receiver UID. Other processes with either
+UID and the daemon's `tiny-dfr` account (`nobody` on installs without it). The client verifies the receiver UID. Other processes with either
 allowed UID can invoke those actions: this existing local trust boundary is
 unchanged. Requests supply no shell commands. A second authenticated socket,
 `dfr-voice-level-<desktop UID>`, serves only `get` with `ok <0-100>` or `idle`.
@@ -114,7 +114,7 @@ python3 -B -m unittest discover -s integrations/voice -p 'test_*.py' -v
 Missing/invalid credential tests assert that no capture/upload/insertion occurs;
 Cancel tests assert no request or typing; request/HTTP/JSON/insertion failures
 are exercised through mocks. A same-user test does not qualify the deployed
-nobody namespace, hardware, compositor or provider.
+daemon account's namespace, hardware, compositor or provider.
 
 Live voice acceptance is a separate deliberate operator action after credential
 setup and disclosure review, never part of installation/offline tests. Focus a

@@ -239,7 +239,7 @@ impl SaveGuidance {
                 banner: "Editing the deployed configuration directly. After saving, check daemon reload results.",
                 instructions_label: "Reload Help",
                 instructions_title: "Direct Configuration Save / Reload",
-                instructions: "Save writes directly to /etc/tiny-dfr/config.toml if your current account has permission. The daemon watches this file; no separate draft Apply is needed. Saving is not proof that the running Touch Bar reloaded successfully. Check journalctl -u tiny-dfr -b for reload results. See Native Settings, Save and Apply in /usr/share/doc/tiny-dfr/INSTALL.md for backup and rollback steps. Never run Settings with sudo. This app does not elevate privileges.",
+                instructions: "Save writes directly to /etc/tiny-dfr/config.toml if your current account has permission. The daemon watches this file; no separate draft Apply is needed. Saving is not proof that the running Touch Bar reloaded successfully. Check journalctl -u tiny-dfr -b for reload results. See Native Settings, Save and Apply in INSTALL.md (https://github.com/kirkins/mac-touchbar-omarchy) for backup and rollback steps. Never run Settings with sudo. This app does not elevate privileges.",
                 saved_message: "Saved configuration — check the daemon journal for reload results",
                 close_save_label: "Save Configuration and Close",
             }
@@ -250,7 +250,7 @@ impl SaveGuidance {
                 banner: "Save a draft here. The running Touch Bar changes only after administrator Apply.",
                 instructions_label: "Apply Instructions",
                 instructions_title: "Save Draft / Administrator Apply",
-                instructions: "Save writes only the file shown in Configuration File; it does not apply a user draft to the running Touch Bar. After saving, validate the draft with tiny-dfr check, then ask an administrator to back up and install it to /etc/tiny-dfr/config.toml. See Native Settings, Save and Apply in /usr/share/doc/tiny-dfr/INSTALL.md for terminal steps and rollback. Never run Settings with sudo. This app does not elevate privileges.",
+                instructions: "Save writes only the file shown in Configuration File; it does not apply a user draft to the running Touch Bar. After saving, validate the draft with tiny-dfr-deck check, then ask an administrator to back up and install it to /etc/tiny-dfr/config.toml. See Native Settings, Save and Apply in INSTALL.md (https://github.com/kirkins/mac-touchbar-omarchy) for terminal steps and rollback. Never run Settings with sudo. This app does not elevate privileges.",
                 saved_message: "Saved draft only — the running Touch Bar is unchanged; an administrator must apply it",
                 close_save_label: "Save Draft and Close",
             }
@@ -835,7 +835,7 @@ mod tests {
         assert!(draft
             .saved_message
             .contains("running Touch Bar is unchanged"));
-        assert!(draft.instructions.contains("tiny-dfr check"));
+        assert!(draft.instructions.contains("tiny-dfr-deck check"));
         assert!(draft.instructions.contains("ask an administrator"));
         for path in [
             "config.toml",
@@ -845,9 +845,7 @@ mod tests {
             assert_eq!(SaveGuidance::for_path(Path::new(path)), draft);
         }
         for guidance in [draft, deployed] {
-            assert!(guidance
-                .instructions
-                .contains("/usr/share/doc/tiny-dfr/INSTALL.md"));
+            assert!(guidance.instructions.contains("INSTALL.md"));
             assert!(guidance
                 .instructions
                 .contains("Never run Settings with sudo"));

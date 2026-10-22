@@ -61,7 +61,7 @@ impl Problem {
     pub fn options() -> Self {
         Self {
             heading: "Cannot start Touch Bar Settings",
-            body: "Invalid launch options or no absolute HOME. Run dfr-configurator --help in a terminal. Launch Settings as the ordinary graphical desktop user, never with sudo. See /usr/share/doc/tiny-dfr/INSTALL.md.",
+            body: "Invalid launch options or no absolute HOME. Run dfr-configurator --help in a terminal. Launch Settings as the ordinary graphical desktop user, never with sudo. See INSTALL.md (https://github.com/kirkins/mac-touchbar-omarchy).",
         }
     }
 }
@@ -78,7 +78,7 @@ pub fn open_document(
     };
     result.map_err(|_| Problem {
         heading: "Cannot open Touch Bar Settings",
-        body: "The base configuration or selected draft could not be read or parsed, or the full-deck example is missing. No files were changed. Check the base (--base; default /usr/share/tiny-dfr/config.toml) and draft (--config; default $XDG_CONFIG_HOME/dfr-deck/config.toml or $HOME/.config/dfr-deck/config.toml). If there is no draft, check /etc/tiny-dfr/config.toml and /usr/share/tiny-dfr/multibar.toml. Back up an invalid draft before repairing it; do not delete it blindly. Use tiny-dfr check --base BASE DRAFT in a private terminal for detailed diagnostics. For installation and administrator repair steps see /usr/share/doc/tiny-dfr/INSTALL.md; journalctl --user -b contains session launch failures.",
+        body: "The base configuration or selected draft could not be read or parsed, or the full-deck example is missing. No files were changed. Check the base (--base; default /usr/share/tiny-dfr/config.toml) and draft (--config; default $XDG_CONFIG_HOME/dfr-deck/config.toml or $HOME/.config/dfr-deck/config.toml). If there is no draft, check /etc/tiny-dfr/config.toml and the installed example share/tiny-dfr-deck/multibar.toml. Back up an invalid draft before repairing it; do not delete it blindly. Use tiny-dfr-deck check --base BASE DRAFT in a private terminal for detailed diagnostics. For installation and administrator repair steps see INSTALL.md (https://github.com/kirkins/mac-touchbar-omarchy); journalctl --user -b contains session launch failures.",
     })
 }
 
@@ -109,7 +109,7 @@ mod tests {
             let problem = open_document(&options, &seed, &seed).err().unwrap();
             assert!(!problem.body.contains("PRIVATE_SENTINEL"));
             assert!(problem.body.len() < 1200);
-            assert!(problem.body.contains("tiny-dfr check"));
+            assert!(problem.body.contains("tiny-dfr-deck check"));
             std::fs::write(path, include_str!("../../../share/tiny-dfr/config.toml")).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();

@@ -1,0 +1,48 @@
+# Maintainer: Philip Kirkbride <kirkins@gmail.com>
+#
+# Installs the deck beside Asahi's tiny-dfr package (which stays installed):
+# the daemon goes to /usr/libexec and a systemd drop-in points the packaged
+# tiny-dfr.service at it. Removing this package restores stock tiny-dfr.
+pkgname=tiny-dfr-deck
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Dynamic Touch Bar deck for the Apple Silicon MacBook Pro 13-inch on Omarchy, built on tiny-dfr"
+arch=('aarch64')
+url="https://github.com/kirkins/mac-touchbar-omarchy"
+license=('MIT' 'Apache-2.0')
+depends=('tiny-dfr' 'cairo' 'libinput' 'freetype2' 'fontconfig' 'librsvg' 'glib2'
+         'pango' 'gdk-pixbuf2' 'libdrm' 'systemd-libs' 'gtk4' 'libadwaita' 'python')
+makedepends=('cargo' 'git')
+optdepends=('python-dbus: now-playing helper'
+            'pipewire: visualizer and voice helpers (pw-record)'
+            'libpulse: volume helper (pactl)'
+            'brightnessctl: brightness helper'
+            'libnotify: Settings-launch error notifications')
+install=tiny-dfr-deck.install
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  cd mac-touchbar-omarchy
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd mac-touchbar-omarchy
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release --workspace
+}
+
+package() {
+  cd mac-touchbar-omarchy
+  make install DESTDIR="$pkgdir" BINARY_DIR=target/release SEED_CONFIG=0 \
+    PREFIX=/usr UNITDIR=/usr/lib/systemd/system SYSUSERSDIR=/usr/lib/sysusers.d
+  # The desktop-session helpers are per-user; tiny-dfr-deck-user-setup copies them.
+  install -Dm755 integrations/user-setup "$pkgdir/usr/bin/tiny-dfr-deck-user-setup"
+  for dir in capture audio brightness now-playing viz voice; do
+    install -d "$pkgdir/usr/share/tiny-dfr-deck/integrations/$dir"
+    find "integrations/$dir" -maxdepth 1 -type f ! -name 'test_*' \
+      -exec cp -p -t "$pkgdir/usr/share/tiny-dfr-deck/integrations/$dir" {} +
+  done
+}

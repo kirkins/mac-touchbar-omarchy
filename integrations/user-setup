@@ -1,0 +1,51 @@
+#!/bin/sh
+# Copy (or remove) the Touch Bar deck's desktop-session helpers for one user:
+# every helper except voice dictation, which needs an API key and is set up
+# on its own (voice/README.md). Never overwrites an existing helper or unit,
+# and never enables or starts anything.
+#
+# usage: user-setup install|uninstall
+# USER_HOME (default $HOME) and DESTDIR (default empty) allow staging.
+set -eu
+
+HELPERS="touchbar-capture:capture dfr-volume:audio dfr-brightness:brightness dfr-now-playing:now-playing dfr-viz:viz"
+UNITS="touchbar-capture dfr-volume dfr-brightness dfr-now-playing dfr-viz"
+
+here=$(cd "$(dirname "$0")" && pwd)
+if [ -d "$here/capture" ]; then source_dir=$here; else source_dir=/usr/share/tiny-dfr-deck/integrations; fi
+home=${USER_HOME:-$HOME}
+bin=${DESTDIR:-}$home/.local/bin
+units=${DESTDIR:-}$home/.config/systemd/user
+
+if [ "$(id -u)" = 0 ]; then echo "Run this as the desktop user, not root." >&2; exit 1; fi
+case "$home" in /*) ;; *) echo "USER_HOME must be an absolute path." >&2; exit 1;; esac
+case "$home/" in /|*//*|*/../*|*/./*) echo "USER_HOME must be a normalized, non-root home path." >&2; exit 1;; esac
+
+case "${1:-}" in
+install)
+    for helper in $HELPERS; do
+        name=${helper%%:*}
+        for path in "$bin/$name" "$units/$name.service"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then echo "Refusing to overwrite $path" >&2; exit 1; fi
+        done
+    done
+    for helper in $HELPERS; do
+        name=${helper%%:*}
+        directory=${helper##*:}
+        install -Dm755 "$source_dir/$directory/$name" "$bin/$name"
+        install -Dm644 "$source_dir/$directory/$name.service" "$units/$name.service"
+    done
+    echo "Copied. Enable with: systemctl --user daemon-reload && systemctl --user enable --now $UNITS"
+    ;;
+uninstall)
+    for helper in $HELPERS; do
+        name=${helper%%:*}
+        rm -f "$bin/$name" "$units/$name.service"
+    done
+    echo "Removed. Stop running copies with: systemctl --user daemon-reload && systemctl --user stop $UNITS"
+    ;;
+*)
+    echo "usage: $0 install|uninstall" >&2
+    exit 2
+    ;;
+esac

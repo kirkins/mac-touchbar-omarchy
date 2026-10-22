@@ -1,15 +1,14 @@
 # Touch Bar output volume
 
 `dfr-volume` runs in the desktop user's session. The Touch Bar daemon sends
-bounded requests over the abstract AF_UNIX socket `dfr-volume-1000`, verifies
-the receiver's kernel peer UID is 1000, and reads back the output percentage and
-mute state. This follows the installed voice integration's desktop UID boundary
-without connecting to its socket or modifying its files. This personal setup
-expects the desktop UID 1000; a different UID requires matching client/source
-configuration before deployment.
+bounded requests over the abstract AF_UNIX socket `dfr-volume-<uid>` of the
+seat's active desktop user, verifies the receiver's kernel peer UID matches, and
+reads back the output percentage and mute state. This follows the voice
+integration's desktop-user boundary without connecting to its socket or
+modifying its files.
 
 The receiver binds its own UID's abstract socket and accepts only that UID or
-`nobody` (65534). It serializes a finite `get`, `set 0..130` protocol; callers cannot supply commands, sink names
+the daemon's `tiny-dfr` account (`nobody` on installs without it). It serializes a finite `get`, `set 0..130` protocol; callers cannot supply commands, sink names
 or paths. It resolves each
 operation's active output with `omarchy-audio-output-sink`, writes an absolute
 percentage with `pactl`, and returns mixer readback. Both channels become zero
@@ -19,7 +18,7 @@ keyboard helper. The existing 130% helper remains unchanged.
 The optional user service requires Python3, PipeWire's PulseAudio tools and the
 installed Omarchy sink resolver. It starts with the graphical session, runs as
 the desktop user and retains `NoNewPrivileges=yes`. The Touch Bar system unit,
-root-owned binary, `nobody` execution, private home/tmp and AF_UNIX/NETLINK policy
+root-owned binary, `tiny-dfr` execution, private home/tmp and AF_UNIX/NETLINK policy
 do not need changes. The new service includes the packaged Omarchy bin directory
 in its own PATH, so it does not depend on an interactive shell profile.
 

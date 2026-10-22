@@ -157,7 +157,7 @@ fn main() {
 /// 1 diagnostics printed, 2 usage error.
 fn run_check(args: &[String]) -> i32 {
     let usage = || {
-        eprintln!("usage: tiny-dfr check [--base PATH] [--icon-root DIR] [--width N] [FILE]");
+        eprintln!("usage: tiny-dfr-deck check [--base PATH] [--icon-root DIR] [--width N] [FILE]");
         eprintln!("  FILE defaults to /etc/tiny-dfr/config.toml, validated over the base config");
         eprintln!(
             "  --base overrides the base configuration (default /usr/share/tiny-dfr/config.toml)"

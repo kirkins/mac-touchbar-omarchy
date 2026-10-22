@@ -32,7 +32,7 @@ never leave a stale track behind.
 
 The daemon dials the abstract socket `dfr-now-playing-<uid>` with
 one-shot requests, verifying the receiver's kernel peer UID (the
-receiver accepts only its own UID and `nobody`, 65534):
+receiver accepts only its own UID and the daemon's `tiny-dfr` account (`nobody` on installs without it)):
 
 - `get` - current track. Replies `ok <state>\x1f<title>\x1f<artist>`
   with state `playing`, `paused`, or `stopped` (either text may be
@@ -63,7 +63,7 @@ Omarchy bin directory). Enable the user service, then add the media
 bar's `NowPlaying = true` button (see `share/tiny-dfr/multibar.toml`).
 The receiver needs `python-dbus` in the desktop session. No other
 client, receiver, helper, or unit replacement is required, and the
-Touch Bar system unit, `nobody` execution, and AF_UNIX policy are
+Touch Bar system unit, `tiny-dfr` execution, and AF_UNIX policy are
 unchanged. These are deployment instructions, not authorization to
 install during review.
 

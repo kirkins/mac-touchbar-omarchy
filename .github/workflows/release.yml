@@ -1,0 +1,55 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish a GitHub release with an aarch64 build:
+# the source tree plus prebuilt binaries, installed with
+#   sudo make install BINARY_DIR=bin
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build aarch64 release
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcairo2-dev libinput-dev libfreetype-dev \
+            libfontconfig-dev librsvg2-dev libglib2.0-dev libpango1.0-dev \
+            libgdk-pixbuf-2.0-dev libdrm-dev libudev-dev libsystemd-dev \
+            libgtk-4-dev libadwaita-1-dev
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Check the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME != Cargo.toml version $version" >&2; exit 1; }
+
+      - name: Build release binaries
+        run: cargo build --locked --workspace --release
+
+      - name: Assemble the release tarball
+        run: |
+          name=tiny-dfr-deck-${GITHUB_REF_NAME#v}-aarch64
+          git archive --format=tar --prefix="$name/" HEAD | tar -x
+          install -Dm755 target/release/tiny-dfr "$name/bin/tiny-dfr"
+          install -Dm755 target/release/dfr-configurator "$name/bin/dfr-configurator"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2.0.8
+        with:
+          files: |
+            tiny-dfr-deck-*-aarch64.tar.gz
+            tiny-dfr-deck-*-aarch64.tar.gz.sha256
+          generate_release_notes: true

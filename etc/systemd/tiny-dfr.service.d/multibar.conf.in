@@ -1,0 +1,14 @@
+# Installed by tiny-dfr-deck. Runs the deck daemon in place of the packaged
+# tiny-dfr binary; the distribution's unit, udev rules and icons stay as they
+# are, so removing this file (and running `systemctl daemon-reload`) restores
+# stock tiny-dfr.
+[Service]
+ExecStart=
+ExecStart=@DAEMON@
+# The daemon remembers the theme chosen on the glass here: prepare the one
+# writable directory ProtectSystem=strict otherwise denies, owned by the
+# dedicated account the daemon drops to (see sysusers.d/tiny-dfr-deck.conf).
+ExecStartPre=-/usr/bin/install -d -o tiny-dfr -g tiny-dfr -m 0755 /var/lib/tiny-dfr
+ReadWritePaths=/var/lib/tiny-dfr
+# The desktop helpers run as the seat's active user. To pin one instead:
+#Environment=TINY_DFR_DESKTOP_UID=1000

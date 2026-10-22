@@ -29,7 +29,7 @@ dynamics visible). `DFR_VIZ_SINK` overrides the sink choice for testing.
 
 The daemon dials the abstract socket `dfr-viz-<uid>` with one-shot
 requests, verifying the receiver's kernel peer UID (the receiver accepts
-only its own UID and `nobody`, 65534):
+only its own UID and the daemon's `tiny-dfr` account (`nobody` on installs without it)):
 
 - `on` - start the monitor capture (reply `ok`, or `error` when no sink
   can be resolved or the capture cannot run)
@@ -76,7 +76,7 @@ as 0755 and `dfr-viz.service` to their user systemd directory as 0644
 the user service with the scoped deployment, then add the media bar's
 `Visualizer = true` button (see `share/tiny-dfr/multibar.toml`). No voice
 client, receiver, helper, or unit replacement is required, and the Touch
-Bar system unit, `nobody` execution, and AF_UNIX policy are unchanged.
+Bar system unit, `tiny-dfr` execution, and AF_UNIX policy are unchanged.
 These are deployment instructions, not authorization to install during
 review.
 

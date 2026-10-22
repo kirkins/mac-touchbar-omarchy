@@ -1,0 +1,17 @@
+post_install() {
+  if [ ! -e /etc/tiny-dfr/config.toml ]; then
+    install -Dm644 /usr/share/tiny-dfr-deck/multibar.toml /etc/tiny-dfr/config.toml
+  fi
+  echo ":: Restart the Touch Bar to switch to the deck: systemctl restart tiny-dfr.service"
+  echo ":: Then, as your desktop user, set up the session helpers:"
+  echo "     tiny-dfr-deck-user-setup install"
+}
+
+post_upgrade() {
+  echo ":: Restart the Touch Bar to load the new daemon: systemctl restart tiny-dfr.service"
+}
+
+post_remove() {
+  echo ":: Stock tiny-dfr takes over after: systemctl restart tiny-dfr.service"
+  echo ":: /etc/tiny-dfr/config.toml and /var/lib/tiny-dfr were kept."
+}

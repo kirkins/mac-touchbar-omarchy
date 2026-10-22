@@ -1,0 +1,7 @@
+# Map every identity used for this fork's commits to one canonical author.
+Philip Kirkbride <kirkins@gmail.com> philip <philip@lobbykit.net>
+Philip Kirkbride <kirkins@gmail.com> <philip@lobbykit.net>
+# Commits made by the author's own coding agents.
+Philip Kirkbride <kirkins@gmail.com> ChatGPT Forgejo Bot <chatgpt-bot@lobbykit.invalid>
+Philip Kirkbride <kirkins@gmail.com> firstmate-crew <crew@firstmate.local>
+Philip Kirkbride <kirkins@gmail.com> workstation <workstation@privateer.local>

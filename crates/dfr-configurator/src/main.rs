@@ -24,6 +24,22 @@ use std::time::Duration;
 
 const APP_ID: &str = "org.dfrdeck.Configurator";
 
+/// Where the full-deck example is installed: the deck's data directory under
+/// either install prefix, or the location older installs used.
+const EXAMPLE_DECKS: &[&str] = &[
+    "/usr/share/tiny-dfr-deck/multibar.toml",
+    "/usr/local/share/tiny-dfr-deck/multibar.toml",
+    "/usr/share/tiny-dfr/multibar.toml",
+];
+
+fn example_deck() -> PathBuf {
+    EXAMPLE_DECKS
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(EXAMPLE_DECKS[0]))
+}
+
 fn main() -> anyhow::Result<()> {
     let options = startup::parse(
         std::env::args().skip(1),
@@ -35,14 +51,14 @@ fn main() -> anyhow::Result<()> {
                   --config edits that file directly; by default Settings saves a user draft\n\
                   at $XDG_CONFIG_HOME/dfr-deck/config.toml (or $HOME/.config/dfr-deck/config.toml)\n\
                   --base defaults to /usr/share/tiny-dfr/config.toml\n\
-                  Apply saved drafts with the administrator steps in /usr/share/doc/tiny-dfr/INSTALL.md");
+                  Apply saved drafts with the administrator steps in INSTALL.md (https://github.com/kirkins/mac-touchbar-omarchy)");
         return Ok(());
     };
     let document = match options {
         Ok(Some(options)) => startup::open_document(
             &options,
             Path::new("/etc/tiny-dfr/config.toml"),
-            Path::new("/usr/share/tiny-dfr/multibar.toml"),
+            &example_deck(),
         ),
         _ => Err(startup::Problem::options()),
     };
@@ -50,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     if let Err(problem) = &document {
         eprintln!("{}: {}", problem.heading, problem.body);
     }
-    adw::init().map_err(|_| anyhow::anyhow!("Cannot initialize Touch Bar Settings. Launch from the graphical desktop as its ordinary user; check the user-manager display/session environment and journalctl --user -b. See /usr/share/doc/tiny-dfr/INSTALL.md. No files changed."))?;
+    adw::init().map_err(|_| anyhow::anyhow!("Cannot initialize Touch Bar Settings. Launch from the graphical desktop as its ordinary user; check the user-manager display/session environment and journalctl --user -b. See INSTALL.md (https://github.com/kirkins/mac-touchbar-omarchy). No files changed."))?;
     let app = adw::Application::builder().application_id(APP_ID).build();
     let document = std::cell::RefCell::new(Some(document));
     app.connect_activate(move |app| {
