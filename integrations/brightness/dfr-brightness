@@ -1,10 +1,21 @@
 #!/usr/bin/python3
 """Finite display-only brightness adapter using the existing desktop interface."""
 import os
+import pwd
 import re
 import socket
 import struct
 import subprocess
+
+
+def daemon_uid():
+    """UID of the Touch Bar daemon's account: the dedicated `tiny-dfr` user
+    the install creates, or `nobody` (65534) on installs that predate it."""
+    try:
+        return pwd.getpwnam("tiny-dfr").pw_uid
+    except KeyError:
+        return 65534
+
 
 DEVICE = "apple-panel-bl"
 MIN_PERCENT = 1
@@ -71,7 +82,7 @@ def serve():
             connection, _ = listener.accept()
             with connection:
                 try:
-                    handle(connection, backlight, {uid, 65534})
+                    handle(connection, backlight, {uid, daemon_uid()})
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     print(f"Brightness handoff failed: {error}", flush=True)
                     try:

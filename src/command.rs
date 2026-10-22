@@ -78,7 +78,7 @@ impl CommandRunner {
 // Fixed guidance only: never pipe arbitrary command stderr/configuration into logs.
 fn handoff_failure_guidance(command: &str) -> Option<&'static str> {
     matches!(command, "touchbar-capture-user settings" | "touchbar-capture-user screenshot")
-        .then_some("Desktop handoff failed: verify the UID1000 graphical receiver with systemctl --user status touchbar-capture.service and journalctl --user -u touchbar-capture.service -b as the desktop user. Open Touch Bar Settings from the application menu or /usr/local/bin/dfr-configurator. Complete user-session setup in /usr/share/doc/tiny-dfr/INSTALL.md. A submitted launch is not proof of a mapped window.")
+        .then_some("Desktop handoff failed: as the desktop user, check systemctl --user status touchbar-capture.service and journalctl --user -u touchbar-capture.service -b. Settings also opens from the application menu or by running dfr-configurator. See INSTALL.md (Desktop helpers) for the user-session setup.")
 }
 
 #[cfg(test)]
@@ -118,7 +118,7 @@ mod tests {
         let guidance = handoff_failure_guidance("touchbar-capture-user settings").unwrap();
         assert!(guidance.contains("application menu"));
         assert!(guidance.contains("journalctl --user"));
-        assert!(guidance.contains("not proof"));
+        assert!(guidance.contains("dfr-configurator"));
         assert!(handoff_failure_guidance("arbitrary-secret-command").is_none());
     }
 

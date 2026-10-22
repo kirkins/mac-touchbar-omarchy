@@ -3,12 +3,32 @@
 
 import argparse
 import json
+import os
 import socket
 import struct
 import sys
 
 
-def request(action, uid=1000, address=None):
+def desktop_uid():
+    """The desktop user whose session helper to call: TINY_DFR_DESKTOP_UID if
+    set, else seat0's active user as logind records it, else UID 1000."""
+    override = os.environ.get("TINY_DFR_DESKTOP_UID", "").strip()
+    if override.isdigit():
+        return int(override)
+    try:
+        with open("/run/systemd/seats/seat0") as seat:
+            for line in seat:
+                if line.startswith("ACTIVE_UID="):
+                    uid = int(line.split("=", 1)[1])
+                    if uid:
+                        return uid
+    except (OSError, ValueError):
+        pass
+    return 1000
+
+
+def request(action, uid=None, address=None):
+    uid = desktop_uid() if uid is None else uid
     if action not in ("screenshot", "settings"):
         raise ValueError("Invalid action")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -16,7 +36,7 @@ def request(action, uid=1000, address=None):
         try:
             connection.connect(address or "\0dfr-capture-" + str(uid))
         except OSError as error:
-            raise OSError("Desktop receiver unavailable. As graphical UID 1000, complete the user-session setup and check systemctl --user status touchbar-capture.service. For Settings use the application menu or /usr/local/bin/dfr-configurator; see /usr/share/doc/tiny-dfr/INSTALL.md") from error
+            raise OSError("Desktop receiver unavailable. As the desktop user, complete the user-session setup and check systemctl --user status touchbar-capture.service. For Settings use the application menu or run dfr-configurator; see INSTALL.md (Desktop helpers)") from error
         _, peer_uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if peer_uid != uid:
             raise ValueError("Unexpected desktop receiver UID")

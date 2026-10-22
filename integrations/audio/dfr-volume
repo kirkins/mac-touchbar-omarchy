@@ -1,10 +1,21 @@
 #!/usr/bin/python3
 """Narrow desktop-session receiver for the Touch Bar output-volume slider."""
 import os
+import pwd
 import re
 import socket
 import struct
 import subprocess
+
+
+def daemon_uid():
+    """UID of the Touch Bar daemon's account: the dedicated `tiny-dfr` user
+    the install creates, or `nobody` (65534) on installs that predate it."""
+    try:
+        return pwd.getpwnam("tiny-dfr").pw_uid
+    except KeyError:
+        return 65534
+
 
 MAX_PERCENT = 130
 
@@ -75,7 +86,7 @@ def serve():
             connection, _ = listener.accept()
             with connection:
                 try:
-                    handle(connection, mixer, {uid, 65534})
+                    handle(connection, mixer, {uid, daemon_uid()})
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     print(f"Volume handoff failed: {error}", flush=True)
                     try:

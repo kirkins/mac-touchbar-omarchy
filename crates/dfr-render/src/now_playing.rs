@@ -37,13 +37,13 @@
 //! and cap lengths. Only `playing` ever draws a track.
 
 use crate::appearance::LABEL_FONT;
+use crate::desktop::Endpoint;
 use cairo::Context;
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
     os::{
         fd::AsRawFd,
-        linux::net::SocketAddrExt,
         unix::net::{SocketAddr, UnixStream},
     },
     sync::{
@@ -209,14 +209,13 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    /// Connect to the installed desktop receiver (UID 1000), mirroring
-    /// the volume, brightness, voice, and visualizer endpoints.
+    /// Connect to the desktop user's receiver, mirroring the volume,
+    /// brightness, voice, and visualizer endpoints.
     pub fn client() -> Self {
-        let address = SocketAddr::from_abstract_name(b"dfr-now-playing-1000").unwrap();
-        Self::connect_to(address, 1000)
+        Self::connect_to(Endpoint::Desktop("dfr-now-playing"))
     }
 
-    fn connect_to(address: SocketAddr, uid: u32) -> Self {
+    fn connect_to(endpoint: Endpoint) -> Self {
         let arm = Arc::new(Arm {
             armed: Mutex::new(false),
             signal: Condvar::new(),
@@ -226,9 +225,7 @@ impl NowPlaying {
         wake.set_nonblocking(true).unwrap();
         notify.set_nonblocking(true).unwrap();
         let poller_arm = Arc::clone(&arm);
-        thread::spawn(move || {
-            now_playing_poller(address, uid, &poller_arm, &outgoing, &mut notify)
-        });
+        thread::spawn(move || now_playing_poller(endpoint, &poller_arm, &outgoing, &mut notify));
         Self { arm, feeds, wake }
     }
 
@@ -254,8 +251,7 @@ impl NowPlaying {
 /// the render loop, so the row never holds a track the receiver no
 /// longer reports.
 fn now_playing_poller(
-    address: SocketAddr,
-    uid: u32,
+    endpoint: Endpoint,
     arm: &Arm,
     feeds: &Sender<Feed>,
     notify: &mut UnixStream,
@@ -301,6 +297,7 @@ fn now_playing_poller(
         if !armed {
             continue;
         }
+        let (address, uid) = endpoint.resolve();
         let feed = match fetch_feed(&address, uid) {
             Ok(feed) => feed,
             Err(error) => {
@@ -479,6 +476,7 @@ fn draw_fitted(c: &Context, text: &str, left: f64, width: f64, cy: f64, font: f6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::UnixListener;
 
     /// A unique abstract test address, never the production one.

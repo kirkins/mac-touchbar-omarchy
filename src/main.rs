@@ -239,6 +239,26 @@ fn run_check(args: &[String]) -> i32 {
     1
 }
 
+/// The dedicated account the install creates (see `etc/sysusers.d`). The
+/// desktop helpers accept requests only from this account's UID, so no other
+/// service sharing a generic account can drive them.
+const DAEMON_USER: &str = "tiny-dfr";
+
+/// The account to drop to: [`DAEMON_USER`] when it exists, else `nobody` for
+/// installs that predate it (the helpers accept `nobody` only in that case).
+fn daemon_user() -> &'static str {
+    match nix::unistd::User::from_name(DAEMON_USER) {
+        Ok(Some(_)) => DAEMON_USER,
+        _ => {
+            eprintln!(
+                "tiny-dfr: no '{DAEMON_USER}' account; running as nobody. \
+                 Run `sudo systemd-sysusers` after installing to create it."
+            );
+            "nobody"
+        }
+    }
+}
+
 fn real_main(drm: &mut DrmBackend) {
     let (height, width) = drm.mode().size();
     let (db_width, db_height) = drm.fb_info().unwrap().size();
@@ -254,7 +274,7 @@ fn real_main(drm: &mut DrmBackend) {
     let groups = ["input", "video"];
 
     PrivDrop::default()
-        .user("nobody")
+        .user(daemon_user())
         .group_list(&groups)
         .apply()
         .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));

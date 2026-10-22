@@ -10,6 +10,8 @@ select a fixed action; no bytes from the wire are ever executed.
 import argparse
 import json
 import os
+import shutil
+import pwd
 import signal
 import socket
 import struct
@@ -17,6 +19,16 @@ import subprocess
 import sys
 import threading
 import time
+
+
+def daemon_uid():
+    """UID of the Touch Bar daemon's account: the dedicated `tiny-dfr` user
+    the install creates, or `nobody` (65534) on installs that predate it."""
+    try:
+        return pwd.getpwnam("tiny-dfr").pw_uid
+    except KeyError:
+        return 65534
+
 
 ACTIONS = frozenset(("screenshot", "settings"))
 
@@ -34,13 +46,24 @@ def notify(message):
 
 
 SETTINGS_HELP = ("Open Touch Bar Settings from the application menu or run "
-                 "/usr/local/bin/dfr-configurator in a graphical terminal. "
+                 "dfr-configurator in a graphical terminal. "
                  "See journalctl --user -u touchbar-capture.service -b and "
-                 "/usr/share/doc/tiny-dfr/INSTALL.md.")
+                 "INSTALL.md (Desktop helpers).")
+
+
+def configurator_path():
+    """The installed Settings app: on PATH, else either install prefix."""
+    found = shutil.which("dfr-configurator")
+    if found:
+        return found
+    for candidate in ("/usr/bin/dfr-configurator", "/usr/local/bin/dfr-configurator"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return "/usr/local/bin/dfr-configurator"
 
 
 def settings_preflight():
-    if not os.access("/usr/local/bin/dfr-configurator", os.X_OK):
+    if not os.access(configurator_path(), os.X_OK):
         raise CaptureError("Settings app is missing or not executable; install the complete workspace. " + SETTINGS_HELP)
     if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")) or not all(
             os.environ.get(name) for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")):
@@ -60,7 +83,7 @@ class Capture:
         self.launchers = launchers or {
             "screenshot": ["omarchy", "capture", "screenshot"],
             "settings": ["systemd-run", "--user", "--collect", "--quiet",
-                         "--property=Type=exec", "/usr/local/bin/dfr-configurator"],
+                         "--property=Type=exec", configurator_path()],
         }
         self.settings_check = settings_check or settings_preflight
         self.capture = None
@@ -110,7 +133,7 @@ class Receiver:
     def __init__(self, handler, address=None, allowed_uids=None):
         self.handler = handler
         self.address = address or "\0dfr-capture-" + str(os.getuid())
-        self.allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+        self.allowed_uids = {os.getuid(), daemon_uid()} if allowed_uids is None else set(allowed_uids)
         self.lock = threading.Lock()
         self.slots = threading.BoundedSemaphore(4)
 

@@ -3,12 +3,32 @@
 
 import argparse
 import json
+import os
 import socket
 import struct
 import sys
 
 
-def request(action, uid=1000, address=None):
+def desktop_uid():
+    """The desktop user whose session helper to call: TINY_DFR_DESKTOP_UID if
+    set, else seat0's active user as logind records it, else UID 1000."""
+    override = os.environ.get("TINY_DFR_DESKTOP_UID", "").strip()
+    if override.isdigit():
+        return int(override)
+    try:
+        with open("/run/systemd/seats/seat0") as seat:
+            for line in seat:
+                if line.startswith("ACTIVE_UID="):
+                    uid = int(line.split("=", 1)[1])
+                    if uid:
+                        return uid
+    except (OSError, ValueError):
+        pass
+    return 1000
+
+
+def request(action, uid=None, address=None):
+    uid = desktop_uid() if uid is None else uid
     if action not in ("start", "stop", "cancel"):
         raise ValueError("Invalid action")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:

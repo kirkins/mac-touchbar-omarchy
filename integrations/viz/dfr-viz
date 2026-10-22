@@ -4,6 +4,7 @@
 import array
 import os
 from pathlib import Path
+import pwd
 import signal
 import socket
 import struct
@@ -11,6 +12,16 @@ import subprocess
 import sys
 import threading
 import time
+
+
+def daemon_uid():
+    """UID of the Touch Bar daemon's account: the dedicated `tiny-dfr` user
+    the install creates, or `nobody` (65534) on installs that predate it."""
+    try:
+        return pwd.getpwnam("tiny-dfr").pw_uid
+    except KeyError:
+        return 65534
+
 
 ACTIONS = frozenset(("on", "off", "get"))
 LEVEL_GAIN = 96           # peak scaling, tuned for mastered music
@@ -220,7 +231,7 @@ def handle(connection, feed, allowed_uids):
 
 def serve(feed, address=None, allowed_uids=None):
     address = address or "\0dfr-viz-" + str(os.getuid())
-    allowed_uids = {os.getuid(), 65534} if allowed_uids is None else set(allowed_uids)
+    allowed_uids = {os.getuid(), daemon_uid()} if allowed_uids is None else set(allowed_uids)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(address)
         listener.listen(8)

@@ -37,6 +37,7 @@ use std::{
 pub mod appearance;
 pub mod config;
 pub mod daycycle;
+pub mod desktop;
 pub mod level;
 pub mod now_playing;
 pub mod pet;

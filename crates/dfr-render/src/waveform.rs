@@ -46,6 +46,7 @@
 //! consumer. See `integrations/viz/README.md`.
 
 use crate::appearance::{ButtonAccent, Palette};
+use crate::desktop::Endpoint;
 use cairo::{
     Context, FontFace, FontOptions, FontSlant, FontWeight, LineCap, LineJoin, Matrix, ScaledFont,
 };
@@ -55,7 +56,6 @@ use std::{
     net::Shutdown,
     os::{
         fd::AsRawFd,
-        linux::net::SocketAddrExt,
         unix::net::{SocketAddr, UnixStream},
     },
     sync::{
@@ -1043,14 +1043,13 @@ pub struct MicLevels {
 }
 
 impl MicLevels {
-    /// Connect to the installed desktop receiver (UID 1000), mirroring the
-    /// volume and brightness endpoints.
+    /// Connect to the desktop user's receiver, mirroring the volume and
+    /// brightness endpoints.
     pub fn levels() -> Self {
-        let address = SocketAddr::from_abstract_name(b"dfr-voice-level-1000").unwrap();
-        Self::connect_to(address, 1000)
+        Self::connect_to(Endpoint::Desktop("dfr-voice-level"))
     }
 
-    fn connect_to(address: SocketAddr, uid: u32) -> Self {
+    fn connect_to(endpoint: Endpoint) -> Self {
         let arm = Arc::new(Arm {
             armed: Mutex::new(false),
             signal: Condvar::new(),
@@ -1060,7 +1059,7 @@ impl MicLevels {
         wake.set_nonblocking(true).unwrap();
         notify.set_nonblocking(true).unwrap();
         let poller_arm = Arc::clone(&arm);
-        thread::spawn(move || poller(address, uid, &poller_arm, &outgoing, &mut notify));
+        thread::spawn(move || poller(endpoint, &poller_arm, &outgoing, &mut notify));
         Self { arm, samples, wake }
     }
 
@@ -1197,11 +1196,10 @@ impl MonitorLevels {
     /// Connect to the installed desktop receiver (UID 1000), mirroring
     /// the volume, brightness, and voice level endpoints.
     pub fn visualizer() -> Self {
-        let address = SocketAddr::from_abstract_name(b"dfr-viz-1000").unwrap();
-        Self::connect_to(address, 1000)
+        Self::connect_to(Endpoint::Desktop("dfr-viz"))
     }
 
-    fn connect_to(address: SocketAddr, uid: u32) -> Self {
+    fn connect_to(endpoint: Endpoint) -> Self {
         let arm = Arc::new(Arm {
             armed: Mutex::new(false),
             signal: Condvar::new(),
@@ -1211,7 +1209,7 @@ impl MonitorLevels {
         wake.set_nonblocking(true).unwrap();
         notify.set_nonblocking(true).unwrap();
         let poller_arm = Arc::clone(&arm);
-        thread::spawn(move || viz_poller(address, uid, &poller_arm, &outgoing, &mut notify));
+        thread::spawn(move || viz_poller(endpoint, &poller_arm, &outgoing, &mut notify));
         Self { arm, samples, wake }
     }
 
@@ -1235,13 +1233,7 @@ impl MonitorLevels {
 
 /// Dial the level endpoint only while armed, at a bounded cadence, pushing
 /// every result to the render loop.
-fn poller(
-    address: SocketAddr,
-    uid: u32,
-    arm: &Arm,
-    samples: &Sender<Sample>,
-    notify: &mut UnixStream,
-) {
+fn poller(endpoint: Endpoint, arm: &Arm, samples: &Sender<Sample>, notify: &mut UnixStream) {
     let mut armed = false;
     let mut deadline: Option<Instant> = None;
     loop {
@@ -1275,6 +1267,7 @@ fn poller(
         if !armed {
             continue;
         }
+        let (address, uid) = endpoint.resolve();
         let sample = fetch_level(&address, uid);
         if samples.send(sample).is_err() {
             return;
@@ -1288,13 +1281,7 @@ fn poller(
 /// the desktop receiver starts its output-monitor capture, level polls
 /// follow at the shared cadence, and disarming - or losing the consumer -
 /// sends `off` so the monitor stream never outlives the visualizer.
-fn viz_poller(
-    address: SocketAddr,
-    uid: u32,
-    arm: &Arm,
-    samples: &Sender<Sample>,
-    notify: &mut UnixStream,
-) {
+fn viz_poller(endpoint: Endpoint, arm: &Arm, samples: &Sender<Sample>, notify: &mut UnixStream) {
     let mut armed = false;
     let mut deadline: Option<Instant> = None;
     loop {
@@ -1327,6 +1314,7 @@ fn viz_poller(
             };
         }
         drop(state);
+        let (address, uid) = endpoint.resolve();
         if flipped {
             // The capture stream's whole lifecycle rides the arm flag. A
             // receiver that answers nothing at `on` time is the single
@@ -1360,6 +1348,7 @@ fn viz_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::linux::net::SocketAddrExt;
 
     #[test]
     fn the_render_time_lag_cap_matches_the_parse_time_validation() {
@@ -2261,7 +2250,7 @@ mod tests {
             }
         });
         let uid = unsafe { libc::geteuid() };
-        let mut client = MicLevels::connect_to(address, uid);
+        let mut client = MicLevels::connect_to(Endpoint::Fixed(address, uid));
         bound.recv_timeout(Duration::from_secs(3)).unwrap();
         // Disarmed the poller never dials, even well past one interval.
         thread::sleep(POLL_INTERVAL * 6);
@@ -2700,7 +2689,7 @@ mod tests {
             }
         });
         let uid = unsafe { libc::geteuid() };
-        let mut client = MonitorLevels::connect_to(address, uid);
+        let mut client = MonitorLevels::connect_to(Endpoint::Fixed(address, uid));
         bound.recv_timeout(Duration::from_secs(3)).unwrap();
         // Disarmed, the poller neither starts nor polls anything.
         thread::sleep(POLL_INTERVAL * 6);
@@ -2773,7 +2762,7 @@ mod tests {
             }
         });
         let uid = unsafe { libc::geteuid() };
-        let mut client = MonitorLevels::connect_to(address, uid);
+        let mut client = MonitorLevels::connect_to(Endpoint::Fixed(address, uid));
         bound.recv_timeout(Duration::from_secs(3)).unwrap();
         client.set_armed(true);
         let deadline = Instant::now() + Duration::from_secs(5);

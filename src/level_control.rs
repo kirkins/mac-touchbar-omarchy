@@ -4,12 +4,12 @@
 
 pub use dfr_render::level::{Request, State, MAX_VOLUME_PERCENT};
 
+use dfr_render::desktop::Endpoint;
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
     os::{
         fd::AsRawFd,
-        linux::net::SocketAddrExt,
         unix::net::{SocketAddr, UnixStream},
     },
     sync::mpsc::{self, Receiver, Sender},
@@ -89,18 +89,16 @@ pub struct LevelControl {
 
 impl LevelControl {
     pub fn volume() -> Self {
-        // Same desktop UID and abstract-socket boundary as the optional voice
+        // Same desktop-user abstract-socket boundary as the optional voice
         // integration. No home/runtime file or PipeWire privilege is granted.
-        let address = SocketAddr::from_abstract_name(b"dfr-volume-1000").unwrap();
-        Self::connect_to(address, 1000, 0, MAX_VOLUME_PERCENT)
+        Self::connect_to(Endpoint::Desktop("dfr-volume"), 0, MAX_VOLUME_PERCENT)
     }
 
     pub fn brightness() -> Self {
-        let address = SocketAddr::from_abstract_name(b"dfr-brightness-1000").unwrap();
-        Self::connect_to(address, 1000, 1, 100)
+        Self::connect_to(Endpoint::Desktop("dfr-brightness"), 1, 100)
     }
 
-    fn connect_to(address: SocketAddr, uid: u32, minimum: u8, maximum: u8) -> Self {
+    fn connect_to(endpoint: Endpoint, minimum: u8, maximum: u8) -> Self {
         let (requests, incoming) = mpsc::channel();
         let (outgoing, replies) = mpsc::channel();
         let (wake, mut notify) = UnixStream::pair().unwrap();
@@ -117,6 +115,7 @@ impl LevelControl {
                         revision = next_revision;
                         action = next_action;
                     } else {
+                        let (address, uid) = endpoint.resolve();
                         if outgoing
                             .send((revision, request(&address, uid, action, minimum, maximum)))
                             .is_err()
@@ -128,6 +127,7 @@ impl LevelControl {
                         action = next_action;
                     }
                 }
+                let (address, uid) = endpoint.resolve();
                 if outgoing
                     .send((revision, request(&address, uid, action, minimum, maximum)))
                     .is_err()
@@ -157,6 +157,7 @@ impl LevelControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -204,7 +205,8 @@ mod tests {
             }
         });
         let uid = unsafe { libc::geteuid() };
-        let mut client = LevelControl::connect_to(address, uid, 0, MAX_VOLUME_PERCENT);
+        let mut client =
+            LevelControl::connect_to(Endpoint::Fixed(address, uid), 0, MAX_VOLUME_PERCENT);
         let receive = |client: &mut LevelControl, revision| {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
