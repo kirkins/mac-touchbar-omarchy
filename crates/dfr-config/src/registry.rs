@@ -104,7 +104,7 @@ pub const KNOBS: &[Knob] = &[
         default: "the remembered choice", constraint: Some("must name a defined theme"),
         doc: "Pin the startup theme instead of the last choice made on the glass." },
     Knob { name: "Themes", kind: "table map", scope: Scope::Global, group: "Themes",
-        default: "the thirteen built-ins", constraint: Some("at most 21 themes in total"),
+        default: "the fourteen built-ins", constraint: Some("at most 21 themes in total"),
         doc: "Define or override themes: [Themes.Name] with an Accents map of accent names to \"#RRGGBB\" and optional [[...DayCycleBands]]." },
     // ---- Global: layers
     Knob { name: "MediaLayerDefault", kind: "bool", scope: Scope::Global, group: "Layers",

@@ -39,6 +39,11 @@ unreleased; the sections group it by when it landed.
 - **Arch PKGBUILD** in `packaging/arch` (`makepkg -si`). Package users set up
   the desktop helpers with `tiny-dfr-deck-user-setup install`.
 
+### Themes
+
+- **Aurora Noir** built-in theme (fourteen in total): mint, cyan and violet
+  accents over an inky strip that deepens at night.
+
 ### Upgrading
 
 Desktop helpers installed by earlier versions accept requests only from

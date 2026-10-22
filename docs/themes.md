@@ -9,9 +9,9 @@ A theme sets the colors behind the eight accent names every button uses
 (`neutral`, `cyan`, `amber`, `blue`, `violet`, `orange`, `red`, `green`) and,
 optionally, the time-of-day background bands.
 
-Thirteen themes are built in, in this order: `Default` (the original deck
+Fourteen themes are built in, in this order: `Default` (the original deck
 palette), `Midnight`, `Nord`, `Ember`, `Rosewater`, `Forest`, `Solarized`,
-`Mono`, `Daybreak`, `Tidal`, `Arcade`, `Gilded` and `Orchard`.
+`Mono`, `Daybreak`, `Tidal`, `Arcade`, `Gilded`, `Orchard` and `Aurora Noir`.
 
 Every built-in keeps its accents bright and distinct over the dark bands, keeps
 white labels on dark button fills, and keeps the color roles: cyan for audio,
@@ -19,7 +19,8 @@ amber for brightness, violet for navigation, orange for warnings, red for
 critical, green for charging. A few have their own character: Daybreak is light
 and airy while its dark bands keep contrast; Tidal uses deep-sea bands; Arcade
 puts neon accents over dark violet; Gilded is brass and lapis over walnut;
-Orchard is botanical greens and berry over dark leaf.
+Orchard is botanical greens and berry over dark leaf; Aurora Noir is mint,
+cyan and violet over an inky strip that deepens at night.
 
 ### Custom themes
 

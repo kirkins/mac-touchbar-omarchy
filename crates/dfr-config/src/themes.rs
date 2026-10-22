@@ -310,6 +310,7 @@ mod tests {
                 "Arcade",
                 "Gilded",
                 "Orchard",
+                "Aurora Noir",
             ]
         );
         // The live palette ships as the first theme with no overrides of
@@ -353,7 +354,8 @@ mod tests {
             ("Tidal", "Arcade"),
             ("Arcade", "Gilded"),
             ("Gilded", "Orchard"),
-            ("Orchard", "Default"),
+            ("Orchard", "Aurora Noir"),
+            ("Aurora Noir", "Default"),
         ] {
             themes.active = Some(from.into());
             assert_eq!(themes.cycle_next().as_deref(), Some(next), "after {from}");
@@ -447,6 +449,7 @@ Color = "#002211"
                 "Arcade",
                 "Gilded",
                 "Orchard",
+                "Aurora Noir",
                 "Aloe",
                 "Zephyr",
             ]

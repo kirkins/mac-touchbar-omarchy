@@ -269,7 +269,7 @@ ignore. Defaults are code-level: a stripped base file still loads.
 | **Themes** | | | | |
 | `ThemesEnabled` | bool | `true` | - | Enable the color-theme system and picker layer; configure theme buttons explicitly on a bar. |
 | `ActiveTheme` | string | `the remembered choice` | must name a defined theme | Pin the startup theme instead of the last choice made on the glass. |
-| `Themes` | table map | `the thirteen built-ins` | at most 21 themes in total | Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]]. |
+| `Themes` | table map | `the fourteen built-ins` | at most 21 themes in total | Define or override themes: [Themes.Name] with an Accents map of accent names to "#RRGGBB" and optional [[...DayCycleBands]]. |
 | **Layers** | | | | |
 | `MediaLayerDefault` | bool | `false` | legacy syntax only | Legacy syntax: show the media keys without Fn pressed. |
 | `PrimaryLayerKeys` | list of tables | `the shipped F1-F12 bar` | legacy syntax; mutually exclusive with Layers | Legacy syntax: the primary layer's buttons. |

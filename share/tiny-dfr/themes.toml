@@ -370,3 +370,33 @@ Color = "#1D1A0D"
 Name = "night"
 StartHour = 21
 Color = "#090F0A"
+
+# The Aurora desktop palette (mint, cyan, violet, rose, amber) mapped
+# onto the deck's color families, over an inky strip that deepens at night.
+[[Theme]]
+Name = "Aurora Noir"
+[Theme.Accents]
+neutral = "#8B95AB"
+cyan = "#47D7F5"
+amber = "#FFD166"
+blue = "#6E9BFF"
+violet = "#B07CFF"
+orange = "#FF9E5E"
+red = "#FF5C8A"
+green = "#4FF0C0"
+[[Theme.DayCycleBands]]
+Name = "morning"
+StartHour = 5
+Color = "#0B1220"
+[[Theme.DayCycleBands]]
+Name = "day"
+StartHour = 12
+Color = "#0B0E14"
+[[Theme.DayCycleBands]]
+Name = "evening"
+StartHour = 17
+Color = "#101626"
+[[Theme.DayCycleBands]]
+Name = "night"
+StartHour = 21
+Color = "#05070A"
