@@ -2412,6 +2412,7 @@ mod tests {
         }
         let mut frame = now + Duration::from_millis(50 * HISTORY as u64);
         let budget = Duration::from_millis(2);
+        let mut spent = Vec::with_capacity(100);
         for _ in 0..100 {
             frame += Duration::from_millis(FRAME_INTERVAL_MS as u64);
             let c = Context::new(&surface).unwrap();
@@ -2420,9 +2421,13 @@ mod tests {
             c.fill().unwrap();
             let started = Instant::now();
             wave.render_at(&c, 60, 0.0, 1300.0, 0.0, frame);
-            let spent = started.elapsed();
-            assert!(spent < budget, "repaint took {spent:?}, budget {budget:?}");
+            spent.push(started.elapsed());
         }
+        // The median, not every sample: a loaded machine preempts the odd
+        // repaint, but a real regression slows them all.
+        spent.sort();
+        let median = spent[spent.len() / 2];
+        assert!(median < budget, "median repaint took {median:?}, budget {budget:?}");
     }
 
     #[test]

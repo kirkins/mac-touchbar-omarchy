@@ -99,11 +99,13 @@ class BrightnessTests(unittest.TestCase):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                     client.settimeout(3)
                     client.connect(address)
-                    client.sendall(b"set 1")
-                    client.shutdown(socket.SHUT_WR)
+                    # A rejected peer can be hung up on before it writes, so
+                    # the send may fail as well as the read.
                     try:
+                        client.sendall(b"set 1")
+                        client.shutdown(socket.SHUT_WR)
                         reply = client.recv(64)
-                    except ConnectionResetError:
+                    except (BrokenPipeError, ConnectionResetError):
                         reply = b""
                 thread.join(3)
                 self.assertFalse(thread.is_alive())
